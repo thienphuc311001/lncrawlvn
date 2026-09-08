@@ -2,7 +2,8 @@
 
 Minimal web-novel downloader built from the zh + vn sources of
 [Lightnovel Crawler](https://github.com/lncrawl/lightnovel-crawler). No server,
-no database, no account system, no web UI. One URL in → EPUB + TXT out.
+no database, no account system. One URL in → a persistent on-disk library you
+can read, complete, and export to EPUB/TXT.
 
 ## Development
 
@@ -26,8 +27,14 @@ installer lives at `scripts/lnmini.sh`; copy it anywhere on your `PATH` as
 | Endpoint | Method | Description |
 | --- | --- | --- |
 | `/api/health` | GET | Liveness probe |
-| `/api/extract` | POST | Start a crawl job: `{ "url": "...", "first": 5 }` → `202` + job (or the finished job with `"sync": true`) |
+| `/api/extract` | POST | Start a crawl job: `{ "url": "...", "first": 5 }` → `202` + job (or the finished job with `"sync": true`). Every crawl is saved to the library by default (`"save": false` opts out) |
 | `/api/jobs/{job_id}` | GET | Job progress: status, timestamped stage logs, per-chapter success/failure + reasons |
+| `/api/books` | GET | All books in the library with saved/total chapter counts |
+| `/api/books/{book_id}` | GET | Book metadata + full TOC annotated with per-chapter saved/missing flags |
+| `/api/books/{book_id}/cover` | GET | Downloaded cover image (404 if none) |
+| `/api/books/{book_id}/chapters/{n}` | GET | One saved chapter body (HTML) |
+| `/api/books/{book_id}/fetch-missing` | POST | Start a job that downloads only chapters missing on disk → `202` + job |
+| `/api/books/{book_id}/export?format=epub\|txt` | GET | Build an EPUB/TXT from saved chapters and download it as a ZIP |
 
 
 ## Usage
@@ -55,7 +62,10 @@ source corpus from the original project is intentionally absent.
 ## How it stays simple
 
 - **No `ctx` service graph** — just a logger, one shared scraper state, one source registry.
-- **No DB** — chapters live in memory and are bound straight into the output files.
+- **No DB** — the library is plain JSON files under `~/.lncrawl-mini/library/`:
+  `book.json` (metadata + TOC), `cover.jpg`, and one `chapters/0001-0100/ch_0001.json`
+  file per fetched chapter, written atomically the moment each download finishes
+  (crash-safe).
 
 - **No search** — crawl by URL only。
 - **Anti-bot reused** — HTTP/Cloudflare/browser escalation come from the

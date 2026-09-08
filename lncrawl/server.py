@@ -20,13 +20,15 @@ from collections import deque
 from contextlib import asynccontextmanager
 from typing import Deque, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
 from .context import APP_DIR, ctx
 from .core import Novel
 from .exceptions import LNException
+from .library import LIBRARY
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +50,39 @@ class JobChapter(BaseModel):
     error: Optional[str] = None
 
 
+class BookChapter(BaseModel):
+    id: int
+    title: str = ""
+    url: str = ""
+    saved: bool = False
+
+
+class BookSummary(BaseModel):
+    book_id: str
+    title: str
+    author: str = ""
+    cover_url: str = ""
+    total_chapters: int = 0
+    saved_count: int = 0
+    saved_at: float = 0.0
+
+
+class BookDetail(BookSummary):
+    url: str = ""
+    language: Optional[str] = None
+    synopsis: str = ""
+    tags: List[str] = []
+    chapters: List[BookChapter] = []
+
+
+class ChapterContent(BaseModel):
+    id: int
+    title: str = ""
+    url: str = ""
+    body: str = ""
+    fetched_at: float = 0.0
+
+
 class Job(BaseModel):
     job_id: str
     url: str
@@ -61,6 +96,8 @@ class Job(BaseModel):
     tags: List[str] = []
     total_chapters: int = 0
     requested: str = "all"
+    book_id: str = ""
+    saved_count: int = 0
     success_count: int = 0
     failed_count: int = 0
     error: Optional[str] = None
@@ -148,6 +185,10 @@ class ExtractRequest(BaseModel):
     first: Optional[int] = Field(None, ge=1, description="Only the first N chapters.")
     last: Optional[int] = Field(None, ge=1, description="Only the last N chapters.")
     rate_limit: Optional[float] = Field(None, gt=0, description="Requests per second cap.")
+    save: bool = Field(True, description="Persist the novel and fetched chapters into the library.")
+    only_ids: Optional[List[int]] = Field(
+        None, description="Internal: download only these chapter ids (fetch-missing runs)."
+    )
     sync: bool = Field(False, description="Run inline and return the final job (old behavior).")
 
 
@@ -187,6 +228,72 @@ def get_job(job_id: str) -> Job:
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
     return job
+
+
+@app.get("/api/books", response_model=List[BookSummary])
+def list_books() -> List[BookSummary]:
+    """All novels persisted in the library, newest first."""
+    return [BookSummary(**b) for b in LIBRARY.list_books()]
+
+
+@app.get("/api/books/{book_id}", response_model=BookDetail)
+def get_book(book_id: str) -> BookDetail:
+    """Book metadata plus its table of contents with saved/missing flags."""
+    book = LIBRARY.load_book(book_id)
+    if book is None:
+        raise HTTPException(status_code=404, detail="Book not found in library")
+    return BookDetail(**book)
+
+
+@app.get("/api/books/{book_id}/cover")
+def get_cover(book_id: str):
+    cover = LIBRARY.cover_path(book_id)
+    if not cover.is_file():
+        raise HTTPException(status_code=404, detail="No cover saved")
+    return FileResponse(cover, media_type="image/jpeg")
+
+
+@app.get("/api/books/{book_id}/chapters/{chapter_id}", response_model=ChapterContent)
+def get_chapter(book_id: str, chapter_id: int) -> ChapterContent:
+    data = LIBRARY.load_chapter(book_id, chapter_id)
+    if data is None:
+        raise HTTPException(status_code=404, detail="Chapter not saved yet")
+    return ChapterContent(**data)
+
+
+@app.post("/api/books/{book_id}/fetch-missing", response_model=Job, status_code=202)
+def fetch_missing(book_id: str) -> Job:
+    """Start a job that downloads only chapters missing from the library."""
+    book = LIBRARY.load_book(book_id)
+    if book is None:
+        raise HTTPException(status_code=404, detail="Book not found in library")
+    if not book["url"]:
+        raise HTTPException(status_code=400, detail="Book has no source URL")
+    missing = LIBRARY.missing_chapter_ids(book_id)
+    if not missing:
+        raise HTTPException(status_code=400, detail="No missing chapters — the book is complete")
+    req = ExtractRequest(url=book["url"], only_ids=missing)
+    job = JOBS.create(book["url"])
+    thread = threading.Thread(
+        target=_run_job,
+        args=(job.job_id, req),
+        daemon=True,
+        name=f"crawl-{job.job_id}",
+    )
+    thread.start()
+    started = JOBS.snapshot(job.job_id)
+    assert started is not None
+    return started
+
+
+@app.get("/api/books/{book_id}/export")
+def export_book(book_id: str, format: str = Query("epub", pattern="^(epub|txt)$")):
+    """Export saved chapters as an EPUB or TXT wrapped in a ZIP download."""
+    try:
+        zip_path = LIBRARY.export_zip(book_id, format)
+    except LNException as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return FileResponse(zip_path, media_type="application/zip", filename=zip_path.name)
 
 
 def _run_job(job_id: str, req: ExtractRequest) -> None:
@@ -236,6 +343,30 @@ def _run_job(job_id: str, req: ExtractRequest) -> None:
             _log(job, f"Cover: {novel.cover_url}")
         _log(job, f"Chapter list parsed: {len(novel.chapters)} chapters")
 
+        book_id = ""
+        if req.save:
+            book_id = LIBRARY.save_book_meta(
+                {
+                    "url": novel.url,
+                    "title": novel.title,
+                    "author": novel.author,
+                    "cover_url": novel.cover_url,
+                    "language": novel.language,
+                    "synopsis": novel.synopsis,
+                    "tags": list(novel.tags),
+                    "toc": [{"id": c.id, "title": c.title, "url": c.url} for c in novel.chapters],
+                }
+            )
+            _set(job, book_id=book_id)
+            _log(job, f"Saved to library as '{book_id}'")
+            cover_file = LIBRARY.cover_path(book_id)
+            if novel.cover_url and not cover_file.is_file():
+                try:
+                    crawler.download_cover(novel.cover_url, cover_file)
+                    _log(job, "Cover saved to library")
+                except Exception as e:
+                    _log(job, f"Cover download failed: {e}", level="warning")
+
         chapters = list(novel.chapters)
         requested = "all"
         if req.first:
@@ -247,6 +378,12 @@ def _run_job(job_id: str, req: ExtractRequest) -> None:
             requested = f"last {req.last}"
             _log(job, f"Scoped to the last {req.last} chapters")
         _set(job, requested=requested)
+        if req.only_ids:
+            wanted = set(req.only_ids)
+            chapters = [c for c in chapters if c.id in wanted]
+            requested = f"{len(chapters)} missing"
+            _set(job, requested=requested)
+            _log(job, f"Fetch missing: {len(chapters)} chapters to download")
         if not chapters:
             raise LNException("No chapters to download")
 
@@ -275,6 +412,10 @@ def _run_job(job_id: str, req: ExtractRequest) -> None:
             with JOBS.lock:
                 job.chapters[idx].success = bool(chapter.success)
                 job.chapters[idx].error = error
+            if req.save and book_id and chapter.success:
+                if LIBRARY.save_chapter(book_id, chapter.to_dict()):
+                    with JOBS.lock:
+                        job.saved_count += 1
             title = (chapter.title or "").strip()[:60]
             elapsed = chapter.get("elapsed") or 0.0
             if chapter.success:
@@ -292,7 +433,10 @@ def _run_job(job_id: str, req: ExtractRequest) -> None:
             finished_at=time.time(),
         )
         level = "warning" if failed_count else "info"
-        _log(job, f"Completed: {success_count} ok, {failed_count} failed", level=level)
+        summary = f"Completed: {success_count} ok, {failed_count} failed"
+        if req.save and book_id:
+            summary += f", {job.saved_count} saved to library"
+        _log(job, summary, level=level)
     except LNException as e:
         _set(job, status="failed", error=str(e), finished_at=time.time())
         _log(job, f"Failed: {e}", level="error")
