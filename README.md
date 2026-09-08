@@ -26,7 +26,8 @@ installer lives at `scripts/lnmini.sh`; copy it anywhere on your `PATH` as
 | Endpoint | Method | Description |
 | --- | --- | --- |
 | `/api/health` | GET | Liveness probe |
-| `/api/extract` | POST | Crawl a novel URL: `{ "url": "...", "first": 5 }` → metadata + chapter list |
+| `/api/extract` | POST | Start a crawl job: `{ "url": "...", "first": 5 }` → `202` + job (or the finished job with `"sync": true`) |
+| `/api/jobs/{job_id}` | GET | Job progress: status, timestamped stage logs, per-chapter success/failure + reasons |
 
 
 ## Usage

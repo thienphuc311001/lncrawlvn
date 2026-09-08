@@ -4,7 +4,7 @@ import { useState } from 'react';
 
 import DemoOutput from './demo-output';
 
-const EXAMPLE_URL = 'https://example.com/novel/chapter-1';
+const EXAMPLE_URL = 'https://xtruyen.vn/truyen/huyen-giam-tien-toc/';
 
 export default function Hero() {
   const [url, setUrl] = useState('');

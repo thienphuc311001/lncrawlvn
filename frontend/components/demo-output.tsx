@@ -1,155 +1,145 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { CSSProperties } from 'react';
 
-type DemoLine = {
+type LogLine = {
   text: string;
-  success?: boolean;
+  level: 'info' | 'warning' | 'error';
   style?: CSSProperties;
-  animate?: boolean;
 };
+
+type JobChapter = {
+  id: number;
+  title: string;
+  url: string;
+  success: boolean;
+  error: string | null;
+};
+
+type Job = {
+  job_id: string;
+  url: string;
+  status: 'pending' | 'running' | 'done' | 'failed';
+  source: string;
+  title: string;
+  author: string;
+  total_chapters: number;
+  requested: string;
+  success_count: number;
+  failed_count: number;
+  error: string | null;
+  logs: { t: number; level: string; message: string }[];
+  chapters: JobChapter[];
+};
+
+const API_BASE = 'http://127.0.0.1:8000';
+const POLL_INTERVAL_MS = 800;
+/** Terminal panels hold a bounded history so huge novels cannot flood the DOM. */
+const MAX_RENDERED_LINES = 300;
+
+const IDLE_LINES: LogLine[] = [
+  { text: 'lncrawl-mini ready. Paste a novel URL and press Extract.', level: 'info' },
+];
 
 type DemoOutputProps = {
   /** URL typed into the hero input (empty until the user enters one). */
   url: string;
-  /** Incremented every time a crawl simulation should (re)start. */
+  /** Incremented every time a crawl should (re)start. */
   runToken: number;
-  /** Notifies the parent when the simulation starts / finishes. */
+  /** Notifies the parent when a crawl starts / finishes. */
   onRunningChange: (running: boolean) => void;
 };
 
-/** The static log shown on first paint — mirrors the index.html mockup exactly. */
-const STATIC_LINES: DemoLine[] = [
-  { text: '$ novelcrawler extract --url https://...' },
-  { text: '→ Detecting novel structure...', style: { marginTop: '12px' } },
-  { text: '✓ Found 247 chapters', success: true },
-  { text: '→ Parsing chapter metadata...' },
-  { text: '✓ Extracted title, author, summary', success: true },
-  { text: '→ Downloading chapter content...' },
-  { text: '✓ 247/247 chapters complete', success: true },
-  { text: '→ Building EPUB...' },
-  { text: '✓ novel-title.epub (2.4 MB)', success: true, style: { marginTop: '12px' } },
-];
+function jobLine(job: Job, index: number): LogLine {
+  const prefix = `[${job.logs[index].t.toFixed(1)}s]`;
+  return { text: `${prefix} ${job.logs[index].message}`, level: job.logs[index].level as LogLine['level'] };
+}
 
-const FALLBACK_CHAPTERS = 247;
-
-function hashString(value: string): number {
-  let hash = 0;
-  for (let i = 0; i < value.length; i += 1) {
-    hash = (hash * 31 + value.charCodeAt(i)) >>> 0;
+function summaryLines(job: Job): LogLine[] {
+  const lines: LogLine[] = [
+    {
+      text: `→ ${job.status} · source=${job.source || '?'} · requested=${job.requested} · found=${job.total_chapters} · ok=${job.success_count} · failed=${job.failed_count}`,
+      level: job.status === 'failed' || job.failed_count > 0 ? 'warning' : 'info',
+      style: { marginTop: '12px' },
+    },
+  ];
+  if (job.error) {
+    lines.push({ text: `✗ ${job.error}`, level: 'error' });
   }
-  return hash;
-}
-
-/** Derive a plausible chapter count from the URL (falls back to the mockup's 247). */
-function deriveChapters(url: string): number {
-  if (!url) return FALLBACK_CHAPTERS;
-  return 96 + (hashString(url) % 304);
-}
-
-/** URL path segments that name a chapter rather than the novel itself. */
-const CHAPTER_SEGMENTS = /^(chapter|chap|chuong)[-_]?\d*$/i;
-/** Generic URL path segments that never identify a specific novel. */
-const GENERIC_SEGMENTS =
-  /^(novels?|books?|read|reads|story|stories|series|fiction|webnovel|light-?novel)$/i;
-
-/** Derive a filename from the URL path, skipping chapter-like, generic, and numeric segments. */
-function deriveTitle(url: string): string {
-  if (!url) return 'novel-title';
-  try {
-    const { pathname } = new URL(url);
-    const segments = pathname.split('/').filter((segment) => segment.length > 0);
-    const meaningful = segments.filter(
-      (segment) =>
-        !CHAPTER_SEGMENTS.test(segment) &&
-        !GENERIC_SEGMENTS.test(segment) &&
-        !/^\d+$/.test(segment)
-    );
-    const last = meaningful[meaningful.length - 1];
-    if (last) {
-      return last.replace(/\.(html?|php|aspx?)$/i, '');
-    }
-  } catch {
-    // Not a parseable URL — fall through to the mockup default.
-  }
-  return 'novel-title';
-}
-
-/** Scale the EPUB size with the chapter count (247 chapters → 2.4 MB, as in the mockup). */
-function deriveSizeMb(chapters: number): string {
-  return (chapters * 0.0097 + 0.05).toFixed(1);
+  return lines;
 }
 
 export default function DemoOutput({ url, runToken, onRunningChange }: DemoOutputProps) {
-  const [lines, setLines] = useState<DemoLine[]>(STATIC_LINES);
+  const [lines, setLines] = useState<LogLine[]>(IDLE_LINES);
   const [running, setRunning] = useState(false);
+  const boxRef = useRef<HTMLDivElement | null>(null);
 
   useEffect(() => {
     if (runToken === 0) return;
 
     let cancelled = false;
-    const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
-    const push = (line: DemoLine) => setLines((prev) => [...prev, { ...line, animate: true }]);
-    const replaceLast = (text: string) =>
-      setLines((prev) =>
-        prev.map((line, index) => (index === prev.length - 1 ? { ...line, text } : line))
-      );
-
-    const chapters = deriveChapters(url);
-    const title = deriveTitle(url);
-    const echoedUrl = url || 'https://...';
+    const targetUrl = url.trim();
 
     const run = async () => {
       setRunning(true);
       onRunningChange(true);
-      setLines([{ text: `$ novelcrawler extract --url ${echoedUrl}`, animate: true }]);
+      setLines([{ text: `$ lncrawl extract --url ${targetUrl || 'https://...'}`, level: 'info' }]);
 
-      await sleep(450);
-      if (cancelled) return;
-      push({ text: '→ Detecting novel structure...', style: { marginTop: '12px' } });
-
-      await sleep(750);
-      if (cancelled) return;
-      push({ text: `✓ Found ${chapters} chapters`, success: true });
-
-      await sleep(420);
-      if (cancelled) return;
-      push({ text: '→ Parsing chapter metadata...' });
-
-      await sleep(650);
-      if (cancelled) return;
-      push({ text: '✓ Extracted title, author, summary', success: true });
-
-      await sleep(420);
-      if (cancelled) return;
-      push({ text: '→ Downloading chapter content...' });
-
-      await sleep(450);
-      if (cancelled) return;
-      push({ text: `✓ 0/${chapters} chapters complete`, success: true });
-      const steps = 22;
-      for (let step = 1; step <= steps; step += 1) {
-        if (cancelled) return;
-        const count = Math.min(chapters, Math.round((chapters * step) / steps));
-        replaceLast(`✓ ${count}/${chapters} chapters complete`);
-        await sleep(70);
+      if (!targetUrl) {
+        setLines((prev) => [...prev, { text: '✗ No URL provided', level: 'error' }]);
+        setRunning(false);
+        onRunningChange(false);
+        return;
       }
 
-      await sleep(350);
-      if (cancelled) return;
-      push({ text: '→ Building EPUB...' });
+      try {
+        const res = await fetch(`${API_BASE}/api/extract`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url: targetUrl }),
+        });
+        if (!res.ok && res.status !== 202) {
+          const detail = await res.json().catch(() => null);
+          throw new Error(detail?.detail || `API returned ${res.status}`);
+        }
+        let job: Job = await res.json();
 
-      await sleep(850);
-      if (cancelled) return;
-      push({
-        text: `✓ ${title}.epub (${deriveSizeMb(chapters)} MB)`,
-        success: true,
-        style: { marginTop: '12px' },
-      });
+        let renderedLogs = 0;
+        while (!cancelled) {
+          const fresh: LogLine[] = [];
+          for (let i = renderedLogs; i < job.logs.length; i += 1) {
+            const line = jobLine(job, i);
+            if (i === 0) line.style = { marginTop: '12px' };
+            fresh.push(line);
+          }
+          renderedLogs = job.logs.length;
+          if (fresh.length) setLines((prev) => [...prev, ...fresh]);
 
-      setRunning(false);
-      onRunningChange(false);
+          if (job.status === 'done' || job.status === 'failed') {
+            setLines((prev) => [...prev, ...summaryLines(job)]);
+            break;
+          }
+          await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
+          const poll = await fetch(`${API_BASE}/api/jobs/${job.job_id}`);
+          if (!poll.ok) throw new Error(`Job poll returned ${poll.status}`);
+          job = await poll.json();
+        }
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        setLines((prev) => [
+          ...prev,
+          {
+            text: `✗ ${message} — is the backend running? (lnmini run dev)`,
+            level: 'error',
+          },
+        ]);
+      } finally {
+        if (!cancelled) {
+          setRunning(false);
+          onRunningChange(false);
+        }
+      }
     };
 
     void run();
@@ -163,12 +153,22 @@ export default function DemoOutput({ url, runToken, onRunningChange }: DemoOutpu
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [runToken]);
 
+  // Keep the newest lines visible as logs stream in.
+  useEffect(() => {
+    const box = boxRef.current;
+    if (box) box.scrollTop = box.scrollHeight;
+  }, [lines]);
+
+  const rendered = lines.slice(-MAX_RENDERED_LINES);
+
   return (
-    <div className="demo-output" role="log" aria-label="Crawl demo output">
-      {lines.map((line, index) => (
+    <div className="demo-output" role="log" aria-label="Crawl output" ref={boxRef}>
+      {rendered.map((line, index) => (
         <span
           key={index}
-          className={`line${line.success ? ' success' : ''}${line.animate ? ' line-in' : ''}`}
+          className={`line line-in${line.level === 'error' ? ' error' : ''}${
+            line.level === 'warning' ? ' warning' : ''
+          }`}
           style={line.style}
         >
           {line.text}

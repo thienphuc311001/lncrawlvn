@@ -267,9 +267,13 @@ h1, h2, h3, h4 { text-wrap: balance; }
   line-height: 1.7;
   color: var(--muted);
   overflow-x: auto;
+  max-height: 480px;
+  overflow-y: auto;
 }
 .demo-output .line { display: block; }
 .demo-output .success { color: var(--accent); }
+.demo-output .error { color: oklch(55% 0.2 25); }
+.demo-output .warning { color: oklch(65% 0.15 75); }
 
 /* ------------------------------------------------------------------ */
 /* Additions for the Next.js frontend (not in the original mockup):    */

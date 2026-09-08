@@ -2,6 +2,7 @@
 import base64
 import logging
 import re
+import time
 import zlib
 from typing import List, Optional
 from urllib.parse import urlencode
@@ -132,18 +133,35 @@ class XTruyen(MadaraTemplate):
 
     def _fetch_chapter_range(self, manga_id: str, start: int, end: int) -> List[dict]:
         url = f"{self.scraper.origin}api/api-chapters.php"
-        response = self.scraper.post(
-            url,
-            data={
-                "manga_id": manga_id,
-                "from": str(start),
-                "to": str(end),
-                "vol": "",
-            },
-            headers={"X-Custom-Auth": _API_AUTH_HEADER},
-        )
-        payload = response.json()
-        return payload if isinstance(payload, list) else []
+        # The endpoint occasionally answers 500 on the first hit after an idle
+        # period; a short retry with backoff keeps whole runs from dying on it.
+        last_error: Optional[Exception] = None
+        for attempt in range(3):
+            if attempt:
+                time.sleep(1.5 * attempt)
+            try:
+                response = self.scraper.post(
+                    url,
+                    data={
+                        "manga_id": manga_id,
+                        "from": str(start),
+                        "to": str(end),
+                        "vol": "",
+                    },
+                    headers={"X-Custom-Auth": _API_AUTH_HEADER},
+                )
+                payload = response.json()
+                return payload if isinstance(payload, list) else []
+            except Exception as e:  # noqa: BLE001 - retried below, raised at the end
+                last_error = e
+                logger.warning(
+                    "Chapter API attempt %d/3 failed for %s (from=%s): %r",
+                    attempt + 1,
+                    url,
+                    start,
+                    e,
+                )
+        raise LNException(f"Chapter API failed after 3 attempts: {last_error!r}") from last_error
 
     # ------------------------------------------------------------------------- #
     # Chapter body
