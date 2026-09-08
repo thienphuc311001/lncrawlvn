@@ -275,14 +275,12 @@ def _run_job(job_id: str, req: ExtractRequest) -> None:
             with JOBS.lock:
                 job.chapters[idx].success = bool(chapter.success)
                 job.chapters[idx].error = error
-            if not chapter.success:
-                _log(
-                    job,
-                    f"Chapter {chapter.id} failed: {error}",
-                    level="error",
-                )
-            elif done_count % 50 == 0:
-                _log(job, f"Progress: {done_count}/{len(chapters)} chapters fetched")
+            title = (chapter.title or "").strip()[:60]
+            elapsed = chapter.get("elapsed") or 0.0
+            if chapter.success:
+                _log(job, f"✓ Ch {chapter.id} · {title} ({elapsed:.1f}s)")
+            else:
+                _log(job, f"✗ Ch {chapter.id} · {title}: {error}", level="error")
 
         success_count = sum(1 for c in chapters if c.success)
         failed_count = len(chapters) - success_count
@@ -308,13 +306,19 @@ def _run_job(job_id: str, req: ExtractRequest) -> None:
 
 
 def _fetch_chapter(crawler, chapter):
+    started = time.perf_counter()
+
+    def timed():
+        chapter.elapsed = round(time.perf_counter() - started, 2)
+        return chapter
+
     try:
         crawler.download_chapter(chapter)
+        crawler.format_chapter(chapter)
     except Exception as e:
         logger.warning("Chapter %s failed: %s", chapter.id, e)
         chapter.success = False
         chapter.error = repr(e)
-        return chapter
-    crawler.format_chapter(chapter)
+        return timed()
     chapter.error = None
-    return chapter
+    return timed()

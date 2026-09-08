@@ -70,6 +70,30 @@ function summaryLines(job: Job): LogLine[] {
   return lines;
 }
 
+/** Recaps failed chapters from the structured per-chapter results, so
+ * failures stay visible even when their log lines were evicted. */
+const MAX_FAILED_RECAP = 20;
+
+function failedChapterLines(job: Job): LogLine[] {
+  const failed = job.chapters.filter((chapter) => !chapter.success);
+  if (failed.length === 0) return [];
+  const lines: LogLine[] = [
+    {
+      text: `⚠ Failed chapters (${failed.length}):`,
+      level: 'warning',
+      style: { marginTop: '12px' },
+    },
+  ];
+  for (const chapter of failed.slice(0, MAX_FAILED_RECAP)) {
+    const reason = chapter.error ? ` — ${chapter.error.slice(0, 140)}` : '';
+    lines.push({ text: `  ✗ Ch ${chapter.id} · ${chapter.title}${reason}`, level: 'error' });
+  }
+  if (failed.length > MAX_FAILED_RECAP) {
+    lines.push({ text: `  … and ${failed.length - MAX_FAILED_RECAP} more`, level: 'warning' });
+  }
+  return lines;
+}
+
 export default function DemoOutput({ url, runToken, onRunningChange }: DemoOutputProps) {
   const [lines, setLines] = useState<LogLine[]>(IDLE_LINES);
   const [running, setRunning] = useState(false);
@@ -117,7 +141,7 @@ export default function DemoOutput({ url, runToken, onRunningChange }: DemoOutpu
           if (fresh.length) setLines((prev) => [...prev, ...fresh]);
 
           if (job.status === 'done' || job.status === 'failed') {
-            setLines((prev) => [...prev, ...summaryLines(job)]);
+            setLines((prev) => [...prev, ...summaryLines(job), ...failedChapterLines(job)]);
             break;
           }
           await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
