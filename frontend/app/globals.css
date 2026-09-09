@@ -338,6 +338,65 @@ h1, h2, h3, h4 { text-wrap: balance; }
 .job-console-fab:hover { border-color: var(--fg); }
 
 /* ------------------------------------------------------------------ */
+/* Settings modal (⚙ in the hero) — sits above the job console dock.  */
+/* ------------------------------------------------------------------ */
+.settings-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 70;
+  display: grid;
+  place-items: center;
+  background: oklch(0% 0 0 / 0.35);
+}
+.settings-modal {
+  width: min(680px, calc(100vw - 40px));
+  max-height: min(88vh, 720px);
+  overflow-y: auto;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  padding: 24px;
+  box-shadow: 0 16px 48px oklch(0% 0 0 / 0.22);
+}
+.settings-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--gap-sm);
+}
+.settings-head h3 { margin: 0; font-size: 19px; }
+.settings-group {
+  margin-top: 18px;
+  border-top: 1px solid var(--border);
+  padding-top: 12px;
+}
+.settings-group h4 { margin: 0 0 10px; font-size: 15px; }
+.settings-hint { font-size: 13px; margin: 4px 0 12px; }
+.settings-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 12px;
+}
+.settings-field { display: flex; flex-direction: column; gap: 4px; font-size: 13px; }
+.settings-field span { color: var(--muted); }
+.settings-field input {
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 8px 10px;
+  font: inherit;
+  font-size: 13px;
+  color: var(--fg);
+  background: var(--surface);
+  width: 100%;
+}
+.settings-field input:focus { outline: 2px solid var(--accent-soft); border-color: var(--accent); }
+.settings-check { display: inline-flex; align-items: center; gap: 8px; font-size: 13px; color: var(--fg); cursor: pointer; }
+.settings-field small { display: block; color: var(--muted); font-size: 12px; line-height: 1.35; }
+.mono { font-family: var(--font-mono); font-size: 12px; color: var(--muted); }
+.settings-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 18px; }
+.settings-saved { color: var(--accent); }
+
+/* ------------------------------------------------------------------ */
 /* Additions for the Next.js frontend (not in the original mockup):    */
 /* smooth in-page scrolling for nav links, a disabled state for the    */
 /* buttons while a crawl is running, and the progressive line reveal   */

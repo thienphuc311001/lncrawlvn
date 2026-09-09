@@ -12,13 +12,15 @@ the failure reason).
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
 import uuid
 from collections import deque
 from contextlib import asynccontextmanager
-from typing import Deque, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Deque, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -34,6 +36,7 @@ logger = logging.getLogger(__name__)
 
 _MAX_JOBS = 50
 _MAX_LOG_LINES = 1000
+_SETTINGS_PATH = APP_DIR / "settings.json"
 
 
 class JobLog(BaseModel):
@@ -162,6 +165,7 @@ def _set(job: Job, **fields) -> None:
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     ctx.setup(log_level=logging.WARNING)
+    _apply_settings(_load_settings())
     logger.info("lncrawl-mini API ready (data dir: %s)", APP_DIR)
     yield
     from .services.scraper import ctx_scraper
@@ -190,6 +194,7 @@ class ExtractRequest(BaseModel):
     first: Optional[int] = Field(None, ge=1, description="Only the first N chapters.")
     last: Optional[int] = Field(None, ge=1, description="Only the last N chapters.")
     rate_limit: Optional[float] = Field(None, gt=0, description="Requests per second cap.")
+    workers: Optional[int] = Field(None, ge=1, le=16, description="Concurrent chapter workers.")
     save: bool = Field(True, description="Persist the novel and fetched chapters into the library.")
     only_ids: Optional[List[int]] = Field(
         None, description="Internal: download only these chapter ids (fetch-missing runs)."
@@ -301,6 +306,157 @@ def export_book(book_id: str, format: str = Query("epub", pattern="^(epub|txt)$"
     return FileResponse(zip_path, media_type="application/zip", filename=zip_path.name)
 
 
+class ConfigField(BaseModel):
+    key: str
+    type: str = "text"  # int | float | bool | text
+    label: str = ""
+    help: str = ""
+    value: Any = None
+    default: Any = None
+    min: Optional[float] = None
+    max: Optional[float] = None
+    step: Optional[float] = None
+
+
+def _settings_path() -> Path:
+    return APP_DIR / "settings.json"
+
+
+def _load_settings() -> Dict[str, Any]:
+    path = _settings_path()
+    if not path.is_file():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _persist_settings(values: Dict[str, Any]) -> None:
+    try:
+        _settings_path().write_text(
+            json.dumps(values, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
+    except Exception as e:
+        logger.warning("Could not persist settings: %s", e)
+
+
+def _apply_settings(values: Dict[str, Any]) -> None:
+    fields = {f.key: f for f in CONFIG_FIELDS}
+    for key, value in values.items():
+        field = fields.get(key)
+        if field is None:
+            continue
+        if field.type == "int":
+            value = int(value)
+        elif field.type == "float":
+            value = float(value)
+        elif field.type == "bool":
+            value = bool(value)
+        else:
+            value = str(value)
+        setattr(ctx.config, key, value)
+
+
+CONFIG_FIELDS = [
+    ConfigField(
+        key="max_sessions_per_exit",
+        type="int",
+        min=1,
+        max=8,
+        label="Workers (song song)",
+        help="Song song requests per IP/exit. 2 is gentle, 6 is fast.",
+    ),
+    ConfigField(
+        key="max_attempts",
+        type="int",
+        min=1,
+        max=50,
+        label="Max attempts",
+        help="How many times a request is retried before giving up.",
+    ),
+    ConfigField(
+        key="max_rotations",
+        type="int",
+        min=0,
+        max=20,
+        label="Max rotations",
+        help="Max address rotations when an exit is blocked.",
+    ),
+    ConfigField(
+        key="solve_timeout",
+        type="float",
+        min=1,
+        max=600,
+        label="Solve timeout (s)",
+        help="How long a captcha/challenge may take in the browser.",
+    ),
+    ConfigField(
+        key="archive_max_age",
+        type="float",
+        min=0,
+        max=86400 * 30,
+        label="Archive max age (s)",
+        help="Max age of a cached page (wayback) used instead of a live fetch.",
+    ),
+    ConfigField(key="use_archive", type="bool", label="Use archive", help="Fall back to the wayback machine when a live fetch fails."),
+    ConfigField(
+        key="impersonate",
+        type="text",
+        label="Impersonate",
+        help="Browser identity to impersonate (empty = default).",
+    ),
+    ConfigField(
+        key="browser_mode",
+        type="text",
+        label="Browser mode",
+        help="auto | headed | headless — how the challenge solver runs.",
+    ),
+    ConfigField(key="ignore_images", type="bool", label="Ignore images", help="Skip image downloads during extraction."),
+]
+
+
+@app.get("/api/config", response_model=List[ConfigField])
+def get_config() -> List[ConfigField]:
+    return [f.model_copy(update={"value": getattr(ctx.config, f.key, f.default)}) for f in CONFIG_FIELDS]
+
+
+@app.post("/api/config")
+def set_config(payload: Dict[str, Any]) -> Dict[str, Any]:
+    fields = {f.key: f for f in CONFIG_FIELDS}
+    errors: Dict[str, str] = {}
+    updated: Dict[str, Any] = {}
+    for key, raw in payload.items():
+        field = fields.get(key)
+        if field is None:
+            errors[key] = "Unknown setting"
+            continue
+        try:
+            if field.type == "int":
+                value = int(raw)
+            elif field.type == "float":
+                value = float(raw)
+            elif field.type == "bool":
+                value = bool(raw)
+            else:
+                value = str(raw)
+            if isinstance(value, (int, float)):
+                if field.min is not None and value < field.min:
+                    raise ValueError(f"Minimum is {field.min:g}")
+                if field.max is not None and value > field.max:
+                    raise ValueError(f"Maximum is {field.max:g}")
+        except (TypeError, ValueError) as e:
+            errors[key] = str(e)
+            continue
+        setattr(ctx.config, key, value)
+        updated[key] = value
+    if updated:
+        _persist_settings(updated)
+    if errors:
+        raise HTTPException(status_code=422, detail=errors)
+    return updated
+
+
 def _run_job(job_id: str, req: ExtractRequest) -> None:
     """Execute a crawl job, recording every stage into the job's log."""
     job = JOBS.get_ref(job_id)
@@ -317,6 +473,14 @@ def _run_job(job_id: str, req: ExtractRequest) -> None:
         crawler = Sources().init_crawler(req.url)
         _set(job, source=type(crawler).__name__)
         _log(job, f"Source detected: {type(crawler).__name__}")
+
+        # Optional concurrency: clamp to the source's own ceiling so gentle
+        # sources (e.g. 1qxs, max_sessions_per_exit=1) always override.
+        wanted = req.workers or (ctx.config.max_sessions_per_exit + 1)
+        workers = max(1, min(int(wanted), crawler.max_workers()))
+        if workers != crawler.taskman.workers:
+            crawler.taskman.init_executor(workers)
+        _log(job, f"Workers: {workers}")
 
         if req.rate_limit:
             from .services.scraper import ctx_scraper

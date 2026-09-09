@@ -28,9 +28,10 @@ frontend/
 │   └── page.tsx       # landing page composition
 └── components/
     ├── top-nav.tsx      # sticky navigation
-    ├── hero.tsx         # client: URL input + extract controls
+    ├── hero.tsx         # client: URL input + extract controls + ⚙ settings
     ├── job-runner.tsx   # client: global job context (start/track jobs app-wide)
     ├── job-console.tsx  # client: global dock streaming live job logs
+    ├── settings-modal.tsx # client: crawl tweaks + engine settings (GET/POST /api/config)
     ├── features.tsx     # feature grid
     ├── cta-strip.tsx    # call-to-action band
     └── page-foot.tsx    # footer

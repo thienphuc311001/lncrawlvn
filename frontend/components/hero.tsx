@@ -2,13 +2,16 @@
 
 import { useState } from 'react';
 
-import { useJobRunner } from './job-runner';
+import { useJobRunner, type ExtractOptions } from './job-runner';
+import SettingsModal from './settings-modal';
 
 const EXAMPLE_URL = 'https://xtruyen.vn/truyen/huyen-giam-tien-toc/';
 
 export default function Hero() {
   const [url, setUrl] = useState('');
   const [startError, setStartError] = useState('');
+  const [showSettings, setShowSettings] = useState(false);
+  const [crawlOptions, setCrawlOptions] = useState<ExtractOptions>({});
   const { job, jobStatus, startJob } = useJobRunner();
   const isRunning = job !== null && jobStatus === 'running';
 
@@ -20,7 +23,7 @@ export default function Hero() {
       return;
     }
     setStartError('');
-    startJob(target).catch((error: unknown) => {
+    startJob(target, crawlOptions).catch((error: unknown) => {
       setStartError(error instanceof Error ? error.message : String(error));
     });
   };
@@ -68,6 +71,14 @@ export default function Hero() {
             >
               See example
             </button>
+            <button
+              type="button"
+              className="btn btn-ghost"
+              onClick={() => setShowSettings(true)}
+              title="Crawl & engine settings"
+            >
+              ⚙ Settings
+            </button>
           </div>
           {startError && (
             <p className="muted error-text" style={{ marginTop: '12px' }}>
@@ -76,6 +87,11 @@ export default function Hero() {
           )}
         </div>
       </div>
+      <SettingsModal
+        open={showSettings}
+        onClose={() => setShowSettings(false)}
+        onCrawlOptionsChange={setCrawlOptions}
+      />
     </section>
   );
 }

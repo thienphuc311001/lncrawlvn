@@ -21,6 +21,14 @@ type TrackedJob = {
 
 export type JobStatus = 'idle' | 'running' | 'done' | 'failed';
 
+export type ExtractOptions = {
+  first?: number;
+  last?: number;
+  rate_limit?: number;
+  workers?: number;
+  save?: boolean;
+};
+
 type JobRunnerValue = {
   /** Job the console is currently attached to (null → dock hidden). */
   job: TrackedJob | null;
@@ -31,7 +39,7 @@ type JobRunnerValue = {
   /** Bump to remount the console when the same job id is re-tracked. */
   jobKey: number;
   /** POST /api/extract and start tracking the new job. */
-  startJob: (url: string) => Promise<void>;
+  startJob: (url: string, opts?: ExtractOptions) => Promise<void>;
   /** Attach the console to an existing job (e.g. fetch-missing). */
   trackJob: (jobId: string, label: string) => void;
   /** Hide the console. */
@@ -60,12 +68,18 @@ export default function JobRunnerProvider({ children }: { children: ReactNode })
   const clearJob = useCallback(() => setJob(null), []);
 
   const startJob = useCallback(
-    async (url: string) => {
+    async (url: string, opts: ExtractOptions = {}) => {
       const seq = ++startSeq.current;
+      const body: Record<string, unknown> = { url };
+      if (opts.first !== undefined && opts.first !== null) body.first = opts.first;
+      if (opts.last !== undefined && opts.last !== null) body.last = opts.last;
+      if (opts.rate_limit !== undefined && opts.rate_limit !== null) body.rate_limit = opts.rate_limit;
+      if (opts.workers !== undefined && opts.workers !== null) body.workers = opts.workers;
+      if (opts.save !== undefined) body.save = opts.save;
       const res = await fetch(`${API_BASE}/api/extract`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url }),
+        body: JSON.stringify(body),
       });
       if (!res.ok && res.status !== 202) {
         const detail = await res.json().catch(() => null);
