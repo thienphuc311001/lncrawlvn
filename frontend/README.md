@@ -1,9 +1,9 @@
 # lncrawl-mini · frontend
 
-Next.js landing page for **lncrawl-mini**, ported from the static mockup at
-[`../index.html`](../index.html). Clicking **Extract novel** (or pressing **Enter**
-in the URL field) plays an animated crawl simulation in the terminal panel —
-no backend calls are made.
+Next.js frontend for **lncrawl-mini**. Clicking **Extract novel** (or pressing
+**Enter** in the URL field) starts a real crawl job on the backend; the global
+job console docked at the bottom of the screen streams its live log from
+anywhere in the UI (Extract, Books, book detail — tab switches never lose it).
 
 ## Requirements
 
@@ -29,7 +29,8 @@ frontend/
 └── components/
     ├── top-nav.tsx      # sticky navigation
     ├── hero.tsx         # client: URL input + extract controls
-    ├── demo-output.tsx  # client: animated terminal crawl simulation
+    ├── job-runner.tsx   # client: global job context (start/track jobs app-wide)
+    ├── job-console.tsx  # client: global dock streaming live job logs
     ├── features.tsx     # feature grid
     ├── cta-strip.tsx    # call-to-action band
     └── page-foot.tsx    # footer

@@ -2,6 +2,8 @@
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
 
+import { useJobRunner } from './job-runner';
+
 const API_BASE = 'http://127.0.0.1:8000';
 const POLL_INTERVAL_MS = 800;
 /** Mirrors CHAPTERS_PER_FOLDER in lncrawl/library.py */
@@ -25,19 +27,18 @@ type ChapterContent = { id: number; title: string; url: string; body: string };
 
 type ReaderState = { loading: boolean; chapter: ChapterContent | null; error: string };
 
-type FetchJobState = { jobId: string; done: number; total: number; status: string; error: string };
-
 function folderRange(chapterId: number): { start: number; end: number } {
   const start = Math.floor((chapterId - 1) / FOLDER_SIZE) * FOLDER_SIZE + 1;
   return { start, end: start + FOLDER_SIZE - 1 };
 }
 
 export default function BookDetail({ bookId, onBack }: { bookId: string; onBack: () => void }) {
+  const { trackJob } = useJobRunner();
   const [book, setBook] = useState<Book | null>(null);
   const [error, setError] = useState('');
   const [openFolders, setOpenFolders] = useState<Set<number>>(() => new Set([1]));
   const [reader, setReader] = useState<ReaderState>({ loading: false, chapter: null, error: '' });
-  const [fetchJob, setFetchJob] = useState<FetchJobState | null>(null);
+  const [fetching, setFetching] = useState(false);
   const [exportError, setExportError] = useState('');
   const [exporting, setExporting] = useState<'epub' | 'txt' | null>(null);
 
@@ -91,6 +92,7 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
 
   const startFetchMissing = useCallback(async () => {
     setExportError('');
+    setFetching(true);
     try {
       const res = await fetch(
         `${API_BASE}/api/books/${encodeURIComponent(bookId)}/fetch-missing`,
@@ -98,34 +100,25 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
       );
       const data = await res.json();
       if (!res.ok) throw new Error(data?.detail || `API returned ${res.status}`);
-      setFetchJob({ jobId: data.job_id, done: 0, total: 0, status: data.status, error: '' });
+      // Console dock polls and streams this job's logs from anywhere in the UI.
+      trackJob(data.job_id, `Fetch missing — ${book?.title || bookId}`);
 
-      let job = data;
-      while (job.status !== 'done' && job.status !== 'failed') {
+      let status: string = data.status;
+      while (status === 'running' || status === 'pending') {
         await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
-        const poll = await fetch(`${API_BASE}/api/jobs/${job.job_id}`);
+        const poll = await fetch(`${API_BASE}/api/jobs/${data.job_id}`);
         if (!poll.ok) throw new Error(`Job poll returned ${poll.status}`);
-        job = await poll.json();
-        setFetchJob({
-          jobId: job.job_id,
-          done: job.saved_count,
-          total: job.chapters.length,
-          status: job.status,
-          error: job.error || '',
-        });
+        const job = await poll.json();
+        status = job.status;
+        if (job.status === 'failed' && job.error) setExportError(job.error);
       }
-      setFetchJob((prev) =>
-        prev && prev.jobId === job.job_id
-          ? { ...prev, status: job.status, error: job.error || '' }
-          : prev,
-      );
       await load();
-      setTimeout(() => setFetchJob((prev) => (prev?.jobId === job.job_id ? null : prev)), 4000);
     } catch (e) {
-      setFetchJob(null);
       setExportError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setFetching(false);
     }
-  }, [bookId, load]);
+  }, [bookId, book?.title, load, trackJob]);
 
   const exportBook = useCallback(
     async (format: 'epub' | 'txt') => {
@@ -222,10 +215,10 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
               <button
                 type="button"
                 className="btn btn-primary"
-                disabled={missingCount === 0 || fetchJob !== null}
+                disabled={missingCount === 0 || fetching}
                 onClick={() => void startFetchMissing()}
               >
-                {fetchJob ? 'Fetching…' : `Fetch missing (${missingCount})`}
+                {fetching ? 'Fetching…' : `Fetch missing (${missingCount})`}
               </button>
               <button
                 type="button"
@@ -245,13 +238,6 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
               </button>
             </div>
             {exportError && <p className="muted error-text">✗ {exportError}</p>}
-            {fetchJob && (
-              <p className="muted">
-                Fetching missing chapters… {fetchJob.done}
-                {fetchJob.total ? `/${fetchJob.total}` : ''} saved · status={fetchJob.status}
-                {fetchJob.error ? ` · ${fetchJob.error}` : ''}
-              </p>
-            )}
           </div>
         </div>
 

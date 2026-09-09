@@ -252,47 +252,109 @@ h1, h2, h3, h4 { text-wrap: balance; }
 .hero-split    { display: grid; grid-template-columns: 1fr 1fr; gap: var(--gap-2xl); align-items: center; }
 @media (max-width: 920px) { .hero-split { grid-template-columns: 1fr; } }
 
-.log-row { display: grid; grid-template-columns: 120px 1fr 100px; gap: var(--gap-lg); padding: 22px 0; border-top: 1px solid var(--border); align-items: baseline; }
-.log-row .meta { color: var(--muted); }
-.log-row h3 { font-size: 19px; }
-.log-row .pull { text-align: right; }
-
-.demo-output {
+/* ------------------------------------------------------------------ */
+/* Global job console dock (replaces the old .demo-output terminal):   */
+/* fixed to the bottom edge so the live crawl log is reachable from    */
+/* every tab; collapses to a one-line status bar and shows a floating  */
+/* status button while running and collapsed.                          */
+/* ------------------------------------------------------------------ */
+.job-console {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: 60;
   background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: var(--radius-lg);
-  padding: 24px;
+  border-top: 1px solid var(--border);
+  box-shadow: 0 -8px 24px oklch(0% 0 0 / 0.08);
   font-family: var(--font-mono);
   font-size: 13px;
-  line-height: 1.7;
-  color: var(--muted);
-  overflow-x: auto;
-  max-height: 480px;
-  overflow-y: auto;
+  color: var(--fg);
 }
-.demo-output .line { display: block; }
-.demo-output .success { color: var(--accent); }
-.demo-output .error { color: oklch(55% 0.2 25); }
-.demo-output .warning { color: oklch(65% 0.15 75); }
+.job-console-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--gap-sm);
+  padding: 10px var(--gutter);
+  max-width: var(--container);
+  margin-inline: auto;
+}
+.job-console-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+}
+.jc-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); flex: none; }
+.jc-dot.running { background: oklch(65% 0.15 75); animation: jc-pulse 1.2s ease-in-out infinite; }
+.jc-dot.done    { background: var(--accent); }
+.jc-dot.failed  { background: oklch(55% 0.2 25); }
+@keyframes jc-pulse {
+  0%, 100% { opacity: 1; }
+  50%      { opacity: 0.35; }
+}
+.jc-status { font-size: 11px; letter-spacing: 0.08em; color: var(--muted); flex: none; }
+.jc-status.done   { color: var(--accent); }
+.jc-status.failed { color: oklch(55% 0.2 25); }
+.jc-name { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.jc-meta { color: var(--muted); white-space: nowrap; flex: none; }
+.job-console-actions { display: inline-flex; gap: 4px; flex: none; }
+.job-console-body {
+  max-height: 40vh;
+  overflow-y: auto;
+  overflow-x: auto;
+  padding: 16px var(--gutter) 20px;
+  line-height: 1.7;
+  border-top: 1px solid var(--border);
+}
+.job-console-body .line { display: block; white-space: pre-wrap; word-break: break-word; }
+.job-console-body .error   { color: oklch(55% 0.2 25); }
+.job-console-body .warning { color: oklch(65% 0.15 75); }
+.job-console-fab {
+  position: fixed;
+  right: 24px;
+  bottom: 64px;
+  z-index: 60;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 14px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--surface);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+  box-shadow: 0 8px 24px oklch(0% 0 0 / 0.12);
+}
+.job-console-fab:hover { border-color: var(--fg); }
 
 /* ------------------------------------------------------------------ */
 /* Additions for the Next.js frontend (not in the original mockup):    */
 /* smooth in-page scrolling for nav links, a disabled state for the    */
 /* buttons while a crawl is running, and the progressive line reveal   */
-/* plus blinking cursor used by the animated crawl demo.               */
+/* plus blinking cursor used by the global job console.                */
 /* ------------------------------------------------------------------ */
 html { scroll-behavior: smooth; }
 #hero, #features { scroll-margin-top: 84px; }
 .btn:disabled { cursor: default; opacity: 0.55; transform: none; }
 .btn:disabled:hover { background: var(--accent); }
 
-.demo-output .line-in { animation: line-in 0.22s ease-out both; }
+.job-console .line-in { animation: line-in 0.22s ease-out both; }
 @keyframes line-in {
   from { opacity: 0; transform: translateY(4px); }
   to   { opacity: 1; transform: none; }
 }
 
-.demo-output .demo-cursor {
+.job-cursor {
   display: inline-block;
   width: 8px;
   height: 13px;

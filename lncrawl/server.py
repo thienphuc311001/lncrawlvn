@@ -103,6 +103,9 @@ class Job(BaseModel):
     error: Optional[str] = None
     started_at: float = 0.0
     finished_at: Optional[float] = None
+    first_log_index: int = Field(
+        0, description="Global index of logs[0]; grows when old lines are evicted."
+    )
     logs: List[JobLog] = []
     chapters: List[JobChapter] = []
 
@@ -144,8 +147,10 @@ def _log(job: Job, message: str, level: str = "info") -> None:
         job.logs.append(
             JobLog(t=round(time.time() - job.started_at, 2), level=level, message=message)
         )
-        if len(job.logs) > _MAX_LOG_LINES:
-            del job.logs[: len(job.logs) - _MAX_LOG_LINES]
+        overflow = len(job.logs) - _MAX_LOG_LINES
+        if overflow > 0:
+            del job.logs[:overflow]
+            job.first_log_index += overflow
 
 
 def _set(job: Job, **fields) -> None:
