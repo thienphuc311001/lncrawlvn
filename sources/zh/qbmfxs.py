@@ -3,10 +3,16 @@
 import base64
 import logging
 import re
-from typing import Optional
+import time
+from typing import TYPE_CHECKING, Optional
+
+from scraper import Action, Blocked, Diagnosis, Layer
 
 from lncrawl.core import Chapter, Novel, PageSoup, SoupTemplate
 from lncrawl.exceptions import LNException
+
+if TYPE_CHECKING:
+    from requests import Response
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +31,21 @@ MAX_SPLITS = 100
 # it is plain text separated by <br>, so the paragraph-based cleaner rules
 # cannot reach it and it is dropped here instead.
 SUMMARY_BOILERPLATE = re.compile(r"<p>[^<]*小说为转载作品[^<]*</p>")
+# Under the server's concurrent workers a burst of chapter requests trips the
+# site's per-IP limiter, which answers HTTP 403 with a 访问太频繁 body. A bare
+# 403 carries no vendor signalling, so the scraper's generic detector cannot
+# attribute it, every tier refuses, and get_soup raises Blocked instead of
+# backing off — the refusal never reaches check_response. It is ridden out
+# where it surfaces, in _read_page. The page says 30 seconds; the limiter
+# stops refusing sooner, so the first retry lands inside the recovery window.
+BLOCKED_RETRY_AFTER_SECONDS = 30.0
+MAX_BLOCKED_ATTEMPTS = 4
+# The bare-request 网络错误 shell (class="title">出错了 header, "网络错误,请
+# 点击刷新按钮重试" body) is the site's own "not now" answer served as 200.
+# Keep it inside the scraper's loop through check_response so the window is
+# waited out there rather than parsed as an empty page.
+ERROR_SHELL_MARKER = "网络错误,请点击刷新按钮重试"
+SHELL_RETRY_AFTER_SECONDS = 30.0
 
 
 class QbmFxsCrawler(SoupTemplate):
@@ -47,6 +68,12 @@ class QbmFxsCrawler(SoupTemplate):
     any first page plants the `uid`/`refresh_token` cookies the catalog
     requires, and the internal Referer the reader sketch serves with comes
     from the scraper's navigation chain automatically.
+
+    The site's per-IP limiter refuses bursts of concurrent chapter requests
+    with a 403 访问太频繁 page. That refusal escapes the scraper as a Blocked
+    error (it never reaches check_response, which only sees clean responses),
+    so it is waited out in _read_page, and the 200 网络错误 shell is backed
+    off inside the scraper's loop through check_response.
     """
 
     base_url = ["https://www.qbmfxs.com/"]
@@ -89,13 +116,66 @@ class QbmFxsCrawler(SoupTemplate):
             holder = PageSoup.create(f"<p>{content}</p>").select_one("p")
             novel.synopsis = self.cleaner.extract_contents(holder)
 
+    # ------------------------------------------------------------------ #
+    # Refusals the scraper's own detectors cannot see
+    # ------------------------------------------------------------------ #
+
+    def check_response(self, response: "Response", body: str) -> Optional[Diagnosis]:
+        # The 网络错误 shell is the site's own way of saying "not now": keep it
+        # inside the scraper's loop so the window is waited out there instead
+        # of being parsed as an empty page.
+        if ERROR_SHELL_MARKER in body:
+            return Diagnosis(
+                action=Action.BACKOFF,
+                layer=Layer.WORKERS,
+                detail="the site's edge served its 网络错误 shell instead of the page",
+                retry_after=SHELL_RETRY_AFTER_SECONDS,
+            )
+        return None
+
+    def get_novel_soup(self, novel: Novel) -> PageSoup:
+        # The limiter is per-IP and shared by the whole process: even the
+        # novel page can land on a 403 while another job is mid-crawl.
+        page = self._read_page(self.build_novel_url(novel))
+        if page is None:
+            raise LNException(f"Novel page not readable at {novel.url}")
+        return page
+
+    def _read_page(self, url: str) -> Optional[PageSoup]:
+        """Fetch one page, riding out the 403 访问太频繁 limiter window.
+
+        The refusal never reaches check_response — that hook only sees clean
+        responses — so it surfaces from get_soup as a Blocked error. Widen
+        the shared pacing interval for this host, sleep out the window, and
+        fetch the same page again; give up after the budget so a genuinely
+        spent page still fails loudly.
+        """
+        key = self.scraper.memory.key(url)
+        for attempt in range(MAX_BLOCKED_ATTEMPTS):
+            try:
+                return self.scraper.get_soup(url)
+            except Blocked as e:
+                wait = BLOCKED_RETRY_AFTER_SECONDS * (attempt + 1)
+                widened = self.scraper.pacer.throttled(key, wait)
+                logger.warning(
+                    f"Rate limited on {url} (attempt {attempt + 1} of "
+                    f"{MAX_BLOCKED_ATTEMPTS}); waiting {widened:.0f}s: {e}"
+                )
+                time.sleep(widened)
+            except Exception as e:
+                logger.warning(f"Failed to fetch {url}: {e}")
+                return None
+        return None
+
     def parse_toc(self, soup: PageSoup, novel: Novel) -> None:
         # The novel page renders only the newest chapters; the full catalog is
         # a separate page linked as 查看完整目录.
         link = soup.select_one('a[href*="/list_1/"]')
         if not link:
             raise LNException("No catalog link found")
-        catalog = self.scraper.get_soup(self.absolute_url(link["href"]))
+        catalog = self._read_page(self.absolute_url(link["href"]))
+        if catalog is None:
+            raise LNException(f"Catalog page not readable at {link['href']}")
         for anchor in catalog.select("div.catalog div.list ul li a"):
             title = anchor.select_one("p.line_1") or anchor
             novel.add_chapter(
@@ -115,7 +195,9 @@ class QbmFxsCrawler(SoupTemplate):
         raws = []
         current = url
         for _ in range(MAX_SPLITS):
-            page = self.scraper.get_soup(current)
+            page = self._read_page(current)
+            if page is None:
+                raise LNException(f"Chapter page not readable at {current}")
             body = page.select_one("div.read div.content") or page.select_one("div.content")
             if not body:
                 raise LNException(f"No chapter body found at {current}")
