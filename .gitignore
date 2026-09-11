@@ -26,6 +26,7 @@ Thumbs.db
 .idea/
 .vscode/
 .claude/
+.cline/
 
 # Downloaded novels & crawled library data
 light_novels/

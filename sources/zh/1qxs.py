@@ -21,7 +21,9 @@ logger = logging.getLogger(__name__)
 # redirects back to itself. The mobile edge serves the same book, the same
 # chapter ids and the same split pages, under a window that drains in
 # minutes. Every page is therefore fetched through it; the desktop host is
-# kept in base_url only so its URLs still resolve to this crawler.
+# kept in base_url only so its URLs still resolve to this crawler. It still
+# serves the novel page's newest-chapter panel, so a single desktop read per
+# crawl seeds the chapter walk with those titles.
 MOBILE_HOST = "https://m.1qxs.com"
 
 # Novel page: /xs_1/{bookId}.html — the xs_N segment is the site channel.
@@ -33,6 +35,9 @@ NOVEL_PATH = re.compile(r"/(xs_\d+)/(\d+)(?:\.html)?/?$")
 CHAPTER_LINK = re.compile(r"/xs_\d+/(\d+)/(\d+)(?:\.html)?")
 # Chapter titles carry their split-page counter: 第1章 收租，然后遇见医学奇迹(1/5)
 SPLIT_SUFFIX = re.compile(r"\s*[（(]\d+/\d+[)）]\s*$")
+# Anchor texts that are buttons, not chapter titles: the mobile novel page
+# links its newest chapter from a "免费阅读" / "开始阅读" promo block too.
+BAD_ANCHOR_TITLES = re.compile(r"免费阅读|开始阅读|继续阅读|小说免费阅读|1qxs\.com")
 # Promo line repeated as the first paragraph of every split page.
 PROMO_TEXT = re.compile(r"小说免费阅读|1qxs\.com")
 # The visible half of a mobile chapter page ends with a teaser saying the
@@ -63,6 +68,23 @@ SHELL_RETRY_AFTER_SECONDS = 90.0
 # not-found shell answers instantly, so this many in a row means the ids no
 # longer belong to this book (or every page is being refused), not a gap.
 MAX_CONSECUTIVE_MISSES = 10
+# The desktop host keeps a second, far smaller budget: ~15 chapter pages
+# while fresh, then refusals for hours. It is only ever spent where the
+# answer is worth more than the mobile pace — the novel page's
+# server-rendered newest-chapter titles, plus a short probe of the lowest
+# ids — and each phase ends at the first page that is not a real chapter, so
+# a spent window costs one request (the one that proved it).
+_DESKTOP_HOST = "https://www.1qxs.com"
+DESKTOP_PROBE_BUDGET = 12
+DESKTOP_PROBE_DELAY = 1.0
+# A learned mobile interval outside this band is treated as noise and
+# reseeded with the default: narrower would be an unmeasured guess about the
+# window, wider would stall a crawl on one bad day for everyone after it.
+MOBILE_MIN_SAFE_INTERVAL = 6.0
+MOBILE_MAX_SAFE_INTERVAL = 90.0
+# How often the chapter-list walk reports to the job console. At a ~10 s pace
+# this is a line every two to three minutes, each with an ETA.
+TOC_HEARTBEAT_EVERY = 15
 
 
 class YiqiNovelCrawler(SoupTemplate):
@@ -75,7 +97,11 @@ class YiqiNovelCrawler(SoupTemplate):
        and there is no JSON API behind them. But chapter ids are dense
        integers from 1, so the list is rebuilt by walking
        /xs_1/{bookId}/{chapterId} up to the newest id linked on the novel
-       page. A missing id in the middle (a deleted chapter) is skipped.
+       page. The walk is seeded with titles the pages already render — the
+       novel page's newest-chapter panel and one read of the desktop novel
+       page — and the lowest ids may be resolved on the desktop edge while it
+       still serves. A missing id in the middle (a deleted chapter) is
+       skipped, and the walk reports its progress and an ETA as it goes.
     2. Long chapters are split across {chapterId}, {chapterId}/2, ...
        chained by the 下一页 link — which on the last split points at the
        next chapter, so the walk is bounded by comparing chapter ids. On
@@ -130,15 +156,31 @@ class YiqiNovelCrawler(SoupTemplate):
         )
         # The crawler is opened on the desktop origin, where Sources taught the
         # pacer this source's rate limit — but every page is fetched through
-        # the mobile host, and pacing is keyed by host. Teach the mobile
-        # clock the same interval or it runs at the default 3s and spends
-        # the window within the first ~25 pages. Both the pacer and the
-        # persisted profile: fetch() re-learns the interval from the profile
-        # on every call, so a stale value there would stomp this one.
+        # the mobile host, and pacing is keyed by host. Teach the mobile clock
+        # the same interval or it runs at the default 3s and spends the window
+        # within the first ~25 pages. Both the pacer and the persisted profile:
+        # fetch() re-learns the interval from the profile on every call, so a
+        # stale value there would stomp this one.
+        #
+        # A profile interval wider than the default is a lesson an earlier run
+        # paid a blocked window to learn — the edge is refusing, so keeping the
+        # walk slow is cheaper than re-spending the window in the first few
+        # minutes. Preserve it; only seed the default for a host never paced.
         mobile_profile = self.scraper.memory.profile(MOBILE_HOST)
-        mobile_profile.interval = 1.0 / self.request_rate_limit
+        known_interval = float(getattr(mobile_profile, "interval", 0.0) or 0.0)
+        if not MOBILE_MIN_SAFE_INTERVAL <= known_interval <= MOBILE_MAX_SAFE_INTERVAL:
+            known_interval = 1.0 / self.request_rate_limit
+            mobile_profile.interval = known_interval
         self.scraper.memory.touch()
-        self.scraper.pacer.learn(mobile_profile.origin, mobile_profile.interval)
+        self.scraper.pacer.learn(mobile_profile.origin, known_interval)
+
+        # The desktop host sees at most a handful of requests per run (see
+        # parse_toc); keep them spaced so they slot into whatever window the
+        # edge still has without reading as a burst.
+        desktop_profile = self.scraper.memory.profile(_DESKTOP_HOST)
+        desktop_profile.interval = DESKTOP_PROBE_DELAY
+        self.scraper.memory.touch()
+        self.scraper.pacer.learn(desktop_profile.origin, DESKTOP_PROBE_DELAY)
 
     # ------------------------------------------------------------------ #
     # Refusals the scraper's own detectors cannot see
@@ -222,12 +264,36 @@ class YiqiNovelCrawler(SoupTemplate):
     # ------------------------------------------------------------------ #
 
     def parse_toc(self, soup: PageSoup, novel: Novel) -> None:
-        book_id, latest_id = self._latest_chapter(soup, novel)
+        book_id, mobile_latest = self._latest_chapter(soup, novel)
+        if book_id < 1:
+            raise Exception(f"No chapter links on {novel.url}")
+        channel = self._novel_channel(novel)
+
+        # Titles the pages already serve are trusted and never re-probed: the
+        # novel page names its newest chapters, and the desktop novel page
+        # server-renders the same panel. A spent desktop edge simply yields
+        # fewer of them.
+        titles: dict[int, str] = self._chapter_titles_from_soup(soup, book_id)
+        desktop_titles = self._harvest_desktop_titles(channel, book_id)
+        titles.update(desktop_titles)
+        latest_id = max(mobile_latest, *(desktop_titles or (0,)))
         if latest_id < 1:
             raise Exception(f"No chapters found for {novel.url}")
-        channel = self._novel_channel(novel)
+        titles.update(self._probe_desktop_head(channel, book_id, titles))
+
+        unknown = max(0, latest_id - len(titles))
+        logger.info(
+            f"Rebuilding the chapter list: {unknown} chapter ids to check on the "
+            f"mobile edge ({len(titles)} already known) — roughly "
+            f"{unknown / 6:.0f} minutes at the site's measured pace"
+        )
+        started = time.time()
+        requests = 0
         consecutive_misses = 0
         for chapter_id in range(1, latest_id + 1):
+            if chapter_id in titles:
+                continue
+            requests += 1
             url = f"{MOBILE_HOST}/{channel}/{book_id}/{chapter_id}"
             page = self._read_page(url)
             title = self._page_title(page) if page else None
@@ -240,7 +306,24 @@ class YiqiNovelCrawler(SoupTemplate):
                 logger.warning(f"Skipping missing chapter id {chapter_id} of book {book_id}")
                 continue
             consecutive_misses = 0
-            novel.add_chapter(title=title, url=url)
+            titles[chapter_id] = title
+            if requests % TOC_HEARTBEAT_EVERY == 0:
+                rate = (time.time() - started) / requests
+                remaining = max(1, latest_id - chapter_id - 1)
+                logger.info(
+                    f"TOC walk: {chapter_id}/{latest_id} ids · {len(titles)} chapters "
+                    f"found · ~{remaining * rate / 60:.0f} min left"
+                )
+
+        for chapter_id, title in sorted(titles.items()):
+            novel.add_chapter(
+                id=chapter_id,
+                title=title,
+                url=f"{MOBILE_HOST}/{channel}/{book_id}/{chapter_id}",
+            )
+        logger.info(
+            f"TOC walk finished: {len(novel.chapters)} chapters in {time.time() - started:.0f}s"
+        )
 
     # ------------------------------------------------------------------ #
     # Chapter body
@@ -248,6 +331,7 @@ class YiqiNovelCrawler(SoupTemplate):
 
     def download_chapter(self, chapter: Chapter) -> None:
         chapter_id = self._chapter_id(chapter.url)
+        logger.info(f"Fetching chapter {chapter_id} — {(chapter.title or '').strip()}")
         parts: list[str] = []
         url = chapter.url
         while url:
@@ -302,6 +386,96 @@ class YiqiNovelCrawler(SoupTemplate):
         if not link:
             raise Exception(f"Not a chapter page URL: {url}")
         return int(link.group(2))
+
+    def _chapter_titles_from_soup(self, soup: PageSoup, book_id: int) -> dict:
+        """(id, title) for every chapter the page already names.
+
+        Used on the novel pages, which server-render their newest chapters as
+        links; the walk can then skip those ids instead of paying a paced
+        request for each. The mobile panel wraps each link in a div.time
+        (a date or "15小时前") plus a div.line_1 (the title); the desktop panel
+        puts the title directly in the anchor — the line_1 branch is preferred
+        wherever the two coexist. Promotional buttons ("免费阅读") link the
+        newest chapter as well and seed nothing.
+        """
+        titles: dict[int, str] = {}
+        for anchor in soup.select("a[href]"):
+            link = CHAPTER_LINK.search(str(anchor.get("href") or ""))
+            if not link or int(link.group(1)) != book_id:
+                continue
+            line = anchor.select_one("div.line_1")
+            text = line.text if line else anchor.text
+            text = " ".join(text.split())
+            text = SPLIT_SUFFIX.sub("", text).strip()
+            if not text or BAD_ANCHOR_TITLES.search(text):
+                continue
+            titles.setdefault(int(link.group(2)), text)
+        return titles
+
+    def _harvest_desktop_titles(self, channel: str, book_id: int) -> dict:
+        """Newest-chapter titles from the desktop novel page, if it answers.
+
+        One request, on the desktop edge's small budget; a refusal (or a stale
+        window) reads as an empty harvest rather than an error.
+        """
+        page = self._peek_desktop(f"{_DESKTOP_HOST}/{channel}/{book_id}.html")
+        if page is None:
+            return {}
+        return self._chapter_titles_from_soup(page, book_id)
+
+    def _probe_desktop_head(self, channel: str, book_id: int, known: dict) -> dict:
+        """Resolve the lowest chapter ids on the desktop edge while it serves.
+
+        The mobile walk pays its full ~10 s pace for every id; the desktop edge
+        answers fast while its window is fresh (~15 chapter pages, then hours
+        of refusals). The budget is hard-capped here and the phase ends at the
+        first page that is not a real chapter — so on a spent edge it costs one
+        request, and on a fresh one it replaces a handful of mobile requests.
+        """
+        found: dict[int, str] = {}
+        for chapter_id in range(1, DESKTOP_PROBE_BUDGET + 1):
+            if chapter_id in known:
+                continue
+            page = self._peek_desktop(
+                f"{_DESKTOP_HOST}/{channel}/{book_id}/{chapter_id}.html"
+            )
+            if page is None:
+                break
+            title = self._page_title(page)
+            if not title:
+                break
+            found[chapter_id] = title
+        if found:
+            logger.info(f"Resolved {len(found)} leading chapter ids on the desktop edge")
+        return found
+
+    def _peek_desktop(self, url: str) -> Optional[PageSoup]:
+        """One budgeted desktop fetch that never rides a backoff.
+
+        The crawler's check_response maps the site's 出错了 shell to a long
+        BACKOFF; on the desktop edge that shell is the *expected* answer once
+        the window is spent, so waiting it out is exactly what a budgeted probe
+        must not do. The check is set aside for this single read, and every
+        non-page outcome — shell, error, timeout, HTTP failure — returns None.
+        """
+        saved = self.scraper.check_response
+        self.scraper.check_response = None
+        text: Optional[str] = None
+        try:
+            response = self.scraper.fetch("GET", url, navigation=False, timeout=(8, 15))
+            if response.status_code == 200:
+                text = response.text
+        except Exception:
+            pass
+        finally:
+            self.scraper.check_response = saved
+        if not text:
+            return None
+        if ERROR_SHELL_MARKER in text or ERROR_SHELL_NOT_FOUND in text:
+            return None
+        if "<h1" not in text:
+            return None
+        return self.scraper.make_soup(text)
 
     def _read_page(self, url: str) -> Optional[PageSoup]:
         """Fetch one page through the mobile edge, riding out spent windows.

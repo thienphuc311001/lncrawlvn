@@ -16,10 +16,11 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Chapter or split-page link: /book_1/{bookId}/{chapterId}.html, and
-# /book_1/{bookId}/{chapterId}/{pageNo}.html for splits after the first.
-# Group 2 is the chapter id; group 3 only exists on later splits.
-CHAPTER_LINK = re.compile(r"/book_\d+/(\d+)/(\d+)(?:/(\d+))?\.html")
+# Chapter or split-page link: /book_1/{bookId}/{chapterId}[.html], and
+# /book_1/{bookId}/{chapterId}/{pageNo}[.html] for splits after the first.
+# The extension is optional because chapter fetching strips it (see
+# EXT_SUFFIX); group 2 is the chapter id, group 3 only exists on later splits.
+CHAPTER_LINK = re.compile(r"/book_\d+/(\d+)/(\d+)(?:/(\d+))?(?:\.html)?")
 # The hidden remainder of a split page travels base64 in an inline p_key
 # variable; the site's own reader decodes it and appends it to div.content.
 P_KEY = re.compile(r"p_key='([^']+)'")
@@ -27,6 +28,11 @@ P_KEY = re.compile(r"p_key='([^']+)'")
 # smaller; the cap only guards against a changed layout making the chain
 # circular.
 MAX_SPLITS = 100
+# The .html form of a chapter page deliberately ships a truncated body with an
+# empty p_key — the extension-less form of the same path serves the full text:
+# /book_1/{bookId}/{chapterId}.html -> cut mid-sentence, p_key=''
+# /book_1/{bookId}/{chapterId}      -> complete body, p_key carries the rest
+EXT_SUFFIX = ".html"
 # The novel page's description div closes with a "reprinted work" recap line;
 # it is plain text separated by <br>, so the paragraph-based cleaner rules
 # cannot reach it and it is dropped here instead.
@@ -95,6 +101,12 @@ class QbmFxsCrawler(SoupTemplate):
             "小说免费阅读，请收藏",
             "更换谷歌浏览器即可正常阅读",
             "本章未完，点击",
+            # The mobile template also injects anti-scrape notices between
+            # paragraphs; the pipe-spaced forms defeat plain substring matching.
+            # Keep these raw strings — tag_contains_bad_text joins and compiles
+            # the list itself, so a precompiled pattern would be str()-mangled.
+            r"阅\|读\|模\|式",
+            r"加\|载\|更\|多",
         ]
 
     def parse_authors(self, soup: PageSoup, novel: Novel) -> None:
@@ -184,7 +196,11 @@ class QbmFxsCrawler(SoupTemplate):
             )
 
     def download_chapter(self, chapter: Chapter) -> None:
+        # The extension-less form of the chapter path serves the complete page;
+        # the .html form truncates the body and empties p_key.
         url = self.build_chapter_url(chapter)
+        if url.endswith(EXT_SUFFIX):
+            url = url[: -len(EXT_SUFFIX)]
         link = CHAPTER_LINK.search(url)
         if not link:
             raise LNException(f"Not a chapter page URL: {url}")
@@ -233,12 +249,21 @@ class QbmFxsCrawler(SoupTemplate):
         id differs.
         """
         anchor = page.select_one("a#next[href]")
+        if anchor is None:
+            # The mobile template leaves its pagination links unnamed; both
+            # templates label the split-chain link with 下一页.
+            for candidate in page.select("a[href]"):
+                if "下一页" in (candidate.get_text(strip=True) or ""):
+                    anchor = candidate
+                    break
         if not anchor:
             return None
         href = str(anchor.get("href") or "").strip()
         if not href or href.startswith("javascript") or href == "#":
             return None
         next_url = self.absolute_url(href)
+        if next_url.endswith(EXT_SUFFIX):
+            next_url = next_url[: -len(EXT_SUFFIX)]
         if next_url == current:
             return None
         link = CHAPTER_LINK.search(next_url)

@@ -57,11 +57,12 @@ export default function SettingsModal({ open, onClose, onCrawlOptionsChange }: S
   const updateCrawl = (key: keyof ExtractOptions, value: number | boolean | string) => {
     const next: ExtractOptions = { ...crawl };
     const numberKeys: (keyof ExtractOptions)[] = ['first', 'last', 'rate_limit', 'workers'];
+    const boolKeys: (keyof ExtractOptions)[] = ['save', 'overwrite'];
     if (numberKeys.includes(key) && typeof value === 'string') {
       const parsed = value === '' ? undefined : Number(value);
       (next as Record<string, unknown>)[key] = parsed;
-    } else if (key === 'save') {
-      next.save = Boolean(value);
+    } else if (boolKeys.includes(key)) {
+      (next as Record<string, unknown>)[key] = Boolean(value);
     }
     setCrawl(next);
     onCrawlOptionsChange(next);
@@ -152,6 +153,14 @@ export default function SettingsModal({ open, onClose, onCrawlOptionsChange }: S
                 onChange={(e) => updateCrawl('save', e.target.checked)}
               />
               <span>Save to library</span>
+            </label>
+            <label className="settings-check">
+              <input
+                type="checkbox"
+                checked={crawl.overwrite === true}
+                onChange={(e) => updateCrawl('overwrite', e.target.checked)}
+              />
+              <span>Ghi đè chương đã lưu (repair re-crawl)</span>
             </label>
           </div>
         </section>

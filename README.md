@@ -29,13 +29,14 @@ installer lives at `scripts/lnmini.sh`; copy it anywhere on your `PATH` as
 | `/api/health` | GET | Liveness probe |
 | `/api/config` | GET | Engine settings with metadata (type, min/max, label, current value) |
 | `/api/config` | POST | Update engine settings (max_sessions_per_exit, max_attempts, solve_timeout, use_archive, impersonate, browser_mode, …); persisted to `~/.lncrawl-mini/settings.json` |
-| `/api/extract` | POST | Start a crawl job: `{ "url": "...", "first": 5, "workers": 4, "rate_limit": 1.5 }` → `202` + job (or the finished job with `"sync": true`). Every crawl is saved to the library by default (`"save": false` opts out); `workers` (clamped to the source's own ceiling) controls chapter concurrency |
+| `/api/extract` | POST | Start a crawl job: `{ "url": "...", "first": 5, "workers": 4, "rate_limit": 1.5 }` → `202` + job (or the finished job with `"sync": true`). Every crawl is saved to the library by default (`"save": false` opts out); `workers` (clamped to the source's own ceiling) controls chapter concurrency; `"overwrite": true` replaces already-saved chapters with the re-crawled bodies (repair truncated copies) |
 | `/api/jobs/{job_id}` | GET | Job progress: status, timestamped stage logs, per-chapter success/failure + reasons |
 | `/api/books` | GET | All books in the library with saved/total chapter counts |
 | `/api/books/{book_id}` | GET | Book metadata + full TOC annotated with per-chapter saved/missing flags |
 | `/api/books/{book_id}/cover` | GET | Downloaded cover image (404 if none) |
 | `/api/books/{book_id}/chapters/{n}` | GET | One saved chapter body (HTML) |
 | `/api/books/{book_id}/fetch-missing` | POST | Start a job that downloads only chapters missing on disk → `202` + job |
+| `/api/books/{book_id}` | DELETE | Remove a book with all saved chapters, cover, and exports → `204` (`409` while a crawl job is running for it) |
 | `/api/books/{book_id}/export?format=epub\|txt` | GET | Build an EPUB/TXT from saved chapters and download it as a ZIP |
 
 

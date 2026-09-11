@@ -27,6 +27,7 @@ export type ExtractOptions = {
   rate_limit?: number;
   workers?: number;
   save?: boolean;
+  overwrite?: boolean;
 };
 
 type JobRunnerValue = {
@@ -76,6 +77,7 @@ export default function JobRunnerProvider({ children }: { children: ReactNode })
       if (opts.rate_limit !== undefined && opts.rate_limit !== null) body.rate_limit = opts.rate_limit;
       if (opts.workers !== undefined && opts.workers !== null) body.workers = opts.workers;
       if (opts.save !== undefined) body.save = opts.save;
+      if (opts.overwrite !== undefined) body.overwrite = opts.overwrite;
       const res = await fetch(`${API_BASE}/api/extract`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },

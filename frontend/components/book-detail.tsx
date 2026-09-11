@@ -41,6 +41,7 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
   const [fetching, setFetching] = useState(false);
   const [exportError, setExportError] = useState('');
   const [exporting, setExporting] = useState<'epub' | 'txt' | null>(null);
+  const [deleting, setDeleting] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -151,6 +152,31 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
   );
 
 
+  const deleteBook = useCallback(async () => {
+    if (!book) return;
+    const confirmed = window.confirm(
+      `Xóa "${book.title}" khỏi library?\n\n` +
+        `Mất ${book.saved_count}/${book.total_chapters} chương đã lưu, cover và exports. ` +
+        `Hành động này không thể hoàn tác.`,
+    );
+    if (!confirmed) return;
+    setDeleting(true);
+    setExportError('');
+    try {
+      const res = await fetch(`${API_BASE}/api/books/${encodeURIComponent(bookId)}`, {
+        method: 'DELETE',
+      });
+      if (!res.ok) {
+        const detail = await res.json().catch(() => null);
+        throw new Error(detail?.detail || `API returned ${res.status}`);
+      }
+      onBack();
+    } catch (e) {
+      setExportError(e instanceof Error ? e.message : String(e));
+      setDeleting(false);
+    }
+  }, [book, bookId, onBack]);
+
   if (error && !book) {
     return (
       <section className="section">
@@ -235,6 +261,14 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
                 onClick={() => void exportBook('txt')}
               >
                 {exporting === 'txt' ? 'Packing…' : 'Export TXT'}
+              </button>
+              <button
+                type="button"
+                className="btn btn-danger"
+                disabled={deleting || fetching || exporting !== null}
+                onClick={() => void deleteBook()}
+              >
+                {deleting ? 'Deleting…' : '🗑 Delete book'}
               </button>
             </div>
             {exportError && <p className="muted error-text">✗ {exportError}</p>}

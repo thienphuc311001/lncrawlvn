@@ -14,6 +14,7 @@ later "fetch missing" run only downloads chapters that have no file yet.
 
 import json
 import logging
+import shutil
 import time
 import zipfile
 from pathlib import Path
@@ -55,6 +56,29 @@ class Library:
     def cover_path(self, book_id: str) -> Path:
         return self._book_dir(book_id) / "cover.jpg"
 
+    def delete_book(self, book_id: str) -> bool:
+        """Remove a book with all chapters, cover, and exports.
+
+        Returns True when something was deleted, False when the book dir did
+        not exist. Book ids arrive from the API path, so anything that would
+        escape the library root (``..``, absolute paths, nested ids) is an
+        error rather than a cleanup target.
+        """
+        book_dir = self._book_dir(book_id)
+        root = self.root.resolve()
+        try:
+            resolved = book_dir.resolve()
+            inside_root = resolved.is_relative_to(root) and resolved != root
+        except (OSError, ValueError):
+            raise LNException(f"Invalid book id: {book_id}")
+        if not inside_root:
+            raise LNException(f"Invalid book id: {book_id}")
+        if not book_dir.is_dir():
+            return False
+        shutil.rmtree(book_dir)
+        logger.info("Deleted book from library: %s", book_id)
+        return True
+
     # ------------------------------------------------------------------ #
     # Writes
     # ------------------------------------------------------------------ #
@@ -68,13 +92,21 @@ class Library:
             json.dump(meta, f, ensure_ascii=False, indent=2)
         return book_id
 
-    def save_chapter(self, book_id: str, chapter: Dict[str, Any]) -> bool:
-        """Write one chapter body; returns True only when newly created."""
+    def save_chapter(
+        self, book_id: str, chapter: Dict[str, Any], overwrite: bool = False
+    ) -> bool:
+        """Write one chapter body; returns True when the file was written.
+
+        With ``overwrite`` an existing saved copy is replaced (used by
+        re-crawls that repair previously truncated bodies) and True is still
+        returned. Without it an existing file is kept as-is and False is
+        returned — the default first-crawl behavior.
+        """
         chapter_id = int(chapter.get("id") or 0)
         if chapter_id <= 0:
             return False
         path = self._chapter_path(book_id, chapter_id)
-        if path.is_file():  # already fetched earlier — keep the old copy
+        if path.is_file() and not overwrite:  # keep the earlier copy
             return False
         payload = {
             "id": chapter_id,

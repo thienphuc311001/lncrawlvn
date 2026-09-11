@@ -119,6 +119,9 @@ h1, h2, h3, h4 { text-wrap: balance; }
 .btn-secondary:hover { border-color: var(--fg); }
 .btn-ghost { background: transparent; color: var(--fg); border-color: transparent; padding-inline: 8px; }
 .btn-ghost:hover { color: var(--accent); }
+.btn-danger { background: transparent; color: #c94f4f; border-color: color-mix(in oklch, #c94f4f 35%, transparent); }
+.btn-danger:hover { background: color-mix(in oklch, #c94f4f 10%, transparent); border-color: #c94f4f; }
+.btn-danger:disabled { opacity: 0.5; }
 .btn-arrow::after { content: '→'; transition: transform 0.15s ease; }
 .btn-arrow:hover::after { transform: translateX(2px); }
 
@@ -578,13 +581,14 @@ html { scroll-behavior: smooth; }
   z-index: 50;
 }
 .reader-panel {
-  background: var(--background, #111);
+  background: var(--background, #121212);
   border: 1px solid var(--border);
   border-radius: 12px;
   width: min(760px, 100%);
   max-height: 88vh;
   display: flex;
   flex-direction: column;
+  color: #E0E0E0; 
 }
 .reader-head {
   display: flex;
@@ -593,6 +597,10 @@ html { scroll-behavior: smooth; }
   gap: 16px;
   padding: 16px 20px;
   border-bottom: 1px solid var(--border);
+}
+
+.reader-head button {
+  color: #E0E0E0;
 }
 .reader-head h3 { font-size: 15px; margin: 0; }
 .reader-body {

@@ -141,6 +141,14 @@ class JobStore:
         with self.lock:
             return self._jobs.get(job_id)
 
+    def has_active_for_book(self, book_id: str) -> bool:
+        """True while any pending/running job is writing to this book."""
+        with self.lock:
+            return any(
+                job.book_id == book_id and job.status in ("pending", "running")
+                for job in self._jobs.values()
+            )
+
 
 JOBS = JobStore()
 
@@ -160,6 +168,71 @@ def _set(job: Job, **fields) -> None:
     with JOBS.lock:
         for key, value in fields.items():
             setattr(job, key, value)
+
+
+# --------------------------------------------------------------------------- #
+# Crawler log forwarding
+# --------------------------------------------------------------------------- #
+# The job console shows what the server itself logs through ``_log``; what the
+# crawler reports (TOC-walk heartbeats and ETAs, blocked-window waits, skipped
+# ids) stays invisible unless it is routed into the job log too. The crawlers
+# log through Python's ``logging`` on module loggers under ``sources.*``, so
+# one process-wide handler forwards those lines into the job running on the
+# current thread, falling back to the most recent job for the download worker
+# threads (which have no thread-local of their own).
+
+_ACTIVE_JOB = threading.local()
+_LATEST_JOB: Optional[Job] = None
+_LATEST_JOB_LOCK = threading.Lock()
+
+
+class _CrawlerLogHandler(logging.Handler):
+    """Forward INFO+ records from the crawlers and the scraper into a job log."""
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.INFO)
+        self._prefixes = ("sources.", "scraper.")
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if not record.name.startswith(self._prefixes):
+            return
+        job = getattr(_ACTIVE_JOB, "job", None)
+        if job is None:
+            job = _LATEST_JOB
+        if job is None:
+            return
+        level = {logging.WARNING: "warning", logging.ERROR: "error"}.get(
+            record.levelno, "info"
+        )
+        try:
+            _log(job, record.getMessage(), level=level)
+        except Exception:  # noqa: BLE001 - a logging side path must not fail a crawl
+            pass
+
+
+_LOGGING_HANDLER = _CrawlerLogHandler()
+
+
+def _install_log_forwarding(job: Job) -> None:
+    global _LATEST_JOB
+    _ACTIVE_JOB.job = job
+    with _LATEST_JOB_LOCK:
+        _LATEST_JOB = job
+        if _LOGGING_HANDLER not in logging.getLogger().handlers:
+            logging.getLogger().addHandler(_LOGGING_HANDLER)
+    # The app context opens the loggers at WARNING; let the crawlers' INFO
+    # lines through so the heartbeats and ETAs reach the console.
+    logging.getLogger("sources").setLevel(logging.INFO)
+
+
+def _uninstall_log_forwarding() -> None:
+    # The fallback must not outlive the job: without this, worker threads of
+    # a later crawl land their lines in this finished job's console, and any
+    # stray INFO from the scraper keeps appending to it after completion.
+    global _LATEST_JOB
+    _ACTIVE_JOB.job = None
+    with _LATEST_JOB_LOCK:
+        _LATEST_JOB = None
 
 
 @asynccontextmanager
@@ -196,6 +269,10 @@ class ExtractRequest(BaseModel):
     rate_limit: Optional[float] = Field(None, gt=0, description="Requests per second cap.")
     workers: Optional[int] = Field(None, ge=1, le=16, description="Concurrent chapter workers.")
     save: bool = Field(True, description="Persist the novel and fetched chapters into the library.")
+    overwrite: bool = Field(
+        False,
+        description="Re-crawled chapters replace already-saved copies (repairs truncated bodies).",
+    )
     only_ids: Optional[List[int]] = Field(
         None, description="Internal: download only these chapter ids (fetch-missing runs)."
     )
@@ -304,6 +381,22 @@ def export_book(book_id: str, format: str = Query("epub", pattern="^(epub|txt)$"
     except LNException as e:
         raise HTTPException(status_code=400, detail=str(e))
     return FileResponse(zip_path, media_type="application/zip", filename=zip_path.name)
+
+
+@app.delete("/api/books/{book_id}", status_code=204)
+def delete_book(book_id: str):
+    """Delete a book with all its saved chapters, cover, and exports."""
+    if JOBS.has_active_for_book(book_id):
+        raise HTTPException(
+            status_code=409,
+            detail="A crawl job is still running for this book — stop it first",
+        )
+    try:
+        deleted = LIBRARY.delete_book(book_id)
+    except LNException as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Book not found in library")
 
 
 class ConfigField(BaseModel):
@@ -462,6 +555,7 @@ def _run_job(job_id: str, req: ExtractRequest) -> None:
     job = JOBS.get_ref(job_id)
     if job is None:  # evicted before it started
         return
+    _install_log_forwarding(job)
 
     crawler = None
     try:
@@ -528,6 +622,8 @@ def _run_job(job_id: str, req: ExtractRequest) -> None:
             )
             _set(job, book_id=book_id)
             _log(job, f"Saved to library as '{book_id}'")
+            if req.overwrite:
+                _log(job, "Overwrite mode: re-crawled chapters replace saved copies")
             cover_file = LIBRARY.cover_path(book_id)
             if novel.cover_url and not cover_file.is_file():
                 try:
@@ -582,7 +678,7 @@ def _run_job(job_id: str, req: ExtractRequest) -> None:
                 job.chapters[idx].success = bool(chapter.success)
                 job.chapters[idx].error = error
             if req.save and book_id and chapter.success:
-                if LIBRARY.save_chapter(book_id, chapter.to_dict()):
+                if LIBRARY.save_chapter(book_id, chapter.to_dict(), overwrite=req.overwrite):
                     with JOBS.lock:
                         job.saved_count += 1
             title = (chapter.title or "").strip()[:60]
@@ -616,6 +712,7 @@ def _run_job(job_id: str, req: ExtractRequest) -> None:
     finally:
         if crawler is not None:
             crawler.close()
+        _uninstall_log_forwarding()
 
 
 def _fetch_chapter(crawler, chapter):
