@@ -35,6 +35,7 @@ installer lives at `scripts/lnmini.sh`; copy it anywhere on your `PATH` as
 | `/api/books/{book_id}` | GET | Book metadata + full TOC annotated with per-chapter saved/missing flags |
 | `/api/books/{book_id}/cover` | GET | Downloaded cover image (404 if none) |
 | `/api/books/{book_id}/chapters/{n}` | GET | One saved chapter body (HTML) |
+| `/api/books/{book_id}/chapters/{n}` | DELETE | Remove one saved chapter file (TOC entry kept) → `204`; re-download later via fetch-missing (`409` while a crawl job is running for the book) |
 | `/api/books/{book_id}/fetch-missing` | POST | Start a job that downloads only chapters missing on disk → `202` + job |
 | `/api/books/{book_id}` | DELETE | Remove a book with all saved chapters, cover, and exports → `204` (`409` while a crawl job is running for it) |
 | `/api/books/{book_id}/export?format=epub\|txt` | GET | Build an EPUB/TXT from saved chapters and download it as a ZIP |

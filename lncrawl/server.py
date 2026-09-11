@@ -348,6 +348,28 @@ def get_chapter(book_id: str, chapter_id: int) -> ChapterContent:
     return ChapterContent(**data)
 
 
+@app.delete("/api/books/{book_id}/chapters/{chapter_id}", status_code=204)
+def delete_chapter(book_id: str, chapter_id: int):
+    """Remove one saved chapter file so it can be re-fetched from the source.
+
+    The TOC entry in ``book.json`` is kept, so a ``fetch missing`` run can
+    download the chapter again later.
+    """
+    if JOBS.has_active_for_book(book_id):
+        raise HTTPException(
+            status_code=409,
+            detail="A crawl job is still running for this book — stop it first",
+        )
+    if LIBRARY.load_book(book_id) is None:
+        raise HTTPException(status_code=404, detail="Book not found in library")
+    try:
+        deleted = LIBRARY.delete_chapter(book_id, chapter_id)
+    except LNException as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Chapter not saved yet")
+
+
 @app.post("/api/books/{book_id}/fetch-missing", response_model=Job, status_code=202)
 def fetch_missing(book_id: str) -> Job:
     """Start a job that downloads only chapters missing from the library."""

@@ -42,6 +42,7 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
   const [exportError, setExportError] = useState('');
   const [exporting, setExporting] = useState<'epub' | 'txt' | null>(null);
   const [deleting, setDeleting] = useState(false);
+  const [deletingChapter, setDeletingChapter] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -176,6 +177,39 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
       setDeleting(false);
     }
   }, [book, bookId, onBack]);
+
+  /** Drop the saved chapter file so "Fetch missing" can re-download it. */
+  const deleteChapter = useCallback(
+    async (chapter: ChapterContent) => {
+      if (deletingChapter) return;
+      const confirmed = window.confirm(
+        `Xóa chương ${chapter.id} khỏi library?\n\n` +
+          `File nội dung của chương này sẽ bị xóa khỏi đĩa, mục lục vẫn giữ nguyên. ` +
+          `Dùng "Fetch missing" để tải lại chương này từ nguồn khi cần.`,
+      );
+      if (!confirmed) return;
+      setDeletingChapter(true);
+      setExportError('');
+      try {
+        const res = await fetch(
+          `${API_BASE}/api/books/${encodeURIComponent(bookId)}/chapters/${chapter.id}`,
+          { method: 'DELETE' },
+        );
+        if (!res.ok) {
+          const detail = await res.json().catch(() => null);
+          throw new Error(detail?.detail || `API returned ${res.status}`);
+        }
+        // Close the reader and refresh the TOC so the chapter shows as missing.
+        setReader({ loading: false, chapter: null, error: '' });
+        await load();
+      } catch (e) {
+        setExportError(e instanceof Error ? e.message : String(e));
+      } finally {
+        setDeletingChapter(false);
+      }
+    },
+    [bookId, deletingChapter, load],
+  );
 
   if (error && !book) {
     return (
@@ -331,13 +365,23 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
                 <h3>
                   #{reading.id} — {reading.title}
                 </h3>
-                <button
-                  type="button"
-                  className="btn btn-ghost"
-                  onClick={() => setReader({ loading: false, chapter: null, error: '' })}
-                >
-                  ✕ Close
-                </button>
+                <div className="reader-head-actions">
+                  <button
+                    type="button"
+                    className="btn btn-danger"
+                    disabled={deletingChapter || fetching}
+                    onClick={() => void deleteChapter(reading)}
+                  >
+                    {deletingChapter ? 'Đang xóa…' : '🗑 Xóa chương'}
+                  </button>
+                  <button
+                    type="button"
+                    className="btn btn-ghost"
+                    onClick={() => setReader({ loading: false, chapter: null, error: '' })}
+                  >
+                    ✕ Close
+                  </button>
+                </div>
               </div>
               {/* Chapter bodies come from our own crawler pipeline (sanitized by
                   the source cleaner), so this is trusted content, not user input. */}

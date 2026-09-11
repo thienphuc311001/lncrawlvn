@@ -56,13 +56,12 @@ class Library:
     def cover_path(self, book_id: str) -> Path:
         return self._book_dir(book_id) / "cover.jpg"
 
-    def delete_book(self, book_id: str) -> bool:
-        """Remove a book with all chapters, cover, and exports.
+    def _guarded_book_dir(self, book_id: str) -> Path:
+        """Book dir after verifying it stays inside the library root.
 
-        Returns True when something was deleted, False when the book dir did
-        not exist. Book ids arrive from the API path, so anything that would
-        escape the library root (``..``, absolute paths, nested ids) is an
-        error rather than a cleanup target.
+        Book ids arrive from the API path, so anything that would escape the
+        root (``..``, absolute paths, nested ids) is an error rather than a
+        cleanup target.
         """
         book_dir = self._book_dir(book_id)
         root = self.root.resolve()
@@ -73,10 +72,34 @@ class Library:
             raise LNException(f"Invalid book id: {book_id}")
         if not inside_root:
             raise LNException(f"Invalid book id: {book_id}")
+        return book_dir
+
+    def delete_book(self, book_id: str) -> bool:
+        """Remove a book with all chapters, cover, and exports.
+
+        Returns True when something was deleted, False when the book dir did
+        not exist.
+        """
+        book_dir = self._guarded_book_dir(book_id)
         if not book_dir.is_dir():
             return False
         shutil.rmtree(book_dir)
         logger.info("Deleted book from library: %s", book_id)
+        return True
+
+    def delete_chapter(self, book_id: str, chapter_id: int) -> bool:
+        """Delete one saved chapter file, keeping the TOC entry in ``book.json``.
+
+        The chapter immediately counts as missing again, so a later
+        ``fetch missing`` run can re-download it from the source URL kept in
+        the TOC. Cover, exports, and other chapters are untouched. Returns
+        False when there was no saved file to delete.
+        """
+        path = self._guarded_book_dir(book_id) / self.chapter_rel_path(chapter_id)
+        if not path.is_file():
+            return False
+        path.unlink()
+        logger.info("Deleted chapter %s of book %s", chapter_id, book_id)
         return True
 
     # ------------------------------------------------------------------ #

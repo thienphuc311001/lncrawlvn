@@ -602,6 +602,9 @@ html { scroll-behavior: smooth; }
 .reader-head button {
   color: #E0E0E0;
 }
+/* Higher specificity than `.reader-head button` so the danger tint wins. */
+.reader-head .btn-danger { color: #c94f4f; }
+.reader-head-actions { display: flex; align-items: center; gap: 8px; }
 .reader-head h3 { font-size: 15px; margin: 0; }
 .reader-body {
   overflow-y: auto;
