@@ -132,3 +132,15 @@ test('legacy background errors and absent/null context have safe fallbacks', () 
   assert.ok(html.includes('Not available'));
   assert.ok(html.includes('<dd>0</dd>'));
 });
+
+test('model attempts, fallback reasons and final failure are visible in activity logs', () => {
+  const api = load({ job: { job_id: 'test', status: 'failed', logs: [
+    { id: '1', timestamp: '2026-09-17T01:00:00+00:00', status: 'running', task: 'translate:1', model: 'gemini-3.1-flash-lite', attempt: 1 },
+    { id: '2', status: 'failed', model: 'gemini-3.1-flash-lite', error: 'Daily quota exhausted' },
+    { id: '3', status: 'fallback', model: 'gemini-3.5-flash-lite', message: 'Switching to fallback' },
+    { id: '4', status: 'failed', model: 'gemini-3.7-flash', error: 'HTTP 503 <unsafe>' },
+  ] } });
+  const html = renderToStaticMarkup(React.createElement(api.TranslationWorkspace));
+  for (const text of ['Translation activity', 'role="log"', 'gemini-3.1-flash-lite', 'gemini-3.5-flash-lite', 'gemini-3.7-flash', 'Attempt 1/2', 'Daily quota exhausted', 'Switching to fallback', 'HTTP 503 &lt;unsafe&gt;']) assert.ok(html.includes(text), text);
+  assert.ok(html.indexOf('HTTP 503') < html.indexOf('Switching to fallback'), 'Newest event appears first');
+});

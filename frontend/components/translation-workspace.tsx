@@ -3,12 +3,17 @@
 import { useEffect, useState, type ReactNode } from 'react';
 
 const API = 'http://127.0.0.1:8000/api/translation';
+type TranslationEvent = {
+  id?: string; timestamp?: string; task?: string; model?: string; status: string;
+  attempt?: number; retry_after?: number; error?: string; message?: string;
+};
 type Job = {
   job_id: string; status: string; stage?: string; error?: string; error_detail?: unknown;
   total_chapters?: number; completed_chapters?: number; aligned?: number;
   scanned_chapter?: number;
   candidate_count?: number; resolved_candidates?: number; current_term?: string;
   active_chapters?: Record<string, { chunk: number; chunks: number }>;
+  logs?: TranslationEvent[];
 };
 type Config = { models: Record<string, string>; concurrency: number; stagger_ms: number; api_key_configured: boolean };
 
@@ -43,6 +48,25 @@ function readableError(value: unknown): ReactNode {
 function ErrorNotice({ detail }: { detail: unknown }) {
   if (detail === null || detail === undefined || detail === '') return null;
   return <div role="alert" className="error-text">{readableError(detail)}</div>;
+}
+
+function TranslationLog({ logs = [] }: { logs?: TranslationEvent[] }) {
+  return <section className="translation-log" aria-label="Translation activity">
+    <h3>Translation activity</h3>
+    <p className="muted">Primary → Fallback → Backup. A later model is used only after the preceding model fails. Latest 100 events, newest first.</p>
+    {logs.length === 0 ? <p>No activity recorded yet.</p> : <ol role="log" aria-live="polite" aria-relevant="additions" className="translation-log-events">
+      {[...logs].reverse().map((event, index) => <li key={event.id ?? `${event.timestamp ?? ''}-${logs.length - index}`}>
+        <div className="translation-log-meta">
+          {event.timestamp && <time dateTime={event.timestamp}>{event.timestamp.replace('T', ' ').replace(/\.\d+/, '')}</time>}
+          <strong className={`translation-log-status translation-log-status-${event.status}`}>{event.status}</strong>
+          {event.task && <span>{event.task}</span>}
+          {event.model && <span>{event.model}</span>}
+          {event.attempt && <span>Attempt {event.attempt}/2</span>}
+        </div>
+        {(event.error || event.message) && <p>{event.error ?? event.message}</p>}
+      </li>)}
+    </ol>}
+  </section>;
 }
 
 class RequestError extends Error {
@@ -85,6 +109,10 @@ export default function TranslationWorkspace() {
       setConfig(configuration as Config);
       setJobs(history as Job[]);
       setJob((history as Job[])[0] ?? null);
+      const selected = (history as Job[])[0];
+      if (selected) request(`/jobs/${selected.job_id}`).then(data => {
+        if (live) setJob(data as Job);
+      }).catch(e => { if (live) setError(errorDetail(e)); });
     }).catch(e => { if (live) setError(errorDetail(e)); });
     return () => { live = false; };
   }, []);
@@ -137,6 +165,7 @@ export default function TranslationWorkspace() {
       {busy ? 'Working…' : 'Translate batch'}
     </button>
     {config && <details className="translation-config"><summary>System Configuration</summary>
+      <p>Every uncached task starts with Primary. Temporary errors get up to two attempts per model; exhausted daily quota moves directly to the next model. Authentication and invalid request errors stop immediately.</p>
       {Object.entries(config.models).map(([role, model]) => <label className="settings-field" key={role}>
         <span>{role[0].toUpperCase() + role.slice(1)} Model</span><input readOnly value={model} />
       </label>)}
@@ -159,6 +188,7 @@ export default function TranslationWorkspace() {
         <a className="btn btn-primary" href={`${API}/jobs/${job.job_id}/outputs/translated.json`}>Translated Chapters</a>
         <a className="btn btn-primary" href={`${API}/jobs/${job.job_id}/outputs/dictionary.json`}>Updated Book Dictionary</a>
       </div>}
+      <TranslationLog logs={job.logs} />
     </div>}
     <ErrorNotice detail={error} />
   </section>;

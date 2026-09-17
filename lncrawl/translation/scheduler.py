@@ -23,6 +23,12 @@ class ProviderError(RuntimeError):
         self.daily_quota = daily_quota
 
 
+def model_failure_summary(failures):
+    return "All configured Gemini models failed (tried in order): " + "; ".join(
+        f"{model}: {failures[model]}" for model in MODELS
+    )
+
+
 def retry_delay(value):
     try:
         return max(0, float(value))
@@ -85,14 +91,26 @@ class Scheduler:
             },
         }
         attempts = 0
-        for model in MODELS:
+        failures = {}
+        for model_index, model in enumerate(MODELS):
+            if model_index:
+                record(
+                    {
+                        "model": model,
+                        "status": "fallback",
+                        "message": f"{MODELS[model_index - 1]} unavailable; switching to {model}",
+                    }
+                )
             for attempt in range(2):
                 attempts += 1
+                metadata = {"model": model, "retry_count": attempts - 1, "attempt": attempt + 1}
+                record({**metadata, "status": "queued"})
                 try:
                     async with self.slots:
                         async with self.gate:
                             await asyncio.sleep(max(0, self.next_start - time.monotonic()))
                             self.next_start = time.monotonic() + self.spacing
+                        record({**metadata, "status": "running"})
                         result = await asyncio.wait_for(
                             self.transport(model, body)
                             if self.transport
@@ -103,17 +121,20 @@ class Scheduler:
                             parsed = schema.model_validate(result)
                         except ValidationError as exc:
                             raise ProviderError("Invalid provider response schema", True) from exc
-                    record({"model": model, "retry_count": attempts - 1, "status": "success"})
+                    record({**metadata, "status": "success"})
                     return parsed
+                except asyncio.CancelledError:
+                    record({**metadata, "status": "cancelled"})
+                    raise
                 except (httpx.TransportError, asyncio.TimeoutError, TimeoutError) as exc:
                     error = ProviderError("Provider network failure or timeout", True)
                     error.__cause__ = exc
                 except ProviderError as exc:
                     error = exc
+                failures[model] = str(error)
                 record(
                     {
-                        "model": model,
-                        "retry_count": attempts - 1,
+                        **metadata,
                         "status": "failed",
                         "error": str(error),
                         "retry_after": error.retry_after,
@@ -132,9 +153,18 @@ class Scheduler:
                 # A small margin avoids retrying before the quota actually resets.
                 provider_delay = error.retry_after + 1 if error.retry_after > 0 else 0
                 delay = max(provider_delay, 1.0 * 2**attempt)
+                if attempt == 0:
+                    record(
+                        {
+                            **metadata,
+                            "status": "retrying",
+                            "retry_after": delay,
+                            "message": f"Retrying {model} after at least {delay:g}s",
+                        }
+                    )
                 async with self.gate:
                     self.next_start = max(self.next_start, time.monotonic() + delay)
-        raise error
+        raise ProviderError(model_failure_summary(failures), retryable=True) from error
 
     async def _send(self, model, body):
         key = os.environ.get("GOOGLE_AI_API_KEY", "")

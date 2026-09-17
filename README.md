@@ -157,6 +157,14 @@ model/invalid request errors fail explicitly; there is no model discovery or sub
 The configured IDs must be available to your AI Studio account. Credentials are never
 returned to the browser or written to checkpoints.
 
+The translation workspace shows a live **Translation activity** log with task names,
+model attempts, queued/running/success/failed states, retry waits, fallback switches,
+checkpoint reuse and cancellation. It polls every 1.5 seconds while a batch is active
+and retains the latest 100 events after stopping. The complete event history is stored
+in the job's `events.jsonl`; request diagnostics remain in `requests.jsonl`, and the CLI
+prints those request events. If all three models fail, the error reports each model's
+failure in the configured order, rather than showing only the last backup error.
+
 The workflow aligns chapters, scans semantic chunks across the whole batch, aggregates
 all occurrences of each candidate, resolves terminology, and audits the dictionary before
 translation. Large occurrence sets use hierarchical evidence summaries. New mappings

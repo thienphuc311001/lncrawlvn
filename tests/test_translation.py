@@ -185,7 +185,47 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.context, "ok")
         self.assertEqual([model for model, _ in seen], [MODELS[0], MODELS[1]])
         self.assertEqual(seen[0][1], seen[1][1])
-        self.assertTrue(records[0]["daily_quota"])
+        self.assertTrue(
+            next(record for record in records if record["status"] == "failed")["daily_quota"]
+        )
+
+    async def test_exhausted_chain_reports_all_models_and_logs_live_attempts(self):
+        seen, records = [], []
+
+        async def transport(model, body):
+            seen.append(model)
+            self.assertEqual(records[-1]["status"], "running")
+            if model != MODELS[2]:
+                raise ProviderError("HTTP 429 (daily quota exhausted)", True, daily_quota=True)
+            raise ProviderError("HTTP 503", True)
+
+        with patch("lncrawl.translation.scheduler.asyncio.sleep", new=AsyncMock()):
+            with self.assertRaises(ProviderError) as caught:
+                await Scheduler(transport=transport, spacing=0).request(
+                    "test", {}, Context, records.append
+                )
+        self.assertEqual(seen, [MODELS[0], MODELS[1], MODELS[2], MODELS[2]])
+        message = str(caught.exception)
+        self.assertIn("All configured Gemini models failed", message)
+        self.assertLess(message.index(MODELS[0]), message.index(MODELS[1]))
+        self.assertLess(message.index(MODELS[1]), message.index(MODELS[2]))
+        self.assertIn("daily quota exhausted", message)
+        self.assertIn("HTTP 503", message)
+        self.assertEqual(
+            [r["model"] for r in records if r["status"] == "fallback"], list(MODELS[1:])
+        )
+        self.assertEqual([r["model"] for r in records if r["status"] == "retrying"], [MODELS[2]])
+
+    async def test_primary_success_never_calls_fallback(self):
+        seen, records = [], []
+
+        async def transport(model, body):
+            seen.append(model)
+            return {"context": "ok"}
+
+        await Scheduler(transport=transport, spacing=0).request("test", {}, Context, records.append)
+        self.assertEqual(seen, [MODELS[0]])
+        self.assertEqual([r["status"] for r in records], ["queued", "running", "success"])
 
     async def test_fallback_order_same_task(self):
         seen, records = [], []

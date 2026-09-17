@@ -85,6 +85,13 @@ class Pipeline:
         self.cache_keys.setdefault(task, set()).add(key)
         cached = self.store.read(f"cache/{key}.json")
         if cached is not None:
+            self.store.diagnostic(
+                {
+                    "task": task,
+                    "status": "cached",
+                    "message": "Reused completed checkpoint; no API request",
+                }
+            )
             return schema.model_validate(cached)
         result = await self.scheduler.request(
             instruction,

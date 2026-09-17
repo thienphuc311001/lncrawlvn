@@ -138,3 +138,51 @@ class APITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 202)
         self.assertEqual(response.json()["status"], "done")
         self.assertNotIn(store.id, api._tasks)
+
+    async def test_activity_is_persisted_bounded_and_available_after_failure(self):
+        store = Store(api.ROOT, {"raw": "第1章\n正文。", "vietphrase": "Chương 1\nVăn."})
+        store.progress("running", stage="Translating")
+        for index in range(110):
+            store.diagnostic(
+                {"task": f"chunk:{index}", "model": api.MODELS[0], "status": "success"}
+            )
+        store.progress("failed", stage="Stopped", error="All configured Gemini models failed")
+        with (store.path / "events.jsonl").open("ab") as stream:
+            stream.write(b'{"unfinished":')
+        response = await self.client.get(f"/api/translation/jobs/{store.id}")
+        logs = response.json()["logs"]
+        self.assertLessEqual(len(logs), 100)
+        self.assertEqual(logs[-1]["status"], "failed")
+        self.assertEqual(logs[-1]["task"], "batch")
+        self.assertIn("timestamp", logs[-1])
+        self.assertIn("id", logs[-1])
+        self.assertNotIn("logs", (await self.client.get("/api/translation/jobs")).json()[0])
+
+    async def test_legacy_failure_displays_same_task_model_chain(self):
+        import json
+
+        store = Store(api.ROOT, {"raw": "第1章\n正文。", "vietphrase": "Chương 1\nVăn."})
+        store.write(
+            "progress.json",
+            {"status": "failed", "error": "Gemini HTTP 503 for configured model gemini-3.7-flash"},
+        )
+        with (store.path / "requests.jsonl").open("w") as stream:
+            for model in api.MODELS:
+                stream.write(
+                    json.dumps(
+                        {
+                            "task": "align:1",
+                            "model": model,
+                            "status": "failed",
+                            "error": "HTTP 503"
+                            if model == api.MODELS[2]
+                            else "Daily quota exhausted",
+                        }
+                    )
+                    + "\n"
+                )
+        response = await self.client.get(f"/api/translation/jobs/{store.id}")
+        self.assertIn("All configured Gemini models failed", response.json()["error"])
+        self.assertEqual(len(response.json()["logs"]), 3)
+        # Merely viewing a legacy job never changes its persisted checkpoint.
+        self.assertTrue(store.read("progress.json")["error"].startswith("Gemini HTTP"))

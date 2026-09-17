@@ -6,6 +6,7 @@ import os
 import sqlite3
 import uuid
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .models import MODELS, PIPELINE_VERSION
@@ -50,13 +51,58 @@ class Store:
 
     def progress(self, status="running", **fields):
         value = self.read("progress.json", {})
+        changed = (value.get("status"), value.get("stage")) != (
+            status,
+            fields.get("stage", value.get("stage")),
+        )
         value.update(job_id=self.id, status=status, **fields)
         self.write("progress.json", value)
+        if changed:
+            self.log(
+                {
+                    "status": status,
+                    "task": "batch",
+                    "message": value.get("stage", status),
+                    **({"error": value["error"]} if value.get("error") else {}),
+                }
+            )
         return value
 
     def diagnostic(self, metadata):
         with (self.path / "requests.jsonl").open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(metadata, ensure_ascii=False) + "\n")
+        self.log(metadata)
+
+    def log(self, metadata):
+        event = {
+            **metadata,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "id": uuid.uuid4().hex,
+        }
+        with (self.path / "events.jsonl").open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(event, ensure_ascii=False) + "\n")
+
+    def logs(self, limit=100):
+        """Read a bounded tail so polling never loads an entire long-running log."""
+        path = self.path / "events.jsonl"
+        if not path.exists():
+            path = self.path / "requests.jsonl"  # Existing jobs retain their request history.
+        if not path.exists():
+            return []
+        with path.open("rb") as stream:
+            stream.seek(0, os.SEEK_END)
+            size = stream.tell()
+            stream.seek(max(0, size - 131072))
+            if size > 131072:
+                stream.readline()  # Discard a partial UTF-8/JSON line.
+            lines = stream.read().splitlines()[-limit:]
+        result = []
+        for line in lines:
+            try:
+                result.append(json.loads(line))
+            except (ValueError, UnicodeDecodeError):
+                pass  # A writer may still be appending the final event.
+        return result
 
     @contextmanager
     def execution(self):

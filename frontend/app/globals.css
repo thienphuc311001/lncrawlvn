@@ -651,3 +651,12 @@ html { scroll-behavior: smooth; }
 .translation-progress { border: 1px solid var(--border); border-radius: 12px; padding: 24px; margin-block: 24px; }
 .translation-downloads { display: flex; flex-wrap: wrap; gap: 12px; }
 .translation-workspace p { margin-block: 12px; }
+.translation-log { margin-top: 24px; border-top: 1px solid var(--border); padding-top: 20px; }
+.translation-log-events { max-height: 380px; overflow-y: auto; list-style: none; padding: 0; }
+.translation-log-events li { border-bottom: 1px solid var(--border); padding: 12px 4px; overflow-wrap: anywhere; }
+.translation-log-meta { display: flex; flex-wrap: wrap; gap: 8px 12px; font-size: 0.85rem; }
+.translation-log-meta time { color: var(--muted); }
+.translation-log-status { text-transform: uppercase; }
+.translation-log-status-failed { color: #dc2626; }
+.translation-log-status-success, .translation-log-status-done { color: #228b36; }
+.translation-log-status-running, .translation-log-status-retrying, .translation-log-status-fallback { color: #a16207; }

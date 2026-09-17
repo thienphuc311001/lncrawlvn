@@ -14,7 +14,7 @@ from .dictionary import load_legacy
 from .models import MODELS, PARSER_VERSION, Inputs
 from .parsing import ChapterValidationError, validate_inputs
 from .pipeline import Pipeline
-from .scheduler import Scheduler
+from .scheduler import Scheduler, model_failure_summary
 from .store import AlreadyRunning, Store
 
 router = APIRouter(prefix="/api/translation", tags=["translation"])
@@ -39,8 +39,29 @@ def get_store(job_id):
         raise HTTPException(404, "Translation job not found")
 
 
-def snapshot(store):
+def snapshot(store, include_logs=True):
     progress = store.read("progress.json", {"job_id": store.id, "status": "pending"})
+    if include_logs:
+        progress["logs"] = store.logs()
+        # Older checkpoints saved only the final provider error. Recover the
+        # actual same-task chain from their persisted diagnostics for display.
+        if progress.get("status") == "failed" and str(progress.get("error", "")).startswith(
+            "Gemini HTTP"
+        ):
+            failed = [
+                event
+                for event in progress["logs"]
+                if event.get("status") == "failed" and event.get("model")
+            ]
+            if failed:
+                task = failed[-1].get("task")
+                failures = {
+                    event["model"]: event.get("error", "Provider failed")
+                    for event in failed
+                    if event.get("task") == task
+                }
+                if all(model in failures for model in MODELS):
+                    progress["error"] = model_failure_summary(failures)
     if (
         progress["status"] in ("running", "pending")
         and store.id not in _tasks
@@ -117,7 +138,7 @@ async def jobs():
     if not ROOT.exists():
         return []
     paths = sorted(ROOT.glob("*/progress.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-    return [snapshot(get_store(path.parent.name)) for path in paths[:100]]
+    return [snapshot(get_store(path.parent.name), include_logs=False) for path in paths[:100]]
 
 
 @router.get("/jobs/{job_id}")
