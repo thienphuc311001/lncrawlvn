@@ -9,13 +9,29 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-from .models import MODELS, PIPELINE_VERSION
+from . import prompts
+from .models import MODELS, PIPELINE_VERSION, BatchResolution, Repair, Term, Translation
 
 
 def digest(value):
     return hashlib.sha256(
         json.dumps(value, ensure_ascii=False, sort_keys=True).encode()
     ).hexdigest()
+
+
+def pipeline_identity(inputs):
+    """One content identity for jobs and checkpoints, including semantic contracts."""
+    return digest(
+        {
+            "inputs": inputs,
+            "pipeline_version": PIPELINE_VERSION,
+            "models": MODELS,
+            "prompts": [prompts.BATCH_RESOLVE, prompts.TRANSLATE, prompts.REPAIR],
+            "schemas": [
+                model.model_json_schema() for model in (Term, BatchResolution, Translation, Repair)
+            ],
+        }
+    )
 
 
 def atomic_json(path, value):
@@ -33,9 +49,7 @@ def atomic_json(path, value):
 
 class Store:
     def __init__(self, root: Path, inputs=None, job_id=None):
-        self.id = job_id or digest(
-            {"inputs": inputs, "version": PIPELINE_VERSION, "models": MODELS}
-        )
+        self.id = job_id or pipeline_identity(inputs)
         self.path = root / self.id
         if inputs is not None:
             atomic_json(self.path / "inputs.json", inputs)
@@ -72,6 +86,60 @@ class Store:
         with (self.path / "requests.jsonl").open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(metadata, ensure_ascii=False) + "\n")
         self.log(metadata)
+
+    def request_statistics(self):
+        return self.read(
+            "request-statistics.json",
+            {
+                "logical_operations": {
+                    name: 0
+                    for name in (
+                        "terminology_resolver",
+                        "semantic_dictionary_conflict",
+                        "translation",
+                        "repair",
+                    )
+                },
+                "requests": {
+                    name: 0
+                    for name in (
+                        "terminology_resolver",
+                        "semantic_dictionary_conflict",
+                        "translation",
+                        "repair",
+                    )
+                },
+                "local_ai_requests": {
+                    name: 0
+                    for name in (
+                        "alignment",
+                        "scanning",
+                        "occurrence_aggregation",
+                        "evidence_selection",
+                        "structural_dictionary_audit",
+                        "chunk_construction",
+                        "normal_output_validation",
+                    )
+                },
+                "total_requests": 0,
+                "retry": 0,
+                "model_fallback": 0,
+                "cache_hits": 0,
+            },
+        )
+
+    def account(self, operation, event, model_fallback=False):
+        stats = self.request_statistics()
+        if event == "logical":
+            stats["logical_operations"][operation] += 1
+        elif event == "running":
+            stats["requests"][operation] += 1
+            stats["total_requests"] += 1
+        elif event in ("retry", "cache_hits"):
+            stats[event] += 1
+        if model_fallback:
+            stats["model_fallback"] += 1
+        self.write("request-statistics.json", stats)
 
     def log(self, metadata):
         event = {

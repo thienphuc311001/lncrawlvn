@@ -13,7 +13,7 @@ import re
 import unicodedata
 from dataclasses import dataclass
 
-from .models import Chapter
+from .models import Alignment, AlignmentGroup, Chapter
 
 logger = logging.getLogger(__name__)
 NUMERAL = r"[零〇一二两三四五六七八九十百千万\d]+"
@@ -431,6 +431,7 @@ def parse_document(text, label):
     meaningful = []
     preamble = []
     pending_volume_lines = []
+    pending_volume_positions = []
     volume = None
     # A standalone volume marker needs a following chapter before any prose.
     next_significant = {}
@@ -452,6 +453,10 @@ def parse_document(text, label):
                     volume=current.volume,
                 )
             current.meaningful_text = "\n".join(meaningful)
+            current.blank_breaks = [
+                any(not value.strip() for value in document.lines[left : right - 1])
+                for left, right in zip(current.paragraph_lines, current.paragraph_lines[1:])
+            ]
 
     for index, original in enumerate(document.lines, 1):
         if index in document.skipped:
@@ -483,6 +488,7 @@ def parse_document(text, label):
                 )
                 volume = candidate.number
                 pending_volume_lines.append(line)
+                pending_volume_positions.append(index)
                 continue
             # An in-body reference/unsupported volume marker cannot reset order.
             candidate = None
@@ -512,8 +518,11 @@ def parse_document(text, label):
                     if exporter is None:
                         # Generic structural duplicate: keep the text as body content.
                         current.paragraphs.extend(pending_volume_lines)
+                        current.paragraph_lines.extend(pending_volume_positions)
                         pending_volume_lines = []
+                        pending_volume_positions = []
                         current.paragraphs.append(line)
+                        current.paragraph_lines.append(index)
                     else:
                         # Confirmed exporter wrapper/embedded pair: drop the
                         # wrapper's separator and the embedded duplicate from prose.
@@ -521,6 +530,7 @@ def parse_document(text, label):
                             current.paragraphs[-1]
                         ):
                             current.paragraphs.pop()
+                            current.paragraph_lines.pop()
                     _record(
                         document,
                         label,
@@ -570,6 +580,7 @@ def parse_document(text, label):
                 number=candidate.number,
                 title=line,
                 paragraphs=list(pending_volume_lines),
+                paragraph_lines=list(pending_volume_positions),
                 volume=volume,
                 source_line=index,
                 input_label=label,
@@ -577,6 +588,7 @@ def parse_document(text, label):
                 previous_line=previous.source_line if previous else None,
             )
             pending_volume_lines = []
+            pending_volume_positions = []
             current_candidate = candidate
             meaningful = []
             chapters.append(current)
@@ -593,6 +605,7 @@ def parse_document(text, label):
                     current.paragraphs[-1]
                 ):
                     current.paragraphs.pop()
+                    current.paragraph_lines.pop()
                 duplicate = Candidate(index, line, current.number, line, "vietnamese")
                 _record(
                     document,
@@ -606,6 +619,7 @@ def parse_document(text, label):
                 )
                 continue
             current.paragraphs.append(line)
+            current.paragraph_lines.append(index)
             if has_meaningful_body_content(line):
                 meaningful.append(line)
         elif has_meaningful_body_content(line):
@@ -617,9 +631,10 @@ def parse_document(text, label):
             "Chapter headings required: 第1章, Chapter 1, or Chương 1",
             line=1,
         )
-    finish()
     if pending_volume_lines:
         current.paragraphs.extend(pending_volume_lines)
+        current.paragraph_lines.extend(pending_volume_positions)
+    finish()
     # Metadata is only ignored under the pre-existing export contract. TOC
     # candidates are skipped separately; neighboring prose is not discarded.
     if preamble and not any(line.startswith("Source:") for _, line in preamble):
@@ -739,6 +754,82 @@ def validate_alignment(alignment, raw, vp):
                 f"duplicates={sorted({i for i in flattened if flattened.count(i) > 1})[:20]}, "
                 f"returned={len(flattened)}"
             )
+
+
+def deterministic_alignment(raw, vp):
+    """Prove logical line pairing, or recover only punctuation-anchored block splits.
+
+    Blank runs are normalized to a single block boundary. Editor visual wrapping
+    has no effect. No character-offset mapping or semantic provider call is used.
+    """
+    if (raw.volume, raw.number) != (vp.volume, vp.number):
+        raise ValueError("Structural alignment failed: chapter identities differ")
+    if len(raw.paragraphs) == len(vp.paragraphs) and raw.blank_breaks == vp.blank_breaks:
+        groups = [
+            AlignmentGroup(raw=[i], vp=[i], safe_break=True) for i in range(len(raw.paragraphs))
+        ]
+    else:
+
+        def blocks(chapter):
+            result, current = [], []
+            for index in range(len(chapter.paragraphs)):
+                if index and chapter.blank_breaks and chapter.blank_breaks[index - 1]:
+                    result.append(current)
+                    current = []
+                current.append(index)
+            if current:
+                result.append(current)
+            return result
+
+        def anchors(chapter, ids):
+            punctuation = str.maketrans(
+                {
+                    "。": ".",
+                    "！": "!",
+                    "？": "?",
+                    "：": ":",
+                    "；": ";",
+                    "“": '"',
+                    "”": '"',
+                    "「": '"',
+                    "」": '"',
+                    "【": "[",
+                    "】": "]",
+                }
+            )
+            return "".join(
+                re.findall(
+                    r'[.!?:;"\[\]]',
+                    "".join(chapter.paragraphs[i] for i in ids).translate(punctuation),
+                )
+            )
+
+        left, right = blocks(raw), blocks(vp)
+        groups = []
+        proven_blocks = 0
+        if len(left) == len(right):
+            for r_ids, v_ids in zip(left, right):
+                if len(r_ids) == len(v_ids):
+                    groups.extend(
+                        AlignmentGroup(raw=[r], vp=[v], safe_break=True)
+                        for r, v in zip(r_ids, v_ids)
+                    )
+                    proven_blocks += 1
+                    continue
+                signature = anchors(raw, r_ids)
+                if not signature or signature != anchors(vp, v_ids):
+                    break
+                groups.append(AlignmentGroup(raw=r_ids, vp=v_ids, safe_break=True))
+                proven_blocks += 1
+        if proven_blocks != len(left) or len(left) != len(right):
+            raise ValueError(
+                f"Structural alignment failed for chapter {raw.key}: RAW {len(raw.paragraphs)} logical lines, "
+                f"VietPhrase {len(vp.paragraphs)}; blank blocks or punctuation anchors do not prove pairing. "
+                "Review the files manually; no AI alignment was attempted."
+            )
+    alignment = Alignment(confirmed=True, groups=groups)
+    validate_alignment(alignment, raw, vp)
+    return alignment
 
 
 def make_chunks(alignment, raw, vp):

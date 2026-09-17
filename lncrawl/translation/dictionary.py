@@ -8,7 +8,7 @@ from .models import Term
 from .parsing import HAN
 
 ORDINARY = set(
-    "不会 继续 或者 直接 刚才 只要 连忙 眼睛 比如 主动 只能 轻轻 小声 不好 抬头 故意 开口 不再 嘴里 低声 有没有 一边 世界 中山装".split()
+    "不会 继续 或者 直接 刚才 只要 连忙 眼睛 比如 主动 只能 轻轻 小声 不好 抬头 故意 开口 不再 嘴里 低声 有没有 一边 世界 中山装 方法 温柔 任何 任命 任务".split()
 )
 FRAGMENTS = ("也", "不", "没", "竟然", "缓缓", "有")
 
@@ -36,7 +36,11 @@ def quantity_source_problem(source, contexts=()):
 
 
 def source_problem(source, known=()):
-    if not source or not HAN.search(source) or re.search(r"[\s，。！？：；]", source):
+    if (
+        not source
+        or not HAN.search(source)
+        or re.search(r"[\s，。！？：；\x00-\x1f\ufffd\ud800-\udfff]", source)
+    ):
         return "invalid source span"
     if source in ORDINARY:
         return "ordinary vocabulary"
@@ -56,7 +60,7 @@ def term_problem(term, known=()):
     if (
         not term.translation.strip()
         or HAN.search(term.translation)
-        or re.search(r"[\x00-\x1f\ufffd]", term.translation)
+        or re.search(r"[\x00-\x1f\ufffd\ud800-\udfff]", term.translation)
         or term.translation in ("ực đẹp", "ạnh được", "ất đầu", "âu đồ")
     ):
         return "malformed translation"
@@ -65,7 +69,9 @@ def term_problem(term, known=()):
     if any(source_problem(a, known) for a in [*term.aliases, *term.forms]):
         return "invalid alias/form"
     if any(
-        not value.strip() or HAN.search(value) or re.search(r"[\x00-\x1f\ufffd]", value)
+        not value.strip()
+        or HAN.search(value)
+        or re.search(r"[\x00-\x1f\ufffd\ud800-\udfff]", value)
         for value in term.forms.values()
     ):
         return "malformed address form translation"
@@ -107,11 +113,22 @@ def load_legacy(data):
     for record in records:
         try:
             # Missing legacy state is provisional, never implicitly locked.
-            term = Term.model_validate({k: v for k, v in record.items() if k in Term.model_fields})
+            # The canonical namespace uses Chinese source keys, not external IDs
+            # or reference records. Unsupported fields/broken reference formats
+            # are quarantined by the strict schema, without semantic API calls.
+            term = Term.model_validate(record)
             problem = term_problem(term)
             if problem:
                 raise ValueError(problem)
-            if term.source in terms and terms[term.source].translation != term.translation:
+            existing = terms.get(term.source)
+            if existing and (
+                existing.translation != term.translation
+                or existing.type != term.type
+                or any(
+                    key in existing.forms and existing.forms[key] != value
+                    for key, value in term.forms.items()
+                )
+            ):
                 conflicts.add(term.source)
                 terms[term.source].evidence += (
                     f" Legacy conflict: {terms[term.source].translation} versus {term.translation}."
@@ -122,6 +139,18 @@ def load_legacy(data):
                         "classification": "suspicious",
                         "record": record,
                         "reason": "cross-section conflict",
+                    }
+                )
+            elif existing:
+                existing.aliases = sorted(set(existing.aliases + term.aliases))
+                existing.forms.update(term.forms)
+                if term.status == "locked":
+                    existing.status = "locked"
+                problems.append(
+                    {
+                        "classification": "invalid",
+                        "record": record,
+                        "reason": "duplicate source merged locally; locked mapping preserved",
                     }
                 )
             else:
@@ -163,7 +192,8 @@ def terminology_gaps(terms, raw, translated):
 
     Longer source names take precedence over overlapping shorter entries. Address
     forms use their own mappings, and capitalization/Unicode spacing are immaterial.
-    Semantic correctness and repeated occurrences remain the RAW-aware AI check.
+    This checks attested wording locally; semantic equivalence still depends on
+    the translation model, rather than a generic AI review request.
     """
     mappings = {}
     for term in terms:

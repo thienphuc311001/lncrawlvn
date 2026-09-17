@@ -11,7 +11,7 @@ from pathlib import Path
 from ..context import APP_DIR
 from .dictionary import load_legacy
 from .models import PARSER_VERSION, Inputs
-from .parsing import parse_chapters, validate_inputs
+from .parsing import deterministic_alignment, parse_chapters, validate_inputs
 from .pipeline import Pipeline
 from .scheduler import Scheduler, api_keys
 from .store import Store
@@ -39,6 +39,9 @@ class ConsoleStore(Store):
                         "reconciliation_round",
                         "active_chapters",
                         "error",
+                        "dictionary_hash",
+                        "dictionary_frozen",
+                        "request_statistics",
                     )
                 },
                 ensure_ascii=False,
@@ -99,6 +102,8 @@ async def translate(arguments):
         else None
     )
     pairs = validate_inputs(raw, vp)
+    for raw_chapter, vp_chapter in pairs:
+        deterministic_alignment(raw_chapter, vp_chapter)
     load_legacy(dictionary)
     print(f"Validated {len(pairs)} chapter pairs.", flush=True)
     if arguments.check_inputs:

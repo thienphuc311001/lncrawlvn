@@ -95,6 +95,7 @@ class APITests(unittest.IsolatedAsyncioTestCase):
             {
                 "GOOGLE_AI_API_KEY": "secret-test-key",
                 "GOOGLE_AI_API_KEY_BACKUP": "secret-backup-key",
+                "GOOGLE_AI_API_KEY_THIRD": "",
                 "GOOGLE_AI_API_KEYS": "",
             },
         ):

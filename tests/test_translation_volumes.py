@@ -46,13 +46,9 @@ class MultiVolumePipelineTests(unittest.IsolatedAsyncioTestCase):
             translated = store.read("translated.json")
             self.assertEqual([c["number"] for c in translated["chapters"]], [1, 2, 1])
             self.assertEqual([c.get("volume") for c in translated["chapters"]], [1, 1, 2])
-            # Occurrence references scope repeated chapter numbers by volume.
-            scoped = [
-                path
-                for path in files
-                if path.startswith("resolution/") or path.startswith("candidates/")
-            ]
-            self.assertTrue(scoped)
+            # Local units scope repeated chapter numbers by volume.
+            units = store.read("terminology-index.json")["index"]["units"]
+            self.assertEqual({unit["chapter_key"] for unit in units}, {"v1-c1", "v1-c2", "v2-c1"})
             # Checkpoints are content-addressed per volume-scoped key, so a second
             # run performs zero provider calls.
             count = len(fake.calls)

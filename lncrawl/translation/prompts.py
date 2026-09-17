@@ -61,6 +61,31 @@ REVIEW requires a complete named/novel-specific unit whose consistency matters, 
 uncertain evidence. Never save generic vocabulary as a cumulative Book Dictionary.
 """
 )
+BATCH_RESOLVE = (
+    RESOLVE.replace(
+        "Resolve ONE candidate using all occurrence evidence and summaries.",
+        "Resolve independently every supplied candidate using representative RAW/VP evidence selected locally from the whole novel.",
+    )
+    + """Return results with exactly one source-tagged decision per supplied source.
+Each source retains independent evidence and output. Frequency and VP consensus alone
+do not establish identity, type, gender or a semantic alias. Preserve valid locked
+inherited mappings. Related existing entities are reference only, not extra candidates.
+Handle semantic conflicts explicitly. Reject ordinary phrases, quantity modifiers and
+grammar fragments. Attach proved titles/aliases to the canonical actor with exact
+Chinese-keyed forms; uncertain identity stays provisional and separate. Eligibility
+booleans must reflect RAW evidence. Do not translate prose. When repairing a batch,
+correct only the candidates included in that request, preserving accepted decisions.
+Never return type=character_alias as a canonical term. A proved person address form
+must return type=character with the attested canonical Chinese full name, merged
+aliases, and forms[original_source] preserving the address wording. For example, if
+RAW proves 秦科长 is 秦舒曼, return source=秦舒曼, type=character,
+translation=Tần Thư Mạn, forms={"秦科长":"Khoa trưởng Tần"}.
+If RAW does not establish the full identity, retain the exact address source as a
+provisional character without invented aliases, or a generic title if it is a role.
+validator_feedback describes a failed independent record; correct that defect in
+your new result. A plain string reason does not repair an invalid term record.
+"""
+)
 CONTEXT = (
     AUTHORITY
     + """Analyze the WHOLE chapter before translation. Produce compact
@@ -79,6 +104,11 @@ RAW support. Follow relevant dictionary forms tied to corresponding source occur
 Use each canonical translation verbatim (capitalization may follow sentence grammar).
 Do not paraphrase or substitute synonyms for dictionary entries. For a forms key use
 that key's mapped address form; prefer the longest matching Chinese source name.
+The dictionary is frozen for this entire batch. If a truly new important term requires
+an unresolved canonical/alias decision, report it in unresolved_terms with exact RAW
+evidence. Do not invent a mapping or rewrite the frozen dictionary. Otherwise return
+unresolved_terms=[]. Infer immediate scene/speaker context from the supplied RAW,
+chapter metadata and small previous finalized context; no separate analysis is needed.
 """
 )
 VALIDATE = (

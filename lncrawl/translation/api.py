@@ -41,6 +41,7 @@ def get_store(job_id):
 
 def snapshot(store, include_logs=True):
     progress = store.read("progress.json", {"job_id": store.id, "status": "pending"})
+    progress["request_statistics"] = store.request_statistics()
     if include_logs:
         progress["logs"] = store.logs()
         # Older checkpoints saved only the final provider error. Recover the

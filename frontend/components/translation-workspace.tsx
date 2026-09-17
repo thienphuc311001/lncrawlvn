@@ -5,7 +5,7 @@ import { useEffect, useState, type ReactNode } from 'react';
 const API = 'http://127.0.0.1:8000/api/translation';
 type TranslationEvent = {
   id?: string; timestamp?: string; task?: string; model?: string; status: string;
-  attempt?: number; key_slot?: number; retry_after?: number; category?: string; error?: string; message?: string;
+  attempt?: number; key_slot?: number; retry_after?: number; category?: string; operation?: string; reason?: string; error?: string; message?: string;
 };
 type Job = {
   job_id: string; status: string; stage?: string; error?: string; error_detail?: unknown;
@@ -14,6 +14,11 @@ type Job = {
   candidate_count?: number; resolved_candidates?: number; current_term?: string;
   active_chapters?: Record<string, { chunk: number; chunks: number }>;
   logs?: TranslationEvent[];
+  dictionary_hash?: string; dictionary_frozen?: boolean;
+  request_statistics?: {
+    total_requests: number; requests: Record<string, number>; logical_operations: Record<string, number>;
+    local_ai_requests: Record<string, number>; retry: number; model_fallback: number; cache_hits: number;
+  };
 };
 type Config = { models: Record<string, string>; concurrency: number; stagger_ms: number; api_key_configured: boolean; api_key_count?: number };
 
@@ -60,12 +65,13 @@ function TranslationLog({ logs = [] }: { logs?: TranslationEvent[] }) {
           {event.timestamp && <time dateTime={event.timestamp}>{event.timestamp.replace('T', ' ').replace(/\.\d+/, '')}</time>}
           <strong className={`translation-log-status translation-log-status-${event.status}`}>{event.status}</strong>
           {event.task && <span>{event.task}</span>}
+          {event.operation && <span>{event.operation.replaceAll('_', ' ')}</span>}
           {event.model && <span>{event.model}</span>}
           {event.key_slot && <span>Key slot {event.key_slot}</span>}
           {event.category && <span>{event.category}</span>}
           {event.attempt && <span>Attempt {event.attempt}/2</span>}
         </div>
-        {(event.error || event.message) && <p>{event.error ?? event.message}</p>}
+        {(event.error || event.message || event.reason) && <p>{event.error ?? event.message ?? event.reason}</p>}
       </li>)}
     </ol>}
   </section>;
@@ -167,7 +173,7 @@ export default function TranslationWorkspace() {
       {busy ? 'Working…' : 'Translate batch'}
     </button>
     {config && <details className="translation-config"><summary>System Configuration</summary>
-      <p>Every uncached task starts with Primary. Quota errors try the next configured API key on the same model before model fallback. Temporary errors get up to two attempts per key; exhausted daily quota skips a retry. Authentication and invalid request errors stop immediately.</p>
+      <p>Requests prefer Primary, then the other configured keys and fallback models. Daily quota disables only that key/model for this run. RPM/TPM limits suspend that pair for 60 seconds while other pairs continue. Temporary errors get up to two attempts per pair. Authentication or configuration errors disable the affected key; processing continues while a usable pair remains.</p>
       {Object.entries(config.models).map(([role, model]) => <label className="settings-field" key={role}>
         <span>{role[0].toUpperCase() + role.slice(1)} Model</span><input readOnly value={model} />
       </label>)}
@@ -182,6 +188,7 @@ export default function TranslationWorkspace() {
       <h2>{job.stage ?? job.status}</h2>
       <p>{job.status} · {job.completed_chapters ?? 0}/{job.total_chapters ?? '?'} chapters finalized</p>
       {job.aligned !== undefined && <p>Aligned chapters: {job.aligned}</p>}
+      {job.dictionary_frozen && <p>Dictionary frozen for this batch · {job.dictionary_hash?.slice(0, 12)}</p>}
       {job.stage === 'Dictionary resolution' && job.candidate_count !== undefined && job.resolved_candidates !== undefined && <p>Terms reviewed: {job.resolved_candidates}/{job.candidate_count}{job.current_term ? ` · ${job.current_term}` : ''}</p>}
       {Object.entries(job.active_chapters ?? {}).map(([chapter, value]) => <p key={chapter}>{chapterLabel(chapter)} · Chunk {value.chunk}/{value.chunks}</p>)}
       <ErrorNotice detail={job.error_detail ?? job.error} />
@@ -192,6 +199,17 @@ export default function TranslationWorkspace() {
         <a className="btn btn-primary" href={`${API}/jobs/${job.job_id}/outputs/dictionary.json`}>Updated Book Dictionary</a>
       </div>}
       <TranslationLog logs={job.logs} />
+      {job.request_statistics && <details className="translation-statistics"><summary>Request statistics · {job.request_statistics.total_requests} API requests</summary>
+        <table><thead><tr><th>Operation</th><th>Logical calls</th><th>API attempts</th></tr></thead><tbody>
+          {Object.entries(job.request_statistics.requests).map(([operation, count]) => <tr key={operation}>
+            <td>{operation.replaceAll('_', ' ')}</td><td>{job.request_statistics?.logical_operations[operation] ?? 0}</td><td>{count}</td>
+          </tr>)}
+          {Object.entries(job.request_statistics.local_ai_requests).map(([operation, count]) => <tr key={operation}>
+            <td>{operation.replaceAll('_', ' ')} (local)</td><td>0</td><td>{count}</td>
+          </tr>)}
+        </tbody></table>
+        <p>Retries: {job.request_statistics.retry} · Model fallbacks: {job.request_statistics.model_fallback} · Cached AI results reused: {job.request_statistics.cache_hits}</p>
+      </details>}
     </div>}
     <ErrorNotice detail={error} />
   </section>;

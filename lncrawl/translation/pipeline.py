@@ -1,8 +1,10 @@
-"""Batch-first terminology, sequential chapter chunks, quality repair and reconciliation."""
+"""Local whole-batch preprocessing, frozen terminology, translation and targeted repair."""
 
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
+from types import MappingProxyType
 
 from . import prompts
 from .dictionary import (
@@ -14,44 +16,31 @@ from .dictionary import (
     source_name,
     source_problem,
     term_problem,
-    terminology_gaps,
 )
 from .models import (
+    MODELS,
     PARSER_VERSION,
+    PIPELINE_VERSION,
     Alignment,
-    Candidates,
-    Context,
-    Evidence,
-    Issue,
+    BatchResolution,
+    Chapter,
     Repair,
     Resolution,
+    Segment,
+    Term,
     Translation,
-    Validation,
 )
-from .parsing import make_chunks, validate_alignment, validate_inputs
-from .store import digest
+from .parsing import deterministic_alignment, make_chunks, validate_inputs
+from .preprocessing import batches, build_index, local_resolution, normalized
+from .store import digest, pipeline_identity
+from .validation import local_findings
 
 
 class QualityError(RuntimeError):
     pass
 
 
-def pages(items, budget=18000):
-    """Bound evidence prompts by content size, never by corresponding RAW/VP offsets."""
-    page, size = [], 0
-    for item in items:
-        length = len(str(item))
-        if page and size + length > budget:
-            yield page
-            page, size = [], 0
-        page.append(item)
-        size += length
-    if page:
-        yield page
-
-
 def chapter_identity(chapter, field="number"):
-    """Persist original numbering, adding scope only when the input has a volume."""
     identity = {field: chapter.number}
     if chapter.volume is not None:
         identity["volume"] = chapter.volume
@@ -61,49 +50,80 @@ def chapter_identity(chapter, field="number"):
 class Pipeline:
     def __init__(self, store, scheduler):
         self.store, self.scheduler = store, scheduler
-        self.terms = {}
-        self.pairs = []
-        self.alignments = {}
-        self.chunks = {}
-        self.missed = {}
-        self.activity = {}
-        self.term_lock = asyncio.Lock()
-        self.cache_keys = {}
+        self.terms, self.pairs, self.alignments, self.chunks = {}, [], {}, {}
+        self.index, self.activity, self.cache_keys, self.decisions = {}, {}, {}, {}
+        self.frozen_hash = None
+        self.input_hash = None
 
     def progress(self, stage, **fields):
-        self.store.progress(stage=stage, **fields)
+        self.store.progress(
+            stage=stage, request_statistics=self.store.request_statistics(), **fields
+        )
 
-    async def ai(self, task, instruction, payload, schema):
+    def local(self, operation, message):
+        self.store.log(
+            {
+                "status": "local_success",
+                "operation": operation,
+                "ai_requests": 0,
+                "message": message,
+            }
+        )
+
+    async def ai(
+        self,
+        task,
+        instruction,
+        payload,
+        schema,
+        operation="terminology_resolver",
+        reason="Unresolved semantic terminology",
+    ):
         key = digest(
             {
                 "task": task,
                 "instruction": instruction,
                 "payload": payload,
                 "schema": schema.model_json_schema(),
+                "pipeline_version": PIPELINE_VERSION,
+                "models": MODELS,
             }
         )
         self.cache_keys.setdefault(task, set()).add(key)
         cached = self.store.read(f"cache/{key}.json")
         if cached is not None:
+            self.store.account(operation, "cache_hits")
             self.store.diagnostic(
                 {
                     "task": task,
+                    "operation": operation,
                     "status": "cached",
                     "message": "Reused completed checkpoint; no API request",
                 }
             )
             return schema.model_validate(cached)
-        result = await self.scheduler.request(
-            instruction,
-            payload,
-            schema,
-            lambda meta: self.store.diagnostic({"task": task, **meta}),
-        )
+        self.store.account(operation, "logical")
+        previous_model = None
+
+        def record(meta):
+            nonlocal previous_model
+            if meta["status"] == "running":
+                fallback = (
+                    meta["model"] != previous_model
+                    if previous_model
+                    else meta["model"] != MODELS[0]
+                )
+                self.store.account(operation, "running", model_fallback=fallback)
+                if meta.get("retry_count", 0):
+                    self.store.account(operation, "retry")
+                previous_model = meta["model"]
+            self.store.diagnostic({"task": task, "operation": operation, "reason": reason, **meta})
+
+        result = await self.scheduler.request(instruction, payload, schema, record)
         self.store.write(f"cache/{key}.json", result.model_dump())
         return result
 
     def fail(self, task, message):
-        # Unfinalized, semantically invalid responses must not poison every resume.
         for operation, keys in self.cache_keys.items():
             if operation.startswith(task):
                 for key in keys:
@@ -111,7 +131,6 @@ class Pipeline:
         raise QualityError(message)
 
     async def parallel(self, items, function):
-        # Only a small fixed worker pool, not one task per chapter/term.
         iterator = iter(items)
 
         async def worker():
@@ -129,57 +148,25 @@ class Pipeline:
 
     async def align(self, pair):
         raw, vp = pair
-        payload = {
-            "raw": {
-                **raw.model_dump(),
-                "paragraphs": [{"id": i, "text": text} for i, text in enumerate(raw.paragraphs)],
-            },
-            "vietphrase": {
-                **vp.model_dump(),
-                "paragraphs": [{"id": i, "text": text} for i, text in enumerate(vp.paragraphs)],
-            },
-            "paragraph_ids": "zero based",
-            "chapter_order_confirmed": True,
-        }
-        task = f"chapter:{raw.key}:alignment"
-        alignment = await self.ai(task, prompts.ALIGN, payload, Alignment)
-        for attempt in range(3):
-            try:
-                validate_alignment(alignment, raw, vp)
-                break
-            except ValueError as exc:
-                self.store.write(
-                    f"alignment-rejections/{raw.key}-{attempt}.json",
-                    {
-                        "error": str(exc),
-                        "response": alignment.model_dump(),
-                    },
-                )
-                if not alignment.confirmed or attempt == 2:
-                    self.fail(task, f"Chapter {raw.key}: {exc}")
-                alignment = await self.ai(
-                    task + f":repair:{attempt}",
-                    prompts.ALIGN,
-                    {
-                        **payload,
-                        "structural_error": str(exc),
-                        "previous_alignment": alignment.model_dump(),
-                        "repair_instruction": "Correct the semantic alignment. Enumerate EVERY paragraph ID, not just range endpoints. Do not omit, duplicate, reorder or fabricate paragraph IDs.",
-                    },
-                    Alignment,
-                )
+        saved = self.store.read(f"alignment/{raw.key}.json")
+        alignment = Alignment.model_validate(saved) if saved else deterministic_alignment(raw, vp)
+        # Check cached structural provenance, not merely paragraph ID coverage.
+        proved = deterministic_alignment(raw, vp)
+        if alignment != proved:
+            raise QualityError(f"Invalid structural alignment checkpoint for {raw.key}")
         self.alignments[raw.key] = alignment
         self.chunks[raw.key] = make_chunks(alignment, raw, vp)
-        self.store.write(f"alignment/{raw.key}.json", alignment.model_dump())
+        if not saved:
+            self.store.write(f"alignment/{raw.key}.json", alignment.model_dump())
         self.progress(
-            "Chapter alignment", aligned=len(self.alignments), total_chapters=len(self.pairs)
+            "Local chapter alignment", aligned=len(self.alignments), total_chapters=len(self.pairs)
         )
 
     def occurrences(self, source):
-        occurrences = []
+        result = []
         for raw, vp in self.pairs:
             if source in raw.title:
-                occurrences.append(
+                result.append(
                     {
                         **chapter_identity(raw, "chapter"),
                         "paragraph_ids": [-1],
@@ -191,7 +178,7 @@ class Pipeline:
             for group in self.alignments[raw.key].groups:
                 matched = [i for i in group.raw if source in raw.paragraphs[i]]
                 if matched:
-                    occurrences.append(
+                    result.append(
                         {
                             **chapter_identity(raw, "chapter"),
                             "paragraph_ids": matched,
@@ -200,7 +187,7 @@ class Pipeline:
                             "vp": [vp.paragraphs[i] for i in group.vp],
                         }
                     )
-        return occurrences
+        return result
 
     def known_source(self, source):
         return any(
@@ -211,9 +198,6 @@ class Pipeline:
         problem = source_problem(source, self.terms)
         if problem:
             return problem
-        # An absent inherited title may contain a numeral (e.g. a book called
-        # "3个愿望"). Vet its stored evidence semantically rather than discard it
-        # merely because this batch cannot repeat its original naming context.
         if (
             inherited
             and source in [inherited.source, *inherited.aliases, *inherited.forms]
@@ -225,6 +209,9 @@ class Pipeline:
         )
 
     async def resolve(self, source, inherited=None):
+        """Diagnostic single-candidate resolution; production preprocessing batches candidates."""
+        if self.frozen_hash is not None:
+            raise QualityError("Dictionary is frozen; rebuild the batch to resolve new terminology")
         issue = self.source_issue(source, inherited)
         if issue:
             self.store.write(
@@ -232,53 +219,11 @@ class Pipeline:
                 {"application_decision": "REJECT", "reason": issue},
             )
             return
-        occurrences = self.occurrences(source)
-        occurrence_pages = list(pages(occurrences))
-        evidence = [""] * len(occurrence_pages)
-
-        async def collect(item):
-            index, page = item
-            result = await self.ai(
-                f"term:{source}:evidence:{index}",
-                prompts.EVIDENCE,
-                {"source": source, "occurrences": page},
-                Evidence,
-            )
-            evidence[index] = result.findings
-
-        # Evidence pages are independent. Use the same bounded worker pool and
-        # provider gate, then retain source order for deterministic resolution.
-        await self.parallel(enumerate(occurrence_pages), collect)
-        # Hierarchical reduction visits every occurrence without a million-character request.
-        while sum(map(len, evidence)) > 18000:
-            summary_pages = list(pages(evidence, 12000))
-            reduced = [""] * len(summary_pages)
-
-            async def aggregate(item):
-                index, page = item
-                result = await self.ai(
-                    f"term:{source}:aggregate",
-                    prompts.EVIDENCE,
-                    {"source": source, "all_evidence_summaries": page},
-                    Evidence,
-                )
-                if len(result.findings) > 3000:
-                    raise QualityError("Evidence summary exceeds compact context budget")
-                reduced[index] = result.findings
-
-            await self.parallel(enumerate(summary_pages), aggregate)
-            evidence = reduced
-        related = [
-            t.model_dump()
-            for t in self.terms.values()
-            if source in [t.source, *t.aliases, *t.forms]
-            or any(t.source in finding for finding in evidence)
-        ]
         payload = {
             "source": source,
-            "all_occurrence_evidence": evidence,
+            "representative_evidence": self.occurrences(source)[:6],
             "inherited": inherited.model_dump() if inherited else None,
-            "related_entities": related,
+            "related_entities": [term.model_dump() for term in self.terms.values()],
         }
         task = f"term:{source}:resolve"
         result = await self.ai(task, prompts.RESOLVE, payload, Resolution)
@@ -325,6 +270,8 @@ class Pipeline:
                 )
 
     def apply_resolution(self, source, inherited, result):
+        if self.frozen_hash is not None:
+            raise QualityError("Cannot mutate the frozen batch dictionary")
         self.store.write(f"resolution/{digest(source)}.json", result.model_dump())
         if result.decision == "REJECT" or result.term is None:
             return
@@ -454,206 +401,395 @@ class Pipeline:
             del self.terms[name]
         self.terms[term.source] = term
 
-    async def discover(self, pair):
-        raw, _ = pair
-        collected = {}
-        for index, chunk in enumerate(self.chunks[raw.key]):
-            result = await self.ai(
-                f"chapter:{raw.key}:scan:{index}",
-                prompts.DISCOVER,
-                {**chunk, "raw_title": raw.title, "vp_title": pair[1].title},
-                Candidates,
+    def dictionary_conflicts(self):
+        owners, translations, conflicts = {}, {}, set()
+        for source, term in self.terms.items():
+            translation = normalized(term.translation)
+            if translation in translations:
+                conflicts.update([source, translations[translation]])
+            translations[translation] = source
+            for name in [source, *term.aliases, *term.forms]:
+                if name in owners and owners[name] != source:
+                    conflicts.update([source, owners[name]])
+                owners[name] = source
+        return conflicts
+
+    def resolver_payload(self, source, feedback=None):
+        candidate = self.index["candidates"].get(source, {})
+        inherited = self.terms.get(source)
+        variants = candidate.get("vietphrase_variants", {})
+        related = [
+            term.model_dump()
+            for term in self.terms.values()
+            if term.source == source
+            or source in [*term.aliases, *term.forms]
+            or term.source[0] == source[0]
+            or normalized(term.translation) in {normalized(value) for value in variants}
+        ]
+        return {
+            "source": source,
+            "frequency": candidate.get("frequency", 0),
+            "signals": candidate.get("reasons", []),
+            "vietphrase_consensus": variants,
+            "representative_evidence": candidate.get("representative_evidence", []),
+            "inherited": inherited.model_dump() if inherited else None,
+            "related_entities": related[:12],
+            "validator_feedback": feedback,
+        }
+
+    def save_decisions(self):
+        self.store.write(
+            "resolved-terms.json",
+            {
+                "input_hash": self.input_hash,
+                "terms": [term.model_dump() for term in self.terms.values()],
+                "decisions": self.decisions,
+            },
+        )
+
+    async def resolve_candidates(self, sources, operation):
+        pending, feedback = list(sources), {}
+        for attempt in range(3):
+            if not pending:
+                return
+            failed = []
+            items = [self.resolver_payload(source, feedback.get(source)) for source in pending]
+            for page in batches(items):
+                page_sources = [item["source"] for item in page]
+                task = f"batch:{operation}:{digest(page_sources)}:{attempt}"
+                result = await self.ai(
+                    task,
+                    prompts.BATCH_RESOLVE,
+                    {"candidates": page},
+                    BatchResolution,
+                    operation=operation,
+                    reason="Ambiguous whole-novel terminology"
+                    if operation == "terminology_resolver"
+                    else "Concrete conflicting canonical mappings/aliases",
+                )
+                counts = Counter(item.source for item in result.results)
+                by_source = {
+                    item.source: item for item in result.results if counts[item.source] == 1
+                }
+                for source in page_sources:
+                    item = by_source.get(source)
+                    previous = {
+                        key: value.model_copy(deep=True) for key, value in self.terms.items()
+                    }
+                    try:
+                        if item is None:
+                            raise QualityError(
+                                "Missing, duplicated or malformed independent candidate result"
+                            )
+                        inherited = self.terms.get(source)
+                        if item.decision == "REJECT":
+                            self.terms.pop(source, None)
+                        self.apply_resolution(
+                            source,
+                            inherited,
+                            Resolution.model_validate(item.model_dump(exclude={"source"})),
+                        )
+                        # Only this candidate's namespace is checked here: unrelated
+                        # pending semantic conflicts cannot invalidate independent work.
+                        term = next(
+                            (
+                                value
+                                for value in self.terms.values()
+                                if source in [value.source, *value.aliases, *value.forms]
+                            ),
+                            None,
+                        )
+                        if term:
+                            names = {term.source, *term.aliases, *term.forms}
+                            connected = {
+                                key: value
+                                for key, value in self.terms.items()
+                                if names.intersection([value.source, *value.aliases, *value.forms])
+                                or normalized(value.translation) == normalized(term.translation)
+                            }
+                            sanity(connected)
+                        self.decisions[source] = item.decision
+                        self.save_decisions()
+                    except (QualityError, ValueError) as exc:
+                        self.terms = previous
+                        feedback[source] = str(exc)
+                        failed.append(source)
+                        self.store.write(
+                            f"resolution-rejections/{digest(source)}-{attempt}.json",
+                            {"error": str(exc), "response": item.model_dump() if item else None},
+                        )
+                self.progress(
+                    "Dictionary resolution",
+                    resolved_candidates=len(self.decisions),
+                    current_term=None,
+                )
+            pending = failed
+        if pending:
+            raise QualityError(
+                f"Unresolved semantic dictionary candidates after two targeted batch corrections: {', '.join(pending[:20])}"
             )
-            for candidate in result.candidates:
-                source = source_name(candidate.source)
-                if (
-                    not self.source_issue(source)
-                    and candidate.evidence
-                    and candidate.source in candidate.evidence
-                    and any(
-                        candidate.evidence in text
-                        for text in [raw.title, *[p["text"] for p in chunk["raw"]]]
-                    )
-                ):
-                    collected[source] = candidate.evidence
-        self.missed.update(collected)
-        self.store.write(f"candidates/{raw.key}.json", collected)
-        self.progress("Terminology analysis", scanned_chapter=raw.key)
 
-    def remember_missed(self, validation, raw):
-        for candidate in validation.missed_terms:
-            source = source_name(candidate.source)
+    async def prepare_dictionary(self, inputs):
+        inherited, problems = load_legacy(inputs.get("dictionary"))
+        self.store.write("legacy-audit.json", problems)
+        saved_index = self.store.read("terminology-index.json")
+        if saved_index and saved_index.get("input_hash") == self.input_hash:
+            self.index = saved_index["index"]
+        else:
+            self.progress("Local whole-novel terminology scan")
+            self.index = await asyncio.to_thread(
+                build_index, self.pairs, self.alignments, inherited
+            )
+            self.store.write(
+                "terminology-index.json", {"input_hash": self.input_hash, "index": self.index}
+            )
+        for operation in ("scanning", "occurrence_aggregation", "evidence_selection"):
+            self.local(
+                operation,
+                f"{len(self.index['candidates'])} whole-novel candidates; zero AI requests",
+            )
+        saved = self.store.read("resolved-terms.json")
+        if saved and saved.get("input_hash") == self.input_hash:
+            self.terms = {item["source"]: Term.model_validate(item) for item in saved["terms"]}
+            self.decisions = saved["decisions"]
+        else:
+            self.terms = {term.source: term for term in inherited}
+        conflicts = self.dictionary_conflicts()
+        conflicts.update(term.source for term in inherited if "Legacy conflict:" in term.evidence)
+        pending = []
+        for source, candidate in self.index["candidates"].items():
+            if source in self.decisions:
+                continue
+            if self.known_source(source) and source not in conflicts:
+                self.decisions[source] = "REUSED"
+                continue
+            local_term = local_resolution(candidate)
             if (
-                not self.known_source(source)
-                and not self.source_issue(source)
-                and candidate.evidence
-                and candidate.source in candidate.evidence
-                and candidate.evidence in raw
+                local_term
+                and source not in conflicts
+                and not any(
+                    normalized(local_term.translation) == normalized(term.translation)
+                    for term in self.terms.values()
+                )
             ):
-                self.missed[source] = candidate.evidence
-                self.store.write("missed-terms.json", self.missed)
+                self.terms[source] = local_term
+                self.decisions[source] = "LOCAL_PROVISIONAL"
+            elif candidate["frequency"] or source in conflicts:
+                pending.append(source)
+        self.save_decisions()
+        self.progress(
+            "Dictionary resolution",
+            candidate_count=len(self.index["candidates"]),
+            resolved_candidates=len(self.decisions),
+        )
+        semantic = sorted(set(pending).intersection(conflicts))
+        ordinary = [source for source in pending if source not in conflicts]
+        if semantic:
+            await self.resolve_candidates(semantic, "semantic_dictionary_conflict")
+        if ordinary:
+            await self.resolve_candidates(ordinary, "terminology_resolver")
+        # Namespace collisions are semantic only if structurally valid records remain.
+        for round_number in range(2):
+            conflicts = self.dictionary_conflicts()
+            if not conflicts:
+                break
+            await self.resolve_candidates(sorted(conflicts), "semantic_dictionary_conflict")
+        sanity(self.terms)
+        audit = []
+        for term in self.terms.values():
+            problem = term_problem(term, self.terms)
+            if problem:
+                raise QualityError(f"Local dictionary audit: {term.source}: {problem}")
+            for name in [term.source, *term.aliases, *term.forms]:
+                if not any(name in unit["raw"] for unit in self.index["units"]):
+                    audit.append(
+                        {
+                            "source": name,
+                            "classification": "absent_from_current_raw",
+                            "disposition": "retained_valid_cumulative_mapping",
+                        }
+                    )
+        self.store.write("dictionary-audit.json", audit)
+        self.local(
+            "structural_dictionary_audit",
+            "Schema, namespace, Unicode, mappings and RAW occurrence audit passed",
+        )
+        dictionary = export_dictionary(self.terms)
+        self.store.write("working-dictionary.json", dictionary)
+        self.freeze(dictionary)
+        self.store.write(
+            "frozen-dictionary.json",
+            {
+                "input_hash": self.input_hash,
+                "dictionary_hash": self.frozen_hash,
+                "dictionary": dictionary,
+            },
+        )
 
-    async def resolve_missed(self):
-        async with self.term_lock:
-            for source in sorted(self.missed):
-                if not self.known_source(source):
-                    await self.resolve(source)
-            sanity(self.terms)
-            self.store.write("working-dictionary.json", export_dictionary(self.terms))
+    def freeze(self, dictionary):
+        terms, invalid = load_legacy(dictionary)
+        if invalid:
+            raise QualityError("Malformed frozen dictionary checkpoint")
+        sanity({term.source: term for term in terms})
+        self.terms = MappingProxyType({term.source: term.model_copy(deep=True) for term in terms})
+        self.frozen_hash = digest(export_dictionary(self.terms))
+        self.progress("Dictionary frozen", dictionary_hash=self.frozen_hash, dictionary_frozen=True)
+        self.local("dictionary_freeze", f"All chapters use frozen dictionary {self.frozen_hash}")
+
+    def assert_frozen(self):
+        if self.frozen_hash is None or digest(export_dictionary(self.terms)) != self.frozen_hash:
+            raise QualityError("Frozen dictionary changed; stop and rebuild the batch")
+
+    def check_unresolved(self, task, payload, translation):
+        found = [
+            candidate.model_dump()
+            for candidate in translation.unresolved_terms
+            if not self.known_source(source_name(candidate.source))
+            and candidate.source in candidate.evidence
+            and candidate.evidence
+            in payload.get("raw_title", "") + "\n" + "\n".join(p["text"] for p in payload["raw"])
+        ]
+        if found:
+            self.store.write(
+                f"frozen-conflicts/{digest(task)}.json",
+                {"dictionary_hash": self.frozen_hash, "candidates": found},
+            )
+            raise QualityError(
+                "New unresolved terminology reported after dictionary freeze. Review frozen-conflicts and submit an updated inherited dictionary as a new batch; finalized chapters and dictionary remain unchanged."
+            )
 
     async def validate_and_repair(self, task, payload, translation):
-        ids = [p["id"] for p in payload["raw"]]
-        if [s.id for s in translation.segments] != ids:
-            self.fail(task, f"{task}: translation paragraph IDs do not match RAW")
+        ids = [paragraph["id"] for paragraph in payload["raw"]]
+        self.check_unresolved(task, payload, translation)
         for attempt in range(3):
-            validation = await self.ai(
-                task + ":validate",
-                prompts.VALIDATE,
-                {
-                    **{key: value for key, value in payload.items() if key != "vp"},
-                    "translation": translation.model_dump(),
-                },
-                Validation,
-            )
-            # An AI validator may accept a fluent synonym for a canonical name.
-            # Keep the check grounded in this segment's Chinese source and request
-            # localized RAW-aware repair instead of replacing Vietnamese globally.
-            validation = validation.model_copy(deep=True)
-            segments = {s.id: s.text for s in translation.segments}
-            source_segments = [*payload["raw"], {"id": -1, "text": payload.get("raw_title", "")}]
-            for paragraph in source_segments:
-                text = translation.title if paragraph["id"] == -1 else segments[paragraph["id"]]
-                for source, expected in terminology_gaps(
-                    payload.get("terminology", []), paragraph["text"], text
-                ):
-                    validation.issues.append(
-                        Issue(
-                            segment_id=paragraph["id"],
-                            kind="terminology",
-                            explanation=f"RAW explicitly contains {source}; use its canonical dictionary form {expected!r} at that occurrence. Preserve all other RAW meaning.",
-                        )
-                    )
-            self.remember_missed(
-                validation,
-                payload.get("raw_title", "") + "\n" + "\n".join(p["text"] for p in payload["raw"]),
-            )
-            if not validation.issues:
+            try:
+                issues = local_findings(payload, translation)
+            except ValueError as exc:
+                self.fail(task, str(exc))
+            if not issues:
+                self.local(
+                    "normal_output_validation",
+                    f"{task}: local checks passed; zero AI review requests",
+                )
                 return translation
             self.store.write(
                 f"validation-rejections/{digest(task)}-{attempt}.json",
                 {
                     "task": task,
-                    "attempt": attempt,
-                    "issues": [issue.model_dump() for issue in validation.issues],
+                    "issues": [issue.model_dump() for issue in issues],
                     "translation": translation.model_dump(),
                 },
             )
-            affected = sorted({issue.segment_id for issue in validation.issues})
-            if any(i not in ids and i != -1 for i in affected):
-                self.fail(task, f"{task}: validator returned unknown segment IDs")
             if attempt == 2:
-                self.fail(
-                    task, f"{task}: quality validation still fails after two targeted repairs"
-                )
-            # Only requested paragraphs are editable; neighborhood provides continuity.
+                self.fail(task, f"{task}: local validation still fails after two targeted repairs")
+            affected = sorted({issue.segment_id for issue in issues})
             selected = set(affected)
-            neighbors = set(selected)
-            for i in affected:
-                if i in ids:
-                    pos = ids.index(i)
-                    neighbors.update(ids[max(0, pos - 1) : pos + 2])
             chapter_key = task.split(":")[1]
             vp_ids = {
-                paragraph_id
+                value
                 for group in self.alignments[chapter_key].groups
-                if neighbors.intersection(group.raw)
-                for paragraph_id in group.vp
+                if selected.intersection(group.raw)
+                for value in group.vp
             }
+            neighbors = set()
+            for paragraph_id in affected:
+                if paragraph_id in ids:
+                    index = ids.index(paragraph_id)
+                    neighbors.update(ids[max(0, index - 1) : index + 2])
             repair_payload = {
-                **payload,
-                "repair_attempt": attempt + 1,
-                "repair_feedback": "The previous repair did not pass validation; correct the remaining issues."
-                if attempt
-                else "Correct the localized validation issues.",
-                "raw": [p for p in payload["raw"] if p["id"] in neighbors],
-                "vp": [p for p in payload["vp"] if p["id"] in vp_ids],
+                "raw_title": payload.get("raw_title", ""),
+                "vp_title": payload.get("vp_title", ""),
+                "raw": [paragraph for paragraph in payload["raw"] if paragraph["id"] in selected],
+                "vp": [paragraph for paragraph in payload["vp"] if paragraph["id"] in vp_ids],
+                "terminology": payload.get("terminology", []),
+                "dictionary_hash": self.frozen_hash,
+                "affected_ids": affected,
+                "issues": [issue.model_dump() for issue in issues],
                 "translation": {
                     "title": translation.title,
-                    "segments": [s.model_dump() for s in translation.segments if s.id in neighbors],
+                    "segments": [s.model_dump() for s in translation.segments if s.id in selected],
                 },
-                "affected_ids": affected,
-                "issues": [i.model_dump() for i in validation.issues],
+                "previous_context": payload.get("previous_context", []),
+                "neighbor_context": [
+                    s.model_dump()
+                    for s in translation.segments
+                    if s.id in neighbors and s.id not in selected
+                ],
+                "repair_attempt": attempt + 1,
+                "repair_feedback": "The previous repair did not pass local validation; correct the remaining issues."
+                if attempt
+                else "Correct only the concrete local findings.",
             }
             repaired = await self.ai(
-                task + f":repair:{attempt}", prompts.REPAIR, repair_payload, Repair
+                task + f":repair:{attempt}",
+                prompts.REPAIR,
+                repair_payload,
+                Repair,
+                operation="repair",
+                reason="Concrete failed local validator findings: "
+                + ", ".join(sorted({issue.kind for issue in issues})),
             )
-            if sorted(s.id for s in repaired.segments) != affected:
-                self.fail(task, f"{task}: repair changed unexpected segments")
-            patches = {s.id: s.text for s in repaired.segments}
-            for segment in translation.segments:
-                if segment.id in patches:
-                    segment.text = patches[segment.id]
-            if -1 in patches:
-                translation.title = patches[-1]
+            if sorted(segment.id for segment in repaired.segments) != affected:
+                self.fail(task, f"{task}: repair returned unexpected/missing paragraph IDs")
+            patched = {segment.id: segment.text for segment in translation.segments}
+            for segment in repaired.segments:
+                if segment.id == -1:
+                    translation.title = segment.text
+                else:
+                    patched[segment.id] = segment.text
+            translation.segments = [
+                Segment(id=paragraph_id, text=patched[paragraph_id]) for paragraph_id in ids
+            ]
         raise AssertionError("unreachable")
 
     async def chapter(self, pair):
+        self.assert_frozen()
         raw, vp = pair
         key = raw.key
-        raw_text = "\n".join(raw.paragraphs)
-        terms = relevant(self.terms, raw_text + raw.title)
-        fingerprint = digest(terms)
-        saved = self.store.read(f"chapters/{key}.json")
+        terms = relevant(self.terms, raw.title + "\n" + "\n".join(raw.paragraphs))
         whole = {
             "raw_title": raw.title,
             "vp_title": vp.title,
-            "raw": [{"id": i, "text": p} for i, p in enumerate(raw.paragraphs)],
-            "vp": [{"id": i, "text": p} for i, p in enumerate(vp.paragraphs)],
+            "raw": [{"id": index, "text": text} for index, text in enumerate(raw.paragraphs)],
+            "vp": [{"id": index, "text": text} for index, text in enumerate(vp.paragraphs)],
             "terminology": terms,
         }
-        if saved and saved["dictionary_hash"] == fingerprint:
-            checked = Translation.model_validate(saved["translation"])
-            texts = {s.id: s.text for s in checked.segments}
-            gaps = terminology_gaps(terms, raw.title, checked.title)
-            for paragraph in whole["raw"]:
-                gaps.extend(terminology_gaps(terms, paragraph["text"], texts[paragraph["id"]]))
-            if not gaps:
-                return
-        if saved:
-            # Terminology discovered later triggers source-aware repairs to existing prose.
-            updated = await self.validate_and_repair(
+        saved = self.store.read(f"chapters/{key}.json")
+        if (
+            saved
+            and saved.get("pipeline_input_hash") == self.input_hash
+            and saved["dictionary_hash"] == self.frozen_hash
+        ):
+            checked = await self.validate_and_repair(
                 f"chapter:{key}:full", whole, Translation.model_validate(saved["translation"])
             )
-            self.store.write(
-                f"chapters/{key}.json",
-                {
-                    "dictionary_hash": fingerprint,
-                    **chapter_identity(raw),
-                    "translation": updated.model_dump(),
-                },
-            )
+            self.store.write(f"chapters/{key}.json", {**saved, "translation": checked.model_dump()})
             return
-        context = await self.ai(f"chapter:{key}:context", prompts.CONTEXT, whole, Context)
         segments, title = [], ""
-        translation_chunks = make_chunks(self.alignments[key], raw, vp)
-        for index, chunk in enumerate(translation_chunks):
+        for index, chunk in enumerate(self.chunks[key]):
+            self.assert_frozen()
             self.activity[key] = {"chunk": index + 1, "chunks": len(self.chunks[key])}
-            self.progress("Translating", active_chapters=self.activity)
+            self.progress("Translating", active_chapters=dict(self.activity))
+            chunk_terms = relevant(
+                self.terms, raw.title + "\n" + "\n".join(p["text"] for p in chunk["raw"])
+            )
+            previous = [segment.text[-800:] for segment in segments[-2:]]
             payload = {
                 "CHAPTER CONTEXT": {
-                    "analysis": context.context,
+                    **chapter_identity(raw),
                     "raw_title": raw.title,
                     "vp_title": vp.title,
                 },
                 "PREVIOUS CONTEXT": {
-                    "instruction": "CONTEXT ONLY. Do not translate again or include in output.",
-                    "paragraphs": [s.text for s in segments[-2:]],
+                    "instruction": "CONTEXT ONLY. Do not translate again.",
+                    "paragraphs": previous,
                 },
                 "RAW TO TRANSLATE": chunk["raw"],
                 "VIETPHRASE REFERENCE": chunk["vp"],
-                "TERMINOLOGY": terms,
+                "TERMINOLOGY": chunk_terms,
+                "dictionary_hash": self.frozen_hash,
             }
-            chunk_key = digest(payload)
+            chunk_key = digest({"payload": payload, "pipeline_input_hash": self.input_hash})
             checkpoint = self.store.read(f"chunks/{key}-{index}.json")
             if checkpoint and checkpoint["input_hash"] == chunk_key:
                 translated = Translation.model_validate(checkpoint["translation"])
@@ -663,50 +799,38 @@ class Pipeline:
                     prompts.TRANSLATE,
                     payload,
                     Translation,
+                    operation="translation",
+                    reason="Translate this RAW chunk using the already frozen whole-batch dictionary",
                 )
-                translated = await self.validate_and_repair(
-                    f"chapter:{key}:chunk:{index}",
-                    {
-                        **chunk,
-                        "raw_title": raw.title,
-                        "context": context.context,
-                        "previous_context": [s.text for s in segments[-2:]],
-                        "terminology": terms,
-                    },
-                    translated,
-                )
-                self.store.write(
-                    f"chunks/{key}-{index}.json",
-                    {"input_hash": chunk_key, "translation": translated.model_dump()},
-                )
-            previous_terms = terms
-            await self.resolve_missed()
-            terms = relevant(self.terms, raw_text + raw.title)
-            if terms != previous_terms:
-                translated = await self.validate_and_repair(
-                    f"chapter:{key}:chunk:{index}:terminology",
-                    {
-                        **chunk,
-                        "raw_title": raw.title,
-                        "context": context.context,
-                        "terminology": terms,
-                    },
-                    translated,
-                )
-                self.store.write(
-                    f"chunks/{key}-{index}.json",
-                    {"input_hash": chunk_key, "translation": translated.model_dump()},
-                )
+            translated = await self.validate_and_repair(
+                f"chapter:{key}:chunk:{index}",
+                {
+                    **chunk,
+                    "raw_title": raw.title,
+                    "vp_title": vp.title,
+                    "previous_context": previous,
+                    "terminology": chunk_terms,
+                },
+                translated,
+            )
+            self.store.write(
+                f"chunks/{key}-{index}.json",
+                {
+                    "input_hash": chunk_key,
+                    "dictionary_hash": self.frozen_hash,
+                    "translation": translated.model_dump(),
+                },
+            )
             segments.extend(translated.segments)
             title = title or translated.title
-        self.progress("Full chapter validation", chapter=key)
-        whole["terminology"] = relevant(self.terms, raw_text + raw.title)
-        merged = Translation(title=title, segments=segments)
-        merged = await self.validate_and_repair(f"chapter:{key}:full", whole, merged)
+        merged = await self.validate_and_repair(
+            f"chapter:{key}:full", whole, Translation(title=title, segments=segments)
+        )
         self.store.write(
             f"chapters/{key}.json",
             {
-                "dictionary_hash": fingerprint,
+                "dictionary_hash": self.frozen_hash,
+                "pipeline_input_hash": self.input_hash,
                 **chapter_identity(raw),
                 "translation": merged.model_dump(),
             },
@@ -714,109 +838,80 @@ class Pipeline:
         self.activity.pop(key, None)
         self.progress(
             "Translating",
-            active_chapters=self.activity,
+            active_chapters=dict(self.activity),
             completed_chapters=sum(
                 self.store.read(f"chapters/{r.key}.json") is not None for r, _ in self.pairs
             ),
         )
 
-    async def final_validation(self, pair):
-        raw, vp = pair
-        saved = self.store.read(f"chapters/{raw.key}.json")
-        terms = relevant(self.terms, raw.title + "\n".join(raw.paragraphs))
-        payload = {
-            "scope": "Final batch consistency against the canonical Book Dictionary",
-            "raw_title": raw.title,
-            "vp_title": vp.title,
-            "raw": [{"id": i, "text": p} for i, p in enumerate(raw.paragraphs)],
-            "vp": [{"id": i, "text": p} for i, p in enumerate(vp.paragraphs)],
-            "terminology": terms,
-        }
-        checked = await self.validate_and_repair(
-            f"chapter:{raw.key}:batch", payload, Translation.model_validate(saved["translation"])
-        )
-        self.store.write(
-            f"chapters/{raw.key}.json",
-            {
-                "dictionary_hash": digest(terms),
-                **chapter_identity(raw),
-                "translation": checked.model_dump(),
-            },
-        )
-
     async def run(self):
         inputs = self.store.read("inputs.json")
-        self.progress("Parsing", error=None, error_detail=None, active_chapters={})
-        self.pairs = validate_inputs(inputs["raw"], inputs["vietphrase"])
+        self.input_hash = pipeline_identity(inputs)
+        self.progress(
+            "Local parsing",
+            error=None,
+            error_detail=None,
+            active_chapters={},
+            dictionary_frozen=False,
+        )
+        parsed = self.store.read("parsed-chapters.json")
+        if parsed and parsed["input_hash"] == self.input_hash:
+            self.pairs = [
+                (Chapter.model_validate(pair[0]), Chapter.model_validate(pair[1]))
+                for pair in parsed["pairs"]
+            ]
+        else:
+            self.pairs = validate_inputs(inputs["raw"], inputs["vietphrase"])
+            self.store.write(
+                "parsed-chapters.json",
+                {
+                    "input_hash": self.input_hash,
+                    "pairs": [[r.model_dump(), v.model_dump()] for r, v in self.pairs],
+                },
+            )
         self.store.write("parser-version.json", {"version": PARSER_VERSION})
         await self.parallel(self.pairs, self.align)
-        inherited, problems = load_legacy(inputs.get("dictionary"))
-        self.store.write("legacy-audit.json", problems)
-        self.progress("Validating inherited dictionary")
-        previous_dictionary = self.store.read("working-dictionary.json")
-        if previous_dictionary is not None:
-            restored, invalid = load_legacy(previous_dictionary)
-            if invalid:
-                raise ValueError("Invalid dictionary checkpoint; inspect internal legacy audit")
-            self.terms = {term.source: term for term in restored}
-            sanity(self.terms)
-        # Vet even absent legacy terms before treating them as authoritative.
-        for term in inherited:
-            if term.source not in self.terms:
-                await self.resolve(term.source, term)
-        await self.parallel(self.pairs, self.discover)
-        self.progress("Dictionary resolution", candidate_count=len(self.missed))
-        for index, source in enumerate(sorted(self.missed)):
-            self.progress("Dictionary resolution", current_term=source, resolved_candidates=index)
-            # These inputs already contain every current-batch occurrence. A
-            # restored decision or established address form has no new RAW
-            # evidence to justify another resolution on every resume/chunk.
-            if not self.known_source(source):
-                await self.resolve(source, self.terms.get(source))
-        self.progress(
-            "Dictionary resolution", current_term=None, resolved_candidates=len(self.missed)
+        self.local("alignment", "Logical lines/blank blocks paired locally; zero AI requests")
+        self.local(
+            "chunk_construction", "Monotonic paragraph groups chunked locally; zero AI requests"
         )
-        sanity(self.terms)
-        self.store.write("working-dictionary.json", export_dictionary(self.terms))
-        # Replay missed terms from a crash after a chunk checkpoint but before resolution.
-        known_misses = self.store.read("missed-terms.json", {})
-        self.missed = known_misses
-        for round_number in range(4):
-            before = digest(export_dictionary(self.terms))
-            await self.parallel(self.pairs, self.chapter)
-            self.store.write("missed-terms.json", self.missed)
-            self.progress("Final batch validation", reconciliation_round=round_number + 1)
-            await self.parallel(self.pairs, self.final_validation)
-            for source in sorted(self.missed):
-                if not self.known_source(source):
-                    await self.resolve(source)
-            sanity(self.terms)
-            self.store.write("working-dictionary.json", export_dictionary(self.terms))
-            if digest(export_dictionary(self.terms)) == before:
-                break
-            # Changed chapter dictionaries invalidate just affected chapters/chunks;
-            # source-aware full validation rechecks all occurrences under one dictionary.
+        frozen = self.store.read("frozen-dictionary.json")
+        if frozen and frozen["input_hash"] == self.input_hash:
+            self.freeze(frozen["dictionary"])
+            if self.frozen_hash != frozen["dictionary_hash"]:
+                raise QualityError("Frozen dictionary hash mismatch")
         else:
-            raise QualityError(
-                "Missed terminology did not stabilize after four passes; resume required"
-            )
-        self.progress("Saving outputs")
+            await self.prepare_dictionary(inputs)
+        self.assert_frozen()
+        await self.parallel(self.pairs, self.chapter)
+        self.assert_frozen()
+        self.progress("Local final batch validation")
         chapters = []
         for raw, _ in self.pairs:
             saved = self.store.read(f"chapters/{raw.key}.json")
+            if saved["dictionary_hash"] != self.frozen_hash:
+                raise QualityError(f"Chapter {raw.key} does not use the frozen batch dictionary")
             chapters.append(
                 {
                     **chapter_identity(raw),
                     "title": saved["translation"]["title"],
-                    "text": "\n\n".join(s["text"] for s in saved["translation"]["segments"]),
+                    "text": "\n\n".join(
+                        segment["text"] for segment in saved["translation"]["segments"]
+                    ),
                 }
             )
         self.store.write("translated.json", {"chapters": chapters})
-        self.store.write("dictionary.json", export_dictionary(self.terms))
+        self.store.write(
+            "dictionary.json",
+            {**export_dictionary(self.terms), "dictionary_hash": self.frozen_hash},
+        )
         self.store.progress(
             "done",
             stage="Complete",
             completed_chapters=len(chapters),
             total_chapters=len(chapters),
             active_chapters={},
+            dictionary_frozen=True,
+            dictionary_hash=self.frozen_hash,
+            request_statistics=self.store.request_statistics(),
         )

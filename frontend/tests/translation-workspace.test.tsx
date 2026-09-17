@@ -145,3 +145,19 @@ test('model attempts, fallback reasons and final failure are visible in activity
   for (const text of ['Translation activity', 'role="log"', 'gemini-3.1-flash-lite', 'gemini-3.5-flash-lite', 'gemini-3.7-flash', 'Attempt 1/2', 'Key slot 1', 'RPM_LIMIT', 'Suspended for 60 seconds', 'Daily quota exhausted', 'Switching to fallback', 'HTTP 503 &lt;unsafe&gt;']) assert.ok(html.includes(text), text);
   assert.ok(html.indexOf('HTTP 503') < html.indexOf('Switching to fallback'), 'Newest event appears first');
 });
+
+test('frozen dictionary, request reasons and local zero-request statistics are visible', () => {
+  const api = load({ job: { job_id: 'test', status: 'running', dictionary_frozen: true, dictionary_hash: 'abcdef1234567890',
+    logs: [{ id: '1', status: 'running', operation: 'repair', reason: 'Concrete failed local validator findings: terminology' }],
+    request_statistics: { total_requests: 4, requests: { terminology_resolver: 1, semantic_dictionary_conflict: 0, translation: 2, repair: 1 },
+      logical_operations: { terminology_resolver: 1, semantic_dictionary_conflict: 0, translation: 1, repair: 1 },
+      local_ai_requests: { alignment: 0, scanning: 0, occurrence_aggregation: 0, evidence_selection: 0, structural_dictionary_audit: 0, chunk_construction: 0, normal_output_validation: 0 },
+      retry: 1, model_fallback: 1, cache_hits: 2,
+    },
+  } });
+  const html = renderToStaticMarkup(React.createElement(api.TranslationWorkspace));
+  for (const text of ['Dictionary frozen for this batch · abcdef123456', 'Request statistics · 4 API requests', 'Logical calls', 'API attempts', 'terminology resolver', 'semantic dictionary conflict', 'Concrete failed local validator findings: terminology', 'Retries: 1', 'Model fallbacks: 1', 'Cached AI results reused: 2']) assert.ok(html.includes(text), text);
+  for (const operation of ['alignment', 'scanning', 'occurrence aggregation', 'evidence selection', 'structural dictionary audit', 'chunk construction', 'normal output validation']) {
+    assert.ok(html.includes(`${operation} (local)</td><td>0</td><td>0</td>`), operation);
+  }
+});

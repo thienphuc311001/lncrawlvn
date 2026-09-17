@@ -151,9 +151,11 @@ permit merging different chapters that share a number, dropping prose between du
 headings, or assuming arbitrary introductory text is a TOC. Ambiguous headings, conflicting
 duplicates, and repeats after meaningful prose are rejected instead of silently losing text.
 
-After structural pairing, Gemini confirms semantic paragraph alignment; an unconfirmed or
-incomplete alignment stops the job before translation. Paragraph IDs, never character
-offsets, connect RAW, VietPhrase, translated text, and repairs.
+After structural pairing, logical lines and blank block boundaries are aligned locally.
+Editor visual wrapping is irrelevant. Limited split/merge recovery requires matching
+punctuation anchors inside corresponding blocks; ambiguous structure stops for manual
+review without calling Gemini. Paragraph IDs, never character offsets, connect RAW,
+VietPhrase, translated text, and repairs.
 
 Only these fixed models are configured, in this order:
 
@@ -161,15 +163,15 @@ Only these fixed models are configured, in this order:
 2. `gemini-3.5-flash-lite`
 3. `gemini-3.7-flash`
 
-Every AI operation starts with the primary model. The central scheduler allows two
-requests by default, spaces starts by at least 300 ms, uses a 120-second attempt timeout,
-and permits two attempts per model for transient network/provider failures. It respects
-Retry-After (including HTTP dates) and Gemini's RetryInfo, using a shared cooldown.
-An explicit daily quota exhaustion skips another attempt on that key and tries the
-remaining configured keys on the same model before the fixed fallback order. Authentication, missing
-model/invalid request errors fail explicitly; there is no model discovery or substitution.
-The configured IDs must be available to your AI Studio account. Credentials are never
-returned to the browser or written to checkpoints.
+Every AI operation prefers the primary model on a ready key. The central scheduler
+allows two requests by default, spaces starts by at least 300 ms, uses a 120-second
+attempt timeout, and permits two attempts per pair for temporary provider failures.
+Daily quota disables only that model/key for the process run. RPM/TPM cooldown lasts
+60 seconds for that pair while available pairs continue; if all usable pairs are
+cooling down, only the earliest recovery must be awaited. Authentication/configuration
+errors disable the affected key. The configured IDs must be available to your AI Studio
+account; there is no model discovery or substitution. Credentials are never returned
+to the browser or written to checkpoints.
 
 The translation workspace shows a live **Translation activity** log with task names,
 model attempts, queued/running/success/failed states, retry waits, fallback switches,
@@ -179,32 +181,43 @@ in the job's `events.jsonl`; request diagnostics remain in `requests.jsonl`, and
 prints those request events. If all three models fail, the error reports each model's
 failure in the configured order, rather than showing only the last backup error.
 
-The workflow aligns chapters, scans semantic chunks across the whole batch, aggregates
-all occurrences of each candidate, resolves terminology, and audits the dictionary before
-translation. Large occurrence sets use hierarchical evidence summaries. New mappings
-are locked only with strong evidence, otherwise provisional; inherited states are preserved.
-Ordinary vocabulary, grammar fragments, invalid source keys, malformed mappings, alias
-collisions and cross-section conflicts are rejected or quarantined internally. Only one
-canonical dictionary namespace is exported; statistics are computed after cleaning.
-Resolver decisions must separately confirm a complete semantic unit, a named or
-novel-specific entity, a need for consistent wording, and supporting RAW evidence.
-Quantity phrases such as “two to three squads” cannot become organization names without
-RAW evidence establishing a fixed name. Character address forms attach to their canonical
-person; merging forms preserves existing locked mappings. Invalid resolver metadata gets
-at most two corrections using the same RAW evidence before stopping for review.
+The mandatory global dictionary phase scans the **entire input batch locally** before
+any translation. It indexes every occurrence of each candidate, analyzes VietPhrase
+readings, reuses valid inherited source/alias/form mappings, and samples compact RAW
+and VP evidence without AI summaries. Very consistent, verified full-name readings
+can become local provisional entries; identity, gender, titles and alias relationships
+are never inferred from frequency alone. Other candidates are resolved in dynamic
+context-size batches with independent source-tagged decisions. Invalid independent
+results receive at most two targeted corrections without discarding valid decisions.
 
-Each chapter receives a relevant dictionary and a whole-chapter context analysis. Chunks
-follow safe semantic paragraph boundaries, normally around 4,000–6,000 RAW characters;
-short chapters can stay whole. A tightly connected block can exceed this soft target.
-Chunks within a chapter run sequentially, with only the previous two finalized paragraphs
-as continuity context. RAW-aware validators check each chunk and full chapter. Repairs
-can change only reported paragraph IDs (or the title), with two repair attempts before
-stopping for review. Missed terms are resolved using batch-wide occurrences; affected
-completed chapters are revalidated and repaired under the updated dictionary. Final
-reconciliation requires dictionary stability before publishing outputs. Quality failures
-do not trigger model escalation or silent acceptance.
-Canonical wording is also checked against the Chinese source in each paragraph, with
-longer names and specific address forms taking precedence over shorter overlapping names.
+Schema, Unicode, source eligibility, duplicate sources, translations, aliases/forms,
+namespace collisions and RAW presence are audited locally. Malformed inherited records
+are quarantined; identical source duplicates are merged while preserving locked state.
+Only concrete unresolved semantic conflicts use the batched resolver. Valid cumulative
+entries absent from this batch are retained and explicitly marked in the internal audit.
+The final dictionary is frozen with a stable hash **before the first translation**.
+All chapters/chunks use this same hash. New important unresolved terminology reported
+later stops explicitly with a frozen-conflicts report: review and submit an updated
+inherited dictionary as a new batch, preserving the existing finalized work.
+
+Chunks are built locally at paragraph boundaries, normally around 4,000–6,000 RAW
+characters. Translation uses only the current RAW/VP window, local chapter metadata,
+relevant frozen dictionary entries and the previous two finalized paragraphs (bounded
+in size). There is no separate AI chapter analysis. Output checks run locally for
+coverage, IDs/order, emptiness, Chinese residue, frozen wording, Unicode, title shape,
+length anomalies, literal placeholders and suspicious duplicated paragraphs. A successful
+translation causes zero AI review/repair requests. Only actual findings invoke targeted
+repair for exact failed IDs, preserving unaffected text, with at most two repair attempts.
+These deterministic checks detect concrete defects; they do not prove full semantic
+equivalence or replace human editorial review of subtle narrative meaning.
+
+**Request statistics** show logical operations and physical API attempts separately for
+terminology resolution, semantic dictionary conflicts, translation and repair. Retry,
+model fallback and cache reuse counts are also visible. Alignment, scanning, occurrence
+aggregation, evidence selection, structural audit, chunking and normal validation explicitly
+report zero API calls. Every Gemini activity event includes its operation and reason.
+See [the architecture and verification report](docs/translation-pipeline.md) for the
+previous-operation inventory, exact pipeline order, measurements and behavioral tests.
 
 A completed batch exposes exactly two downloads: **translated.json** and **dictionary.json**.
 `translated.json` contains a `chapters` array of records with `number`, `title`, and `text`.

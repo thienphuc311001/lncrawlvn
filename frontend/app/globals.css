@@ -660,3 +660,7 @@ html { scroll-behavior: smooth; }
 .translation-log-status-failed { color: #dc2626; }
 .translation-log-status-success, .translation-log-status-done { color: #228b36; }
 .translation-log-status-running, .translation-log-status-retrying, .translation-log-status-fallback, .translation-log-status-key_rotation { color: #a16207; }
+.translation-statistics { margin-top: 20px; }
+.translation-statistics summary { cursor: pointer; }
+.translation-statistics table { width: 100%; margin-top: 12px; border-collapse: collapse; }
+.translation-statistics th, .translation-statistics td { text-align: left; padding: 8px; border-bottom: 1px solid var(--border); }
