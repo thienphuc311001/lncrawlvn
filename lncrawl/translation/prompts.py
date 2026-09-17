@@ -13,6 +13,8 @@ ALIGN = (
 neighboring order, names, dialogue, punctuation). Align numbered RAW and VP paragraphs
 into monotonic adjacent groups (one-to-many or many-to-one allowed). Cover every ID
 exactly once, in order, no distant arbitrary matches. Never use character offsets.
+Use the explicit paragraph id fields supplied in both inputs. Arrays must enumerate
+every ID, never range endpoints: [0,1,2,3] means four paragraphs, [0,3] means only two.
 Set confirmed=false if content does not correspond. safe_break means a scene or paragraph
 boundary outside a dialogue block or connected speaker-cue/action/reaction sequence.
 """
@@ -49,6 +51,14 @@ attach to canonical entity; never invent Chinese keys from Vietnamese. If alias 
 to an existing entity return that canonical entity with merged aliases/forms. If uncertain
 identity do not merge. Absent current occurrences: vet inherited mapping conservatively;
 retain valid inherited terms, reject clearly invalid, REVIEW suspicious ones. Explain reason.
+Evaluate each eligibility boolean independently before deciding. A complete noun is
+not automatically named or novel-specific. Ordinary clothing (e.g. 中山装), furniture
+(e.g. 停尸柜), body parts and everyday props are NOT novel-specific artifacts merely
+because a character uses them; REJECT them unless RAW establishes a distinctive named
+or supernatural item. A formal title/address or named technique can qualify when its
+consistent wording matters to the book. ACCEPT requires all eligibility checks true;
+REVIEW requires a complete named/novel-specific unit whose consistency matters, with
+uncertain evidence. Never save generic vocabulary as a cumulative Book Dictionary.
 """
 )
 CONTEXT = (
@@ -66,6 +76,9 @@ title and exactly one segment per RAW paragraph ID, in source order. PREVIOUS CO
 is CONTEXT ONLY: do not translate again or include it in output. No artificial separators.
 Every meaningful RAW statement needs a counterpart; every translated statement needs
 RAW support. Follow relevant dictionary forms tied to corresponding source occurrences.
+Use each canonical translation verbatim (capitalization may follow sentence grammar).
+Do not paraphrase or substitute synonyms for dictionary entries. For a forms key use
+that key's mapped address form; prefer the longest matching Chinese source name.
 """
 )
 VALIDATE = (
@@ -77,6 +90,11 @@ Check chapter/chunk boundaries and continuity; do not judge only fluency. Report
 issues using source paragraph segment_id (-1 for title). Terminology checks MUST be
 source-aware, never blind Vietnamese global replacement. List missed important Chinese
 terms with exact RAW evidence. Return empty arrays only when these checks pass.
+Check every explicit dictionary source/alias/form occurrence in RAW against its mapped
+Vietnamese wording in the corresponding segment, using the longest overlapping source
+name. A fluent synonym is still a terminology error. Respect mapped address forms.
+Validate ONLY translation.title and translation.segments as the produced Vietnamese.
+Context and reference text are not translation output and must not be reported as errors.
 """
 )
 REPAIR = (

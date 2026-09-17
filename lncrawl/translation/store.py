@@ -3,7 +3,9 @@
 import hashlib
 import json
 import os
+import sqlite3
 import uuid
+from contextlib import contextmanager
 from pathlib import Path
 
 from .models import MODELS, PIPELINE_VERSION
@@ -55,3 +57,32 @@ class Store:
     def diagnostic(self, metadata):
         with (self.path / "requests.jsonl").open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(metadata, ensure_ascii=False) + "\n")
+
+    @contextmanager
+    def execution(self):
+        """Cross-process ownership; SQLite releases the lease even after a crash."""
+        connection = sqlite3.connect(self.path / "execution.sqlite3", timeout=0)
+        try:
+            try:
+                connection.execute("BEGIN IMMEDIATE")
+            except sqlite3.OperationalError as exc:
+                if "locked" in str(exc):
+                    raise AlreadyRunning("This translation batch is already running") from exc
+                raise
+            yield
+        finally:
+            connection.rollback()
+            connection.close()
+
+    def is_active(self):
+        if not (self.path / "execution.sqlite3").exists():
+            return False
+        try:
+            with self.execution():
+                return False
+        except AlreadyRunning:
+            return True
+
+
+class AlreadyRunning(RuntimeError):
+    pass

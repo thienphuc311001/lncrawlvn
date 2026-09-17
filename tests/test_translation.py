@@ -10,16 +10,30 @@ from unittest.mock import AsyncMock, patch
 import httpx
 
 from lncrawl.translation import prompts
-from lncrawl.translation.dictionary import export_dictionary, load_legacy, sanity
-from lncrawl.translation.models import MODELS, Alignment, Context, Inputs, Term
+from lncrawl.translation.dictionary import (
+    export_dictionary,
+    load_legacy,
+    quantity_source_problem,
+    sanity,
+    source_name,
+    terminology_gaps,
+)
+from lncrawl.translation.models import MODELS, Alignment, Context, Inputs, Term, Validation
 from lncrawl.translation.parsing import (
     make_chunks,
     pair_chapters,
     parse_chapters,
     validate_alignment,
+    validate_inputs,
 )
 from lncrawl.translation.pipeline import Pipeline, QualityError
-from lncrawl.translation.scheduler import ProviderError, Scheduler, retry_delay
+from lncrawl.translation.scheduler import (
+    ProviderError,
+    Scheduler,
+    response_daily_quota,
+    response_retry_delay,
+    retry_delay,
+)
 from lncrawl.translation.store import Store
 
 
@@ -59,6 +73,39 @@ class ParsingTests(unittest.TestCase):
 
 
 class DictionaryTests(unittest.TestCase):
+    def test_quantity_phrase_requires_explicit_fixed_name_evidence(self):
+        name = "2-3队特勤部小队"
+        self.assertIsNotNone(quantity_source_problem(name, ["任意调动" + name + "的特权"]))
+        self.assertIsNone(quantity_source_problem(name, ["番号为" + name]))
+        self.assertIsNone(quantity_source_problem("3个愿望", ["《3个愿望》是一本书。"]))
+        self.assertIsNone(quantity_source_problem("108种增进感情的方式"))
+
+    def test_outer_source_markers_do_not_change_named_identity(self):
+        self.assertEqual(source_name("【怨念纠缠】"), "怨念纠缠")
+        self.assertEqual(source_name("《美丽新世界》"), "美丽新世界")
+        self.assertEqual(source_name("【不完整"), "【不完整")
+        self.assertEqual(source_name("祖石（残）"), "祖石（残）")
+
+    def test_source_aware_mapping_checks_longest_names_and_address_forms(self):
+        terms = [
+            {"source": "探查署", "translation": "Cục Thám tra"},
+            {"source": "新界市探查署", "translation": "Thám tra thự thành phố Tân Giới"},
+            {"source": "邱途", "translation": "Khâu Đồ", "forms": {"邱长官": "Trưởng quan Khâu"}},
+        ]
+        self.assertEqual(
+            terminology_gaps(
+                terms,
+                "新界市探查署。邱长官。",
+                "Thám tra thự thành phố Tân Giới. trưởng quan  Khâu.",
+            ),
+            [],
+        )
+        self.assertEqual(
+            terminology_gaps(terms, "新界市探查署。", "Cục Thám tra thành phố Tân Giới."),
+            [("新界市探查署", "Thám tra thự thành phố Tân Giới")],
+        )
+        self.assertEqual(terminology_gaps(terms, "他走了。", "Anh đi rồi."), [])
+
     def test_legacy_cleanup_and_status(self):
         terms, problems = load_legacy(
             {
@@ -100,6 +147,23 @@ class DictionaryTests(unittest.TestCase):
 
 
 class SchedulerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_daily_model_allowance_moves_to_configured_fallback_without_short_retry(self):
+        seen, records = [], []
+
+        async def transport(model, body):
+            seen.append((model, body))
+            if model == MODELS[0]:
+                raise ProviderError("daily allowance", True, retry_after=59, daily_quota=True)
+            return {"context": "ok"}
+
+        result = await Scheduler(transport=transport, spacing=0).request(
+            "test", {"chapter": 46}, Context, records.append
+        )
+        self.assertEqual(result.context, "ok")
+        self.assertEqual([model for model, _ in seen], [MODELS[0], MODELS[1]])
+        self.assertEqual(seen[0][1], seen[1][1])
+        self.assertTrue(records[0]["daily_quota"])
+
     async def test_fallback_order_same_task(self):
         seen, records = [], []
 
@@ -209,6 +273,43 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
     def test_retry_after(self):
         self.assertEqual(retry_delay("12"), 12)
         self.assertEqual(retry_delay("garbage"), 0)
+        response = httpx.Response(
+            429,
+            headers={"Retry-After": "7"},
+            json={
+                "error": {
+                    "details": [
+                        {
+                            "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                            "retryDelay": "42.125s",
+                        }
+                    ]
+                }
+            },
+        )
+        self.assertEqual(response_retry_delay(response), 42.125)
+        self.assertEqual(
+            response_retry_delay(
+                httpx.Response(429, json={"error": None}, headers={"Retry-After": "2"})
+            ),
+            2,
+        )
+        daily = httpx.Response(
+            429,
+            json={
+                "error": {
+                    "details": [
+                        {
+                            "violations": [
+                                {"quotaId": "GenerateRequestsPerDayPerProjectPerModel-FreeTier"}
+                            ]
+                        }
+                    ]
+                }
+            },
+        )
+        self.assertTrue(response_daily_quota(daily))
+        self.assertFalse(response_daily_quota(response))
 
 
 class FakeGemini:
@@ -246,7 +347,17 @@ class FakeGemini:
                 "forms": {},
                 "evidence": "祖石",
             }
-            return {"decision": "ACCEPT", "term": term, "reason": "Explicit evidence"}
+            return {
+                "decision": "ACCEPT",
+                "eligibility": {
+                    "complete_semantic_unit": True,
+                    "named_or_novel_specific": True,
+                    "consistency_matters": True,
+                    "evidence_supports": True,
+                },
+                "term": term,
+                "reason": "Explicit evidence",
+            }
         if instruction == prompts.CONTEXT:
             return {"context": "No unsupported facts."}
         if instruction == prompts.TRANSLATE:
@@ -280,6 +391,333 @@ class FakeGemini:
 
 
 class PipelineTests(unittest.IsolatedAsyncioTestCase):
+    async def test_absent_inherited_numeric_book_title_is_retained(self):
+        with tempfile.TemporaryDirectory() as root:
+            dictionary = {
+                "entries": [
+                    {
+                        "source": "3个愿望",
+                        "translation": "Ba Điều Ước",
+                        "type": "artifact",
+                        "status": "locked",
+                        "evidence": "Previously identified book title.",
+                    }
+                ]
+            }
+            store = self.store(root, dictionary=dictionary)
+            await Pipeline(store, Scheduler(transport=FakeGemini(), spacing=0)).run()
+            self.assertEqual(store.read("dictionary.json")["entries"][0]["source"], "3个愿望")
+
+    async def test_generic_locked_role_is_not_folded_into_one_person(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = Store(
+                Path(root),
+                Inputs(
+                    raw="第1章\n署长阎嗔是男人。",
+                    vietphrase="Chương 1\nThự trưởng Diêm Chân là đàn ông.",
+                ).model_dump(),
+            )
+            fake = FakeGemini()
+            count = 0
+            feedback = []
+
+            async def transport(model, body):
+                nonlocal count
+                result = await fake(model, body)
+                if body["systemInstruction"]["parts"][0]["text"] == prompts.RESOLVE:
+                    count += 1
+                    data = json.loads(body["contents"][0]["parts"][0]["text"])
+                    result["term"].update(
+                        source="阎嗔", translation="Diêm Chân", type="character", gender="male"
+                    )
+                    if count == 1:
+                        result["term"].update(aliases=["署长"], forms={"署长": "Thự trưởng"})
+                    else:
+                        feedback.append(data)
+                return result
+
+            pipeline = Pipeline(store, Scheduler(transport=transport, spacing=0))
+            pipeline.pairs = validate_inputs(
+                store.read("inputs.json")["raw"], store.read("inputs.json")["vietphrase"]
+            )
+            await pipeline.align(pipeline.pairs[0])
+            role = Term(source="署长", translation="Thự trưởng", type="title", status="locked")
+            pipeline.terms = {role.source: role}
+            await pipeline.resolve("阎嗔")
+            self.assertEqual(count, 2)
+            self.assertIn("established type", feedback[0]["structural_error"])
+            self.assertEqual(pipeline.terms["署长"].model_dump(), role.model_dump())
+            self.assertEqual(set(pipeline.terms), {"署长", "阎嗔"})
+
+    async def test_person_alias_metadata_receives_targeted_canonical_actor_correction(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = Store(
+                Path(root),
+                Inputs(
+                    raw="第1章\n唐副署长就是唐菲菲。",
+                    vietphrase="Chương 1\nPhó thự trưởng Đường là Đường Phỉ Phỉ.",
+                ).model_dump(),
+            )
+            fake = FakeGemini()
+            count = 0
+            feedback = []
+
+            async def transport(model, body):
+                nonlocal count
+                result = await fake(model, body)
+                if body["systemInstruction"]["parts"][0]["text"] == prompts.RESOLVE:
+                    count += 1
+                    data = json.loads(body["contents"][0]["parts"][0]["text"])
+                    if count == 1:
+                        result["term"].update(
+                            source="唐副署长",
+                            translation="Phó thự trưởng Đường",
+                            type="character_alias",
+                            gender="female",
+                            aliases=["唐菲菲"],
+                        )
+                    else:
+                        feedback.append(data)
+                        result["term"].update(
+                            source="唐菲菲",
+                            translation="Đường Phỉ Phỉ",
+                            type="character",
+                            gender="female",
+                            aliases=["唐副署长"],
+                            forms={"唐副署长": "Phó thự trưởng Đường"},
+                        )
+                        if count == 2:
+                            result["term"]["forms"] = {"title": "Phó thự trưởng Đường"}
+                return result
+
+            pipeline = Pipeline(store, Scheduler(transport=transport, spacing=0))
+            pipeline.pairs = validate_inputs(
+                store.read("inputs.json")["raw"], store.read("inputs.json")["vietphrase"]
+            )
+            await pipeline.align(pipeline.pairs[0])
+            await pipeline.resolve("唐副署长")
+            self.assertEqual(count, 3)
+            self.assertIn("Character alias", feedback[0]["structural_error"])
+            self.assertIn("Chinese-keyed address form", feedback[1]["structural_error"])
+            self.assertEqual(list(pipeline.terms), ["唐菲菲"])
+            self.assertEqual(pipeline.terms["唐菲菲"].gender, "female")
+            self.assertEqual(pipeline.terms["唐菲菲"].forms["唐副署长"], "Phó thự trưởng Đường")
+            self.assertTrue(all(model == MODELS[0] for _, _, model in fake.calls))
+
+    async def test_established_address_form_is_not_rediscovered_as_missed_term(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.store(root)
+            fake = FakeGemini()
+            pipeline = Pipeline(store, Scheduler(transport=fake, spacing=0))
+            pipeline.terms = {
+                "叶将军": Term(
+                    source="叶将军",
+                    translation="Tướng quân Diệp",
+                    type="character",
+                    status="locked",
+                    forms={"叶上校": "Đại tá Diệp"},
+                )
+            }
+            validation = Validation.model_validate(
+                {"issues": [], "missed_terms": [{"source": "叶上校", "evidence": "叶上校"}]}
+            )
+            pipeline.remember_missed(validation, "叶上校")
+            self.assertEqual(pipeline.missed, {})
+            pipeline.missed = {"叶上校": "叶上校"}
+            await pipeline.resolve_missed()
+            self.assertEqual(fake.calls, [])
+
+    async def test_title_alias_merge_preserves_locked_historical_rank_form(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = Store(
+                Path(root),
+                Inputs(
+                    raw="第1章\n叶上校升为叶将军。",
+                    vietphrase="Chương 1\nĐại tá Diệp thăng thành Tướng quân Diệp.",
+                ).model_dump(),
+            )
+            fake = FakeGemini()
+            pipeline = Pipeline(store, Scheduler(transport=fake, spacing=0))
+            pipeline.pairs = [
+                (
+                    parse_chapters(store.read("inputs.json")["raw"])[0],
+                    parse_chapters(store.read("inputs.json")["vietphrase"], "VIETPHRASE")[0],
+                )
+            ]
+            await pipeline.align(pipeline.pairs[0])
+            pipeline.terms = {
+                "叶上校": Term(
+                    source="叶上校",
+                    translation="Đại tá Diệp",
+                    type="character",
+                    status="locked",
+                    gender="male",
+                )
+            }
+
+            async def transport(model, body):
+                result = await fake(model, body)
+                if body["systemInstruction"]["parts"][0]["text"] == prompts.RESOLVE:
+                    result["term"].update(
+                        source="叶将军",
+                        translation="Tướng quân Diệp",
+                        type="character",
+                        gender="male",
+                        aliases=["叶上校"],
+                        forms={"叶上校": "Diệp thượng tá"},
+                    )
+                return result
+
+            pipeline.scheduler = Scheduler(transport=transport, spacing=0)
+            await pipeline.resolve("叶将军")
+            self.assertEqual(list(pipeline.terms), ["叶将军"])
+            self.assertEqual(pipeline.terms["叶将军"].forms["叶上校"], "Đại tá Diệp")
+            self.assertEqual(
+                terminology_gaps([pipeline.terms["叶将军"].model_dump()], "叶上校", "Đại tá Diệp"),
+                [],
+            )
+            sanity(pipeline.terms)
+
+    async def test_ordinary_prop_is_rejected_when_provider_accepts_failed_eligibility(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = Store(
+                Path(root),
+                Inputs(
+                    raw="第1章\n停尸柜开了。", vietphrase="Chương 1\nTủ thi thể mở."
+                ).model_dump(),
+            )
+            fake = FakeGemini()
+
+            async def transport(model, body):
+                instruction = body["systemInstruction"]["parts"][0]["text"]
+                if instruction == prompts.DISCOVER:
+                    return {"candidates": [{"source": "停尸柜", "evidence": "停尸柜开了。"}]}
+                result = await fake(model, body)
+                if instruction == prompts.RESOLVE:
+                    result["eligibility"]["named_or_novel_specific"] = False
+                return result
+
+            await Pipeline(store, Scheduler(transport=transport, spacing=0)).run()
+            self.assertEqual(store.read("dictionary.json")["entries"], [])
+            self.assertEqual(store.read("working-dictionary.json")["statistics"]["total_terms"], 0)
+
+    async def test_discovery_normalizes_system_markers_without_modifying_raw(self):
+        with tempfile.TemporaryDirectory() as root:
+            inputs = Inputs(
+                raw="第1章\n【祖石】发光。", vietphrase="Chương 1\n【Tổ Thạch】 phát sáng."
+            ).model_dump()
+            store = Store(Path(root), inputs)
+            fake = FakeGemini()
+
+            async def transport(model, body):
+                if body["systemInstruction"]["parts"][0]["text"] == prompts.DISCOVER:
+                    return {"candidates": [{"source": "【祖石】", "evidence": "【祖石】发光。"}]}
+                return await fake(model, body)
+
+            await Pipeline(store, Scheduler(transport=transport, spacing=0)).run()
+            self.assertEqual(store.read("dictionary.json")["entries"][0]["source"], "祖石")
+            self.assertEqual(store.read("inputs.json"), inputs)
+            self.assertIn("祖石", store.read("candidates/1.json"))
+
+    async def test_dictionary_synonym_is_repaired_even_when_ai_validator_accepts_it(self):
+        with tempfile.TemporaryDirectory() as root:
+            dictionary = {
+                "entries": [
+                    {
+                        "source": "祖石",
+                        "translation": "Tổ Thạch",
+                        "type": "artifact",
+                        "status": "locked",
+                    }
+                ]
+            }
+            store = self.store(root, dictionary=dictionary)
+            fake = FakeGemini()
+
+            async def transport(model, body):
+                result = await fake(model, body)
+                if body["systemInstruction"]["parts"][0]["text"] == prompts.TRANSLATE:
+                    result["segments"][0]["text"] = "Viên đá tổ tiên phát sáng."
+                return result
+
+            await Pipeline(store, Scheduler(transport=transport, spacing=0)).run()
+            repairs = [data for instruction, data, _ in fake.calls if instruction == prompts.REPAIR]
+            self.assertEqual(len(repairs), 1)
+            self.assertEqual(repairs[0]["affected_ids"], [0])
+            self.assertEqual(repairs[0]["issues"][0]["kind"], "terminology")
+            self.assertIn("Tổ Thạch", store.read("translated.json")["chapters"][0]["text"])
+            self.assertTrue(all(model == MODELS[0] for _, _, model in fake.calls))
+            self.assertTrue(
+                all(
+                    "vp" not in data
+                    for instruction, data, _ in fake.calls
+                    if instruction == prompts.VALIDATE
+                )
+            )
+
+    async def test_second_targeted_repair_does_not_reuse_failed_noop(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.store(root)
+            fake = FakeGemini()
+            fake.bad_translation = True
+            repairs = []
+
+            async def transport(model, body):
+                result = await fake(model, body)
+                if body["systemInstruction"]["parts"][0]["text"] == prompts.REPAIR:
+                    data = json.loads(body["contents"][0]["parts"][0]["text"])
+                    repairs.append(data)
+                    if len(repairs) == 1:
+                        result = {
+                            "segments": [{"id": i, "text": "bad"} for i in data["affected_ids"]]
+                        }
+                return result
+
+            await Pipeline(store, Scheduler(transport=transport, spacing=0)).run()
+            self.assertEqual([data["repair_attempt"] for data in repairs], [1, 2])
+            self.assertIn("previous repair", repairs[1]["repair_feedback"])
+
+    async def test_alignment_endpoint_ranges_are_repaired_on_primary(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.store(root)
+            fake = FakeGemini()
+            count = 0
+
+            async def transport(model, body):
+                nonlocal count
+                if body["systemInstruction"]["parts"][0]["text"] == prompts.ALIGN:
+                    count += 1
+                    if count == 1:
+                        return {
+                            "confirmed": True,
+                            "groups": [{"raw": [1], "vp": [1], "safe_break": True}],
+                        }
+                return await fake(model, body)
+
+            await Pipeline(store, Scheduler(transport=transport, spacing=0)).run()
+            self.assertEqual(count, 2)
+            self.assertIsNotNone(store.read("alignment-rejections/1-0.json"))
+            self.assertTrue(all(call[2] == MODELS[0] for call in fake.calls))
+
+    async def test_vietnamese_source_alias_metadata_is_quarantined(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.store(root)
+            fake = FakeGemini()
+            fake.missed = True
+
+            async def transport(model, body):
+                result = await fake(model, body)
+                if body["systemInstruction"]["parts"][0]["text"] == prompts.RESOLVE:
+                    result["term"]["aliases"] = ["Tổ Thạch", "无证据"]
+                    result["term"]["forms"] = {"Tổ Thạch": "Tổ Thạch"}
+                return result
+
+            await Pipeline(store, Scheduler(transport=transport, spacing=0)).run()
+            term = store.read("dictionary.json")["entries"][0]
+            self.assertEqual(term["aliases"], [])
+            self.assertEqual(term["forms"], {})
+            self.assertEqual(term["source"], "祖石")
+
     def store(self, root, long=False, dictionary=None):
         paragraph = "祖石发光。" * (850 if long else 1)
         return Store(

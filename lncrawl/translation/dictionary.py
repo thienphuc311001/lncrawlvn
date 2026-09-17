@@ -1,15 +1,38 @@
 """One canonical namespace; legacy records are quarantined, never blindly trusted."""
 
 import re
+import unicodedata
 from collections import Counter
 
 from .models import Term
 from .parsing import HAN
 
 ORDINARY = set(
-    "不会 继续 或者 直接 刚才 只要 连忙 眼睛 比如 主动 只能 轻轻 小声 不好 抬头 故意 开口 不再 嘴里 低声 有没有 一边 世界".split()
+    "不会 继续 或者 直接 刚才 只要 连忙 眼睛 比如 主动 只能 轻轻 小声 不好 抬头 故意 开口 不再 嘴里 低声 有没有 一边 世界 中山装".split()
 )
 FRAGMENTS = ("也", "不", "没", "竟然", "缓缓", "有")
+
+
+def source_name(source):
+    """Outer book/system markers are typography, not part of a Chinese name."""
+    markers = {"【": "】", "《": "》", "「": "」", "『": "』", "“": "”"}
+    while len(source) > 2 and markers.get(source[0]) == source[-1]:
+        source = source[1:-1]
+    return source
+
+
+def quantity_source_problem(source, contexts=()):
+    if not re.match(r"^\d+(?:[-–~～]\d+)?(?:队|名|个|件|支|位|座|瓶|粒|箱|套|辆|艘|枚)", source):
+        return None
+    named = re.compile(
+        r"(?:名为|称为|命名为|代号为|番号为|名字是|名称是)[\s：:\"“‘「『]*" + re.escape(source)
+    )
+    for text in contexts:
+        if any(
+            left + source + right in text for left, right in (("《", "》"), ("【", "】"))
+        ) or named.search(text):
+            return None
+    return "quantity modifier is not a canonical entity name"
 
 
 def source_problem(source, known=()):
@@ -133,6 +156,36 @@ def relevant(terms, text):
         for t in terms.values()
         if any(key in text for key in [t.source, *t.aliases, *t.forms])
     ]
+
+
+def terminology_gaps(terms, raw, translated):
+    """Check mappings at RAW occurrences; never replace Vietnamese prose globally.
+
+    Longer source names take precedence over overlapping shorter entries. Address
+    forms use their own mappings, and capitalization/Unicode spacing are immaterial.
+    Semantic correctness and repeated occurrences remain the RAW-aware AI check.
+    """
+    mappings = {}
+    for term in terms:
+        for name in [term["source"], *term.get("aliases", []), *term.get("forms", {})]:
+            mappings[name] = term.get("forms", {}).get(name, term["translation"])
+    if not mappings:
+        return []
+
+    def normalized(text):
+        return " ".join(unicodedata.normalize("NFC", text).casefold().split())
+
+    pattern = re.compile(
+        "|".join(re.escape(name) for name in sorted(mappings, key=len, reverse=True))
+    )
+    target = normalized(translated)
+    return sorted(
+        {
+            (match.group(), mappings[match.group()])
+            for match in pattern.finditer(raw)
+            if normalized(mappings[match.group()]) not in target
+        }
+    )
 
 
 def export_dictionary(terms):

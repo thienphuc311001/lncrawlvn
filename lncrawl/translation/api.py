@@ -11,11 +11,11 @@ from fastapi.responses import FileResponse
 
 from ..context import APP_DIR
 from .dictionary import load_legacy
-from .models import MODELS, Inputs
-from .parsing import pair_chapters, parse_chapters
+from .models import MODELS, PARSER_VERSION, Inputs
+from .parsing import ChapterValidationError, validate_inputs
 from .pipeline import Pipeline
 from .scheduler import Scheduler
-from .store import Store
+from .store import AlreadyRunning, Store
 
 router = APIRouter(prefix="/api/translation", tags=["translation"])
 ROOT = APP_DIR / "translations"
@@ -41,29 +41,49 @@ def get_store(job_id):
 
 def snapshot(store):
     progress = store.read("progress.json", {"job_id": store.id, "status": "pending"})
-    if progress["status"] in ("running", "pending") and store.id not in _tasks:
+    if (
+        progress["status"] in ("running", "pending")
+        and store.id not in _tasks
+        and not store.is_active()
+    ):
         return {**progress, "status": "interrupted", "stage": "Ready to resume"}
     return progress
 
 
 async def run(store):
     try:
-        await Pipeline(store, scheduler()).run()
+        with store.execution():
+            await Pipeline(store, scheduler()).run()
+    except AlreadyRunning:
+        pass  # A CLI or another API process owns this batch; leave its progress intact.
     except asyncio.CancelledError:
         store.progress("cancelled", stage="Cancelled; completed checkpoints preserved")
+    except ChapterValidationError as exc:
+        store.progress(
+            "failed",
+            error=str(exc),
+            error_detail=exc.detail,
+            stage="Input validation failed; resubmit corrected files",
+        )
     except Exception as exc:
-        store.progress("failed", error=str(exc), stage="Stopped; resume available")
+        store.progress(
+            "failed", error=str(exc), error_detail=None, stage="Stopped; resume available"
+        )
     finally:
         _tasks.pop(store.id, None)
 
 
 def start(store):
-    if store.id in _tasks or store.read("progress.json", {}).get("status") == "done":
+    if (
+        store.id in _tasks
+        or store.is_active()
+        or store.read("progress.json", {}).get("status") == "done"
+    ):
         return snapshot(store)
     if not os.getenv("GOOGLE_AI_API_KEY"):
         raise HTTPException(503, "Set GOOGLE_AI_API_KEY on the server before starting translation")
     scheduler()  # Validate configuration before accepting work.
-    store.progress("pending", stage="Queued", error=None)
+    store.progress("pending", stage="Queued", error=None, error_detail=None)
     _tasks[store.id] = asyncio.create_task(run(store))
     return snapshot(store)
 
@@ -81,11 +101,14 @@ async def config():
 @router.post("/jobs", status_code=202)
 async def create(inputs: Inputs):
     try:
-        pair_chapters(parse_chapters(inputs.raw), parse_chapters(inputs.vietphrase))
+        validate_inputs(inputs.raw, inputs.vietphrase)
         load_legacy(inputs.dictionary)
+    except ChapterValidationError as exc:
+        raise HTTPException(422, exc.detail)
     except (ValueError, TypeError) as exc:
         raise HTTPException(422, str(exc))
     store = Store(ROOT, inputs=inputs.model_dump())
+    store.write("parser-version.json", {"version": PARSER_VERSION})
     return start(store)
 
 
@@ -104,7 +127,22 @@ async def job(job_id: str):
 
 @router.post("/jobs/{job_id}/resume", status_code=202)
 async def resume(job_id: str):
-    return start(get_store(job_id))
+    store = get_store(job_id)
+    if store.read("progress.json", {}).get("status") == "done":
+        return snapshot(store)
+    if store.read("parser-version.json") != {"version": PARSER_VERSION}:
+        raise HTTPException(
+            409,
+            "This unfinished job uses a missing or outdated chapter parser version. "
+            "Resubmit the original RAW and VIETPHRASE files as a new job; "
+            "legacy checkpoints cannot be resumed safely.",
+        )
+    inputs = store.read("inputs.json")
+    try:
+        validate_inputs(inputs["raw"], inputs["vietphrase"])
+    except ChapterValidationError as exc:
+        raise HTTPException(422, exc.detail)
+    return start(store)
 
 
 @router.post("/jobs/{job_id}/cancel")
@@ -116,6 +154,8 @@ async def cancel(job_id: str):
         await asyncio.gather(task, return_exceptions=True)
         _tasks.pop(store.id, None)
         store.progress("cancelled", stage="Cancelled; completed checkpoints preserved")
+    elif store.is_active():
+        store.write("cancel-request.json", {"requested": True})
     return snapshot(store)
 
 

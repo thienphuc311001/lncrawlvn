@@ -5,7 +5,8 @@ from typing import Dict, List, Literal, Optional
 from pydantic import BaseModel, ConfigDict, Field
 
 MODELS = ("gemini-3.1-flash-lite", "gemini-3.5-flash-lite", "gemini-3.7-flash")
-PIPELINE_VERSION = 1
+PIPELINE_VERSION = 4
+PARSER_VERSION = 4
 
 
 class StrictModel(BaseModel):
@@ -22,6 +23,16 @@ class Chapter(StrictModel):
     number: int
     title: str
     paragraphs: List[str]
+    volume: Optional[int] = None
+    source_line: Optional[int] = Field(default=None, exclude=True)
+    input_label: Optional[str] = Field(default=None, exclude=True)
+    previous_number: Optional[int] = Field(default=None, exclude=True)
+    previous_line: Optional[int] = Field(default=None, exclude=True)
+    meaningful_text: Optional[str] = Field(default=None, exclude=True)
+
+    @property
+    def key(self) -> str:
+        return f"v{self.volume}-c{self.number}" if self.volume is not None else str(self.number)
 
 
 class AlignmentGroup(StrictModel):
@@ -71,8 +82,16 @@ class Term(StrictModel):
     evidence: str = ""
 
 
+class Eligibility(StrictModel):
+    complete_semantic_unit: bool
+    named_or_novel_specific: bool
+    consistency_matters: bool
+    evidence_supports: bool
+
+
 class Resolution(StrictModel):
     decision: Literal["ACCEPT", "REVIEW", "REJECT"]
+    eligibility: Eligibility
     term: Optional[Term] = None
     reason: str
 

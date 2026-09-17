@@ -24,6 +24,7 @@ dependencies = [
 
 [project.scripts]
 lncrawl-mini = "lncrawl.app:main"
+lncrawl-translate = "lncrawl.translation.__main__:main"
 
 [tool.setuptools]
 include-package-data = true

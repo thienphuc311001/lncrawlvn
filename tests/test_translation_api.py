@@ -30,6 +30,65 @@ class APITests(unittest.IsolatedAsyncioTestCase):
         self.root.stop()
         self.temp.cleanup()
 
+    async def test_structured_errors_and_duplicate_artifact_acceptance(self):
+        from lncrawl.translation.models import PARSER_VERSION
+
+        valid = {
+            "raw": "Chapter 1: 第1章 开始\n第1章 开始\n正文。",
+            "vietphrase": "Chương 1\nNội dung.",
+        }
+        with patch.object(api, "start", return_value={"status": "pending"}) as start:
+            response = await self.client.post("/api/translation/jobs", json=valid)
+            self.assertEqual(response.status_code, 202)
+            self.assertEqual(start.call_count, 1)
+            store = start.call_args.args[0]
+            self.assertEqual(store.read("parser-version.json"), {"version": PARSER_VERSION})
+            for field, label in (("raw", "RAW"), ("vietphrase", "VIETPHRASE")):
+                invalid = {**valid, field: "Chapter 3\n正文。\nChapter 2\n正文。"}
+                response = await self.client.post("/api/translation/jobs", json=invalid)
+                self.assertEqual(response.status_code, 422)
+                detail = response.json()["detail"]
+                self.assertEqual(detail["input"], label)
+                self.assertEqual(detail["line"], 3)
+                self.assertEqual(detail["previous_chapter"], 3)
+                self.assertEqual(detail["reason"], "backward_numbering_without_volume_boundary")
+            self.assertEqual(start.call_count, 1)
+            self.assertEqual(len(list(api.ROOT.iterdir())), 1)
+
+    async def test_actual_truncated_exporter_heading_accepted(self):
+        raw = (
+            "Chapter 62: 第62章 秦舒曼恢复身体(感谢“Kawabunga”\n"
+            + "-" * 60
+            + "\n\n第62章 秦舒曼恢复身体（感谢“KAWABUNGA”的10万赏）\n正文。"
+        )
+        inputs = {"raw": raw, "vietphrase": "Chương 62\nNội dung."}
+        with patch.object(api, "start", return_value={"status": "pending"}) as start:
+            response = await self.client.post("/api/translation/jobs", json=inputs)
+            self.assertEqual(response.status_code, 202, response.text)
+            start.assert_called_once()
+            inputs["raw"] = raw.replace("\n\n第62章", "\n真实正文\n第62章")
+            response = await self.client.post("/api/translation/jobs", json=inputs)
+            self.assertEqual(response.status_code, 422)
+            self.assertEqual(response.json()["detail"]["reason"], "duplicate_chapter")
+            start.assert_called_once()
+
+    async def test_legacy_resume_refused_but_completed_output_preserved(self):
+        store = Store(api.ROOT, {"raw": "第1章\n正文。", "vietphrase": "Chương 1\nVăn."})
+        store.progress("cancelled")
+        with patch.object(api, "start") as start:
+            response = await self.client.post(f"/api/translation/jobs/{store.id}/resume")
+            self.assertEqual(response.status_code, 409)
+            self.assertIn("Resubmit", response.json()["detail"])
+            start.assert_not_called()
+        store.write("translated.json", {"chapters": []})
+        store.progress("done")
+        response = await self.client.post(f"/api/translation/jobs/{store.id}/resume")
+        self.assertEqual(response.status_code, 202)
+        response = await self.client.get(
+            f"/api/translation/jobs/{store.id}/outputs/translated.json"
+        )
+        self.assertEqual(response.status_code, 200)
+
     async def test_config_exposes_only_fixed_models_and_no_key(self):
         with patch.dict(os.environ, {"GOOGLE_AI_API_KEY": "secret-test-key"}):
             response = await self.client.get("/api/translation/config")

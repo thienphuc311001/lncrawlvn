@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import time
 from email.utils import parsedate_to_datetime
 
@@ -15,10 +16,11 @@ from .models import MODELS
 
 
 class ProviderError(RuntimeError):
-    def __init__(self, message, retryable=False, retry_after=0):
+    def __init__(self, message, retryable=False, retry_after=0, daily_quota=False):
         super().__init__(message)
         self.retryable = retryable
         self.retry_after = retry_after
+        self.daily_quota = daily_quota
 
 
 def retry_delay(value):
@@ -29,6 +31,33 @@ def retry_delay(value):
             return max(0, parsedate_to_datetime(value).timestamp() - time.time())
         except (ValueError, TypeError, OverflowError):
             return 0
+
+
+def response_retry_delay(response):
+    delay = retry_delay(response.headers.get("Retry-After"))
+    try:
+        error = response.json().get("error", {})
+        for detail in error.get("details", []):
+            if detail.get("@type") == "type.googleapis.com/google.rpc.RetryInfo":
+                duration = re.fullmatch(r"(\d+(?:\.\d+)?)s", detail.get("retryDelay", ""))
+                if duration:
+                    delay = max(delay, float(duration[1]))
+    except (ValueError, AttributeError, TypeError):
+        pass
+    return delay
+
+
+def response_daily_quota(response):
+    if response.status_code != 429:
+        return False
+    try:
+        for detail in response.json().get("error", {}).get("details", []):
+            for violation in detail.get("violations", []):
+                if "perday" in violation.get("quotaId", "").casefold():
+                    return True
+    except (ValueError, AttributeError, TypeError):
+        pass
+    return False
 
 
 class Scheduler:
@@ -87,10 +116,17 @@ class Scheduler:
                         "retry_count": attempts - 1,
                         "status": "failed",
                         "error": str(error),
+                        "retry_after": error.retry_after,
+                        "daily_quota": error.daily_quota,
                     }
                 )
                 if not error.retryable:
                     raise error
+                # Gemini may suggest a minute's delay even for an exhausted
+                # per-model DAILY allowance. Do not retry that unavailable
+                # allowance; the configured next model has its own quota.
+                if error.daily_quota:
+                    break
                 # Shared cooldown also prevents other workers bursting into a quota failure.
                 delay = max(error.retry_after, 1.0 * 2**attempt)
                 async with self.gate:
@@ -109,10 +145,13 @@ class Scheduler:
             )
         if response.status_code != 200:
             code = response.status_code
+            daily_quota = response_daily_quota(response)
             raise ProviderError(
-                f"Gemini HTTP {code} for configured model {model}",
+                f"Gemini HTTP {code} for configured model {model}"
+                + (" (daily quota exhausted)" if daily_quota else ""),
                 code in (408, 429) or code >= 500,
-                retry_delay(response.headers.get("Retry-After")),
+                response_retry_delay(response),
+                daily_quota=daily_quota,
             )
         try:
             data = response.json()
