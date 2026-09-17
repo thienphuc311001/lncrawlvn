@@ -30,6 +30,7 @@ from lncrawl.translation.pipeline import Pipeline, QualityError
 from lncrawl.translation.scheduler import (
     ProviderError,
     Scheduler,
+    api_keys,
     response_daily_quota,
     response_retry_delay,
     retry_delay,
@@ -147,6 +148,115 @@ class DictionaryTests(unittest.TestCase):
 
 
 class SchedulerTests(unittest.IsolatedAsyncioTestCase):
+    def test_server_keys_order_and_deduplication(self):
+        with patch.dict(
+            os.environ,
+            {
+                "GOOGLE_AI_API_KEY": " primary ",
+                "GOOGLE_AI_API_KEY_BACKUP": "backup",
+                "GOOGLE_AI_API_KEYS": "backup, third, primary, ,fourth",
+            },
+            clear=True,
+        ):
+            self.assertEqual(api_keys(), ["primary", "backup", "third", "fourth"])
+
+    async def test_quota_rotates_key_before_model_and_never_logs_credentials(self):
+        original_client = httpx.AsyncClient
+        for daily, fallback in ((False, False), (True, False), (True, True)):
+            seen, records = [], []
+
+            def handle(request):
+                model = request.url.path.split("/")[-1].split(":")[0]
+                key = request.headers["x-goog-api-key"]
+                seen.append((model, key))
+                if key == "private-primary" or (fallback and model == MODELS[0]):
+                    return httpx.Response(
+                        429,
+                        json={
+                            "error": {
+                                "details": [
+                                    {
+                                        "violations": [
+                                            {
+                                                "quotaId": "GenerateRequestsPerDayPerProjectPerModel"
+                                                if daily
+                                                else "GenerateRequestsPerMinutePerProjectPerModel"
+                                            }
+                                        ]
+                                    }
+                                ]
+                            }
+                        },
+                    )
+                return httpx.Response(
+                    200,
+                    json={
+                        "candidates": [
+                            {
+                                "finishReason": "STOP",
+                                "content": {"parts": [{"text": '{"context":"ok"}'}]},
+                            }
+                        ]
+                    },
+                )
+
+            def client_factory(**kwargs):
+                return original_client(transport=httpx.MockTransport(handle), **kwargs)
+
+            with (
+                patch.dict(
+                    os.environ,
+                    {
+                        "GOOGLE_AI_API_KEY": "private-primary",
+                        "GOOGLE_AI_API_KEY_BACKUP": "private-backup",
+                    },
+                    clear=True,
+                ),
+                patch(
+                    "lncrawl.translation.scheduler.httpx.AsyncClient", side_effect=client_factory
+                ),
+                patch("lncrawl.translation.scheduler.asyncio.sleep", new=AsyncMock()),
+            ):
+                result = await Scheduler(spacing=0).request(
+                    "test", {"chapter": 1}, Context, records.append
+                )
+            expected = [(MODELS[0], "private-primary"), (MODELS[0], "private-backup")]
+            if fallback:
+                expected.extend([(MODELS[1], "private-primary"), (MODELS[1], "private-backup")])
+            self.assertEqual(seen, expected)
+            self.assertEqual(result.context, "ok")
+            self.assertTrue(any(record["status"] == "key_rotation" for record in records))
+            self.assertEqual(records[-1]["key_slot"], 2)
+            self.assertNotIn("private-primary", json.dumps(records))
+            self.assertNotIn("private-backup", json.dumps(records))
+
+    async def test_auth_and_outage_do_not_rotate_keys(self):
+        original_client = httpx.AsyncClient
+        for status in (403, 503):
+            seen = []
+
+            def handle(request):
+                seen.append(request.headers["x-goog-api-key"])
+                return httpx.Response(status, json={})
+
+            def client_factory(**kwargs):
+                return original_client(transport=httpx.MockTransport(handle), **kwargs)
+
+            with (
+                patch.dict(
+                    os.environ,
+                    {"GOOGLE_AI_API_KEY": "primary", "GOOGLE_AI_API_KEY_BACKUP": "backup"},
+                    clear=True,
+                ),
+                patch(
+                    "lncrawl.translation.scheduler.httpx.AsyncClient", side_effect=client_factory
+                ),
+                patch("lncrawl.translation.scheduler.asyncio.sleep", new=AsyncMock()),
+            ):
+                with self.assertRaises(ProviderError):
+                    await Scheduler(spacing=0).request("test", {}, Context, lambda record: None)
+            self.assertEqual(seen, ["primary"] * (1 if status == 403 else 6))
+
     async def test_retry_waits_past_rounded_provider_quota_window(self):
         clock, starts = [0.0], []
 

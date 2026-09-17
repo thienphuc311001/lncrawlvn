@@ -659,4 +659,4 @@ html { scroll-behavior: smooth; }
 .translation-log-status { text-transform: uppercase; }
 .translation-log-status-failed { color: #dc2626; }
 .translation-log-status-success, .translation-log-status-done { color: #228b36; }
-.translation-log-status-running, .translation-log-status-retrying, .translation-log-status-fallback { color: #a16207; }
+.translation-log-status-running, .translation-log-status-retrying, .translation-log-status-fallback, .translation-log-status-key_rotation { color: #a16207; }

@@ -14,7 +14,7 @@ from .dictionary import load_legacy
 from .models import MODELS, PARSER_VERSION, Inputs
 from .parsing import ChapterValidationError, validate_inputs
 from .pipeline import Pipeline
-from .scheduler import Scheduler, model_failure_summary
+from .scheduler import Scheduler, api_keys, model_failure_summary
 from .store import AlreadyRunning, Store
 
 router = APIRouter(prefix="/api/translation", tags=["translation"])
@@ -101,7 +101,7 @@ def start(store):
         or store.read("progress.json", {}).get("status") == "done"
     ):
         return snapshot(store)
-    if not os.getenv("GOOGLE_AI_API_KEY"):
+    if not api_keys():
         raise HTTPException(503, "Set GOOGLE_AI_API_KEY on the server before starting translation")
     scheduler()  # Validate configuration before accepting work.
     store.progress("pending", stage="Queued", error=None, error_detail=None)
@@ -115,7 +115,8 @@ async def config():
         "models": dict(zip(("primary", "fallback", "backup"), MODELS)),
         "concurrency": scheduler().concurrency,
         "stagger_ms": 300,
-        "api_key_configured": bool(os.getenv("GOOGLE_AI_API_KEY")),
+        "api_key_configured": bool(api_keys()),
+        "api_key_count": len(api_keys()),
     }
 
 

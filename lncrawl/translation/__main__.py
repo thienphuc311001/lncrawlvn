@@ -13,7 +13,7 @@ from .dictionary import load_legacy
 from .models import PARSER_VERSION, Inputs
 from .parsing import parse_chapters, validate_inputs
 from .pipeline import Pipeline
-from .scheduler import Scheduler
+from .scheduler import Scheduler, api_keys
 from .store import Store
 
 
@@ -112,7 +112,7 @@ async def translate(arguments):
             raise ValueError("--first must be positive")
         raw = first_chapters(raw, arguments.first, "RAW")
         vp = first_chapters(vp, arguments.first, "VIETPHRASE")
-    if not os.getenv("GOOGLE_AI_API_KEY"):
+    if not api_keys():
         raise ValueError("Set GOOGLE_AI_API_KEY in the project-root .env file")
     inputs = Inputs(raw=raw, vietphrase=vp, dictionary=dictionary)
     store = ConsoleStore(APP_DIR / "translations", inputs=inputs.model_dump())

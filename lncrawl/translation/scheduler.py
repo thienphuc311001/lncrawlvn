@@ -16,11 +16,21 @@ from .models import MODELS
 
 
 class ProviderError(RuntimeError):
-    def __init__(self, message, retryable=False, retry_after=0, daily_quota=False):
+    def __init__(
+        self, message, retryable=False, retry_after=0, daily_quota=False, status_code=None
+    ):
         super().__init__(message)
         self.retryable = retryable
         self.retry_after = retry_after
         self.daily_quota = daily_quota
+        self.status_code = status_code
+
+
+def api_keys():
+    """Ordered, deduplicated server credentials; never include values in diagnostics."""
+    values = [os.getenv("GOOGLE_AI_API_KEY", ""), os.getenv("GOOGLE_AI_API_KEY_BACKUP", "")]
+    values.extend(os.getenv("GOOGLE_AI_API_KEYS", "").split(","))
+    return list(dict.fromkeys(value.strip() for value in values if value.strip()))
 
 
 def model_failure_summary(failures):
@@ -92,6 +102,8 @@ class Scheduler:
         }
         attempts = 0
         failures = {}
+        keys = api_keys() if not self.transport else []
+        keys = keys or [None]
         for model_index, model in enumerate(MODELS):
             if model_index:
                 record(
@@ -101,9 +113,15 @@ class Scheduler:
                         "message": f"{MODELS[model_index - 1]} unavailable; switching to {model}",
                     }
                 )
-            for attempt in range(2):
+            key_index, attempt = 0, 0
+            while key_index < len(keys):
                 attempts += 1
-                metadata = {"model": model, "retry_count": attempts - 1, "attempt": attempt + 1}
+                metadata = {
+                    "model": model,
+                    "retry_count": attempts - 1,
+                    "attempt": attempt + 1,
+                    "key_slot": key_index + 1,
+                }
                 record({**metadata, "status": "queued"})
                 try:
                     async with self.slots:
@@ -114,7 +132,7 @@ class Scheduler:
                         result = await asyncio.wait_for(
                             self.transport(model, body)
                             if self.transport
-                            else self._send(model, body),
+                            else self._send(model, body, keys[key_index]),
                             timeout=self.timeout,
                         )
                         try:
@@ -143,6 +161,17 @@ class Scheduler:
                 )
                 if not error.retryable:
                     raise error
+                if (error.status_code == 429 or error.daily_quota) and key_index + 1 < len(keys):
+                    record(
+                        {
+                            **metadata,
+                            "status": "key_rotation",
+                            "message": f"Quota exhausted on key slot {key_index + 1}; switching to key slot {key_index + 2} for the same model",
+                        }
+                    )
+                    key_index += 1
+                    attempt = 0
+                    continue
                 # Gemini may suggest a minute's delay even for an exhausted
                 # per-model DAILY allowance. Do not retry that unavailable
                 # allowance; the configured next model has its own quota.
@@ -164,10 +193,13 @@ class Scheduler:
                     )
                 async with self.gate:
                     self.next_start = max(self.next_start, time.monotonic() + delay)
+                attempt += 1
+                if attempt == 2:
+                    break
         raise ProviderError(model_failure_summary(failures), retryable=True) from error
 
-    async def _send(self, model, body):
-        key = os.environ.get("GOOGLE_AI_API_KEY", "")
+    async def _send(self, model, body, key=None):
+        key = key or next(iter(api_keys()), "")
         if not key:
             raise ProviderError("Set GOOGLE_AI_API_KEY on the server")
         async with httpx.AsyncClient(timeout=self.timeout) as client:
@@ -185,6 +217,7 @@ class Scheduler:
                 code in (408, 429) or code >= 500,
                 response_retry_delay(response),
                 daily_quota=daily_quota,
+                status_code=code,
             )
         try:
             data = response.json()

@@ -90,11 +90,20 @@ class APITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status_code, 200)
 
     async def test_config_exposes_only_fixed_models_and_no_key(self):
-        with patch.dict(os.environ, {"GOOGLE_AI_API_KEY": "secret-test-key"}):
+        with patch.dict(
+            os.environ,
+            {
+                "GOOGLE_AI_API_KEY": "secret-test-key",
+                "GOOGLE_AI_API_KEY_BACKUP": "secret-backup-key",
+                "GOOGLE_AI_API_KEYS": "",
+            },
+        ):
             response = await self.client.get("/api/translation/config")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(tuple(response.json()["models"].values()), api.MODELS)
         self.assertNotIn("secret-test-key", response.text)
+        self.assertNotIn("secret-backup-key", response.text)
+        self.assertEqual(response.json()["api_key_count"], 2)
 
     async def test_inputs_fail_before_provider_and_unknown_fields_rejected(self):
         response = await self.client.post(

@@ -100,11 +100,20 @@ Copy `.env.example` to `.env` if needed, then fill in your key:
 
 ```dotenv
 GOOGLE_AI_API_KEY=your Google AI Studio key
+GOOGLE_AI_API_KEY_BACKUP=your optional backup Google AI Studio key
+# More keys, if needed: GOOGLE_AI_API_KEYS=key3,key4
 TRANSLATION_WORKERS=2
 ```
 
 Restart the backend after editing `.env`. This file is ignored by Git; keep it in the
 project root, separate from the frontend directory. Workers are optional (1–3, default 2).
+
+On HTTP 429/quota exhaustion, the same task tries the next key on the **same model**
+before falling back to another model. Keys are deduplicated in this order: primary,
+backup, then the comma-separated additional keys. Logs show only key slot numbers.
+HTTP 503 uses bounded retries/model fallback; authentication errors stop immediately.
+Google applies quota per project, not per key, so keys from the same project share
+quota ([Google rate-limit documentation](https://ai.google.dev/gemini-api/docs/rate-limits)).
 
 Upload exactly these inputs:
 
@@ -151,8 +160,8 @@ Every AI operation starts with the primary model. The central scheduler allows t
 requests by default, spaces starts by at least 300 ms, uses a 120-second attempt timeout,
 and permits two attempts per model for transient network/provider failures. It respects
 Retry-After (including HTTP dates) and Gemini's RetryInfo, using a shared cooldown.
-An explicit per-model daily quota exhaustion skips another attempt on that model and
-continues through the fixed fallback order. Authentication, missing
+An explicit daily quota exhaustion skips another attempt on that key and tries the
+remaining configured keys on the same model before the fixed fallback order. Authentication, missing
 model/invalid request errors fail explicitly; there is no model discovery or substitution.
 The configured IDs must be available to your AI Studio account. Credentials are never
 returned to the browser or written to checkpoints.

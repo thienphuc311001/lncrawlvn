@@ -5,7 +5,7 @@ import { useEffect, useState, type ReactNode } from 'react';
 const API = 'http://127.0.0.1:8000/api/translation';
 type TranslationEvent = {
   id?: string; timestamp?: string; task?: string; model?: string; status: string;
-  attempt?: number; retry_after?: number; error?: string; message?: string;
+  attempt?: number; key_slot?: number; retry_after?: number; error?: string; message?: string;
 };
 type Job = {
   job_id: string; status: string; stage?: string; error?: string; error_detail?: unknown;
@@ -15,7 +15,7 @@ type Job = {
   active_chapters?: Record<string, { chunk: number; chunks: number }>;
   logs?: TranslationEvent[];
 };
-type Config = { models: Record<string, string>; concurrency: number; stagger_ms: number; api_key_configured: boolean };
+type Config = { models: Record<string, string>; concurrency: number; stagger_ms: number; api_key_configured: boolean; api_key_count?: number };
 
 const ERROR_LABELS: Record<string, string> = {
   error: 'Error', severity: 'Severity', input: 'Input', line: 'Line', heading: 'Heading',
@@ -61,6 +61,7 @@ function TranslationLog({ logs = [] }: { logs?: TranslationEvent[] }) {
           <strong className={`translation-log-status translation-log-status-${event.status}`}>{event.status}</strong>
           {event.task && <span>{event.task}</span>}
           {event.model && <span>{event.model}</span>}
+          {event.key_slot && <span>Key slot {event.key_slot}</span>}
           {event.attempt && <span>Attempt {event.attempt}/2</span>}
         </div>
         {(event.error || event.message) && <p>{event.error ?? event.message}</p>}
@@ -165,12 +166,13 @@ export default function TranslationWorkspace() {
       {busy ? 'Working…' : 'Translate batch'}
     </button>
     {config && <details className="translation-config"><summary>System Configuration</summary>
-      <p>Every uncached task starts with Primary. Temporary errors get up to two attempts per model; exhausted daily quota moves directly to the next model. Authentication and invalid request errors stop immediately.</p>
+      <p>Every uncached task starts with Primary. Quota errors try the next configured API key on the same model before model fallback. Temporary errors get up to two attempts per key; exhausted daily quota skips a retry. Authentication and invalid request errors stop immediately.</p>
       {Object.entries(config.models).map(([role, model]) => <label className="settings-field" key={role}>
         <span>{role[0].toUpperCase() + role.slice(1)} Model</span><input readOnly value={model} />
       </label>)}
     </details>}
     {config && <p className="muted">{config.concurrency} workers · {config.stagger_ms} ms staggering · Server API key {config.api_key_configured ? 'configured' : 'missing — set GOOGLE_AI_API_KEY on the server'}</p>}
+    {config?.api_key_configured && <p className="muted">{config.api_key_count ?? 1} API key(s) configured · Automatic rotation on quota errors · Key values stay on the server</p>}
     {jobs.length > 0 && <label className="settings-field"><span>Saved batches</span><select value={job?.job_id ?? ''} disabled={busy}
       onChange={e => { request(`/jobs/${e.target.value}`).then(data => setJob(data as Job)).catch(e => setError(errorDetail(e))); }}>
       {jobs.map(j => <option key={j.job_id} value={j.job_id}>{j.job_id.slice(0, 12)}</option>)}
