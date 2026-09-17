@@ -31,6 +31,8 @@ from .context import APP_DIR, ctx
 from .core import Novel
 from .exceptions import LNException
 from .library import LIBRARY
+from .translation.api import router as translation_router
+from .translation.api import shutdown as shutdown_translation
 
 logger = logging.getLogger(__name__)
 
@@ -243,6 +245,7 @@ async def lifespan(_app: FastAPI):
     yield
     from .services.scraper import ctx_scraper
 
+    await shutdown_translation()
     ctx_scraper.close()
 
 
@@ -252,6 +255,8 @@ app = FastAPI(
     version="0.2.0",
     lifespan=lifespan,
 )
+
+app.include_router(translation_router)
 
 app.add_middleware(
     CORSMiddleware,
@@ -397,7 +402,7 @@ def fetch_missing(book_id: str) -> Job:
 
 @app.get("/api/books/{book_id}/export")
 def export_book(book_id: str, format: str = Query("epub", pattern="^(epub|txt)$")):
-    """Export saved chapters as an EPUB or TXT wrapped in a ZIP download."""
+    """Export saved chapters as one EPUB/TXT per 100-chapter folder in a ZIP."""
     try:
         zip_path = LIBRARY.export_zip(book_id, format)
     except LNException as e:

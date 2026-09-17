@@ -5,7 +5,7 @@ Layout (under ``APP_DIR/library``)::
     <book_id>/book.json                      metadata + full chapter TOC
     <book_id>/cover.jpg                      optional downloaded cover
     <book_id>/chapters/0001-0100/ch_0001.json  one file per fetched chapter
-    <book_id>/exports/<title>.epub.zip       cached export bundles
+    <book_id>/exports/<title>.epub.zip       export ZIP, one file per 100-chapter folder
 
 Chapters are written to disk the moment their download finishes, so a crashed
 job, dead server, or flaky network never loses already-fetched content. A
@@ -44,10 +44,14 @@ class Library:
     def _book_dir(self, book_id: str) -> Path:
         return self.root / book_id
 
+    def _folder_bounds(self, chapter_id: int) -> Tuple[int, int]:
+        """First and last chapter id of the 100-chapter folder holding a chapter."""
+        start = ((chapter_id - 1) // CHAPTERS_PER_FOLDER) * CHAPTERS_PER_FOLDER + 1
+        return start, start + CHAPTERS_PER_FOLDER - 1
+
     def chapter_rel_path(self, chapter_id: int) -> str:
         """Relative file path for a chapter, grouped 100 per numbered folder."""
-        start = ((chapter_id - 1) // CHAPTERS_PER_FOLDER) * CHAPTERS_PER_FOLDER + 1
-        end = start + CHAPTERS_PER_FOLDER - 1
+        start, end = self._folder_bounds(chapter_id)
         return f"chapters/{start:04d}-{end:04d}/ch_{chapter_id:04d}.json"
 
     def _chapter_path(self, book_id: str, chapter_id: int) -> Path:
@@ -262,31 +266,58 @@ class Library:
             raise LNException("No chapters saved yet — fetch the book first")
         return novel, chapters
 
+    def _group_saved_by_folder(
+        self, chapters: List[Chapter]
+    ) -> List[Tuple[int, int, List[Chapter]]]:
+        """Split saved chapters into the same 100-chapter folders used on disk.
+
+        Returns ``(start, end, chapters_in_folder)`` tuples in folder order,
+        skipping any folder without a saved chapter.
+        """
+        groups: List[Tuple[int, int, List[Chapter]]] = []
+        for chapter in chapters:
+            if not chapter.success:
+                continue
+            start, end = self._folder_bounds(chapter.id)
+            if not groups or groups[-1][0] != start:
+                groups.append((start, end, []))
+            groups[-1][2].append(chapter)
+        return groups
+
     def export_zip(self, book_id: str, fmt: str = "epub") -> Path:
-        """Build an EPUB/TXT from saved chapters and bundle it into a ZIP."""
+        """Build one EPUB/TXT per 100-chapter folder and bundle them into a ZIP.
+
+        Mirrors the on-disk/library folder ranges (``<title>_0001-0100.epub``,
+        ``<title>_0101-0200.epub``, …), one file per folder containing only that
+        folder's saved chapters.
+        """
         if fmt not in ("epub", "txt"):
             raise LNException(f"Unsupported export format: {fmt}")
         novel, chapters = self._load_novel_and_chapters(book_id)
+        groups = self._group_saved_by_folder(chapters)
 
         exports_dir = self._book_dir(book_id) / "exports"
         exports_dir.mkdir(parents=True, exist_ok=True)
         stem = safe_filename(novel.title or "") or book_id
 
-        if fmt == "epub":
-            cover_file = self._book_dir(book_id) / "cover.jpg"
-            target = make_epub(
-                novel,
-                chapters,
-                exports_dir / f"{stem}.epub",
-                cover_file if cover_file.is_file() else None,
-            )
-        else:
-            target = make_text(novel, chapters, exports_dir / f"{stem}.txt")
+        cover = self._book_dir(book_id) / "cover.jpg"
+        cover = cover if cover.is_file() else None
 
-        zip_path = target.with_suffix(target.suffix + ".zip")
+        targets: List[Path] = []
+        for start, end, folder_chapters in groups:
+            label = f"{start:04d}-{end:04d}"
+            out = exports_dir / f"{stem}_{label}.{fmt}"
+            if fmt == "epub":
+                make_epub(novel, folder_chapters, out, cover)
+            else:
+                make_text(novel, folder_chapters, out)
+            targets.append(out)
+
+        zip_path = exports_dir / f"{stem}.{fmt}.zip"
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            zf.write(target, arcname=target.name)
-        logger.info("Export bundle: %s", zip_path)
+            for target in targets:
+                zf.write(target, arcname=target.name)
+        logger.info("Export bundle (%d files): %s", len(targets), zip_path)
         return zip_path
 
 

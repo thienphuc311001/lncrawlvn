@@ -11,6 +11,12 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+from dotenv import load_dotenv
+
+# Load server configuration from the project root, regardless of the launch directory.
+# Deployment environment variables take precedence over values in this file.
+load_dotenv(Path(__file__).resolve().parent.parent / ".env", override=False)
+
 logger = logging.getLogger("lncrawl")
 
 APP_DIR = Path(os.getenv("LNCRAWL_DATA_PATH") or Path.home() / ".lncrawl-mini").absolute()

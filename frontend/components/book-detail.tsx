@@ -36,7 +36,7 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
   const { trackJob } = useJobRunner();
   const [book, setBook] = useState<Book | null>(null);
   const [error, setError] = useState('');
-  const [openFolders, setOpenFolders] = useState<Set<number>>(() => new Set([1]));
+  const [openFolders, setOpenFolders] = useState<Set<number>>(() => new Set());
   const [reader, setReader] = useState<ReaderState>({ loading: false, chapter: null, error: '' });
   const [fetching, setFetching] = useState(false);
   const [exportError, setExportError] = useState('');
@@ -215,9 +215,11 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
     return (
       <section className="section">
         <div className="container">
-          <button type="button" className="btn btn-ghost" onClick={onBack}>
-            ← Back to library
-          </button>
+          <div className="book-detail-back">
+            <button type="button" className="btn btn-ghost" onClick={onBack}>
+              ← Back to library
+            </button>
+          </div>
           <p className="muted error-text">✗ {error}</p>
         </div>
       </section>
@@ -240,9 +242,11 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
   return (
     <section className="section">
       <div className="container">
-        <button type="button" className="btn btn-ghost" onClick={onBack}>
-          ← Back to library
-        </button>
+        <div className="book-detail-back">
+          <button type="button" className="btn btn-ghost" onClick={onBack}>
+            ← Back to library
+          </button>
+        </div>
 
         <div className="book-detail-head">
           <div className="book-cover large">
