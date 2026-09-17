@@ -128,7 +128,10 @@ class Scheduler:
                 if error.daily_quota:
                     break
                 # Shared cooldown also prevents other workers bursting into a quota failure.
-                delay = max(error.retry_after, 1.0 * 2**attempt)
+                # RetryInfo can round the remaining window down to whole seconds.
+                # A small margin avoids retrying before the quota actually resets.
+                provider_delay = error.retry_after + 1 if error.retry_after > 0 else 0
+                delay = max(provider_delay, 1.0 * 2**attempt)
                 async with self.gate:
                     self.next_start = max(self.next_start, time.monotonic() + delay)
         raise error

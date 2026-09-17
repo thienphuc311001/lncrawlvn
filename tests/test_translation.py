@@ -147,6 +147,29 @@ class DictionaryTests(unittest.TestCase):
 
 
 class SchedulerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_retry_waits_past_rounded_provider_quota_window(self):
+        clock, starts = [0.0], []
+
+        async def sleep(delay):
+            clock[0] += delay
+
+        async def transport(model, body):
+            starts.append((model, clock[0]))
+            if len(starts) == 1:
+                raise ProviderError("minute quota", True, retry_after=7)
+            return {"context": "ok"}
+
+        with (
+            patch("lncrawl.translation.scheduler.asyncio.sleep", side_effect=sleep),
+            patch("lncrawl.translation.scheduler.time.monotonic", side_effect=lambda: clock[0]),
+        ):
+            result = await Scheduler(transport=transport).request(
+                "test", {}, Context, lambda metadata: None
+            )
+        self.assertEqual(result.context, "ok")
+        self.assertEqual([model for model, _ in starts], [MODELS[0], MODELS[0]])
+        self.assertGreaterEqual(starts[1][1] - starts[0][1], 8)
+
     async def test_daily_model_allowance_moves_to_configured_fallback_without_short_retry(self):
         seen, records = [], []
 
