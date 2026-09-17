@@ -28,10 +28,12 @@ from lncrawl.translation.parsing import (
 )
 from lncrawl.translation.pipeline import Pipeline, QualityError
 from lncrawl.translation.scheduler import (
+    ErrorCategory,
     ProviderError,
     Scheduler,
     api_keys,
     response_daily_quota,
+    response_error_category,
     response_retry_delay,
     retry_delay,
 )
@@ -154,11 +156,91 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
             {
                 "GOOGLE_AI_API_KEY": " primary ",
                 "GOOGLE_AI_API_KEY_BACKUP": "backup",
-                "GOOGLE_AI_API_KEYS": "backup, third, primary, ,fourth",
+                "GOOGLE_AI_API_KEY_THIRD": "third",
+                "GOOGLE_AI_API_KEYS": "backup, fourth, primary, ,fifth",
             },
             clear=True,
         ):
-            self.assertEqual(api_keys(), ["primary", "backup", "third", "fourth"])
+            self.assertEqual(api_keys(), ["primary", "backup", "third", "fourth", "fifth"])
+
+    def test_provider_error_categories_distinguish_daily_rpm_tpm_and_429_unknown(self):
+        def response(quota_id):
+            return httpx.Response(
+                429, json={"error": {"details": [{"violations": [{"quotaId": quota_id}]}]}}
+            )
+
+        self.assertEqual(
+            response_error_category(response("GenerateRequestsPerDayPerProject")),
+            ErrorCategory.DAILY_QUOTA_EXHAUSTED,
+        )
+        self.assertEqual(
+            response_error_category(response("GenerateRequestsPerMinutePerProject")),
+            ErrorCategory.RPM_LIMIT,
+        )
+        self.assertEqual(
+            response_error_category(response("GenerateTokensPerMinutePerProject")),
+            ErrorCategory.TPM_LIMIT,
+        )
+        self.assertEqual(
+            response_error_category(httpx.Response(429, json={"error": {}})),
+            ErrorCategory.UNKNOWN_ERROR,
+        )
+        self.assertEqual(
+            response_error_category(httpx.Response(503)), ErrorCategory.TEMPORARY_PROVIDER_ERROR
+        )
+        self.assertEqual(
+            response_error_category(httpx.Response(403)), ErrorCategory.AUTHENTICATION_ERROR
+        )
+
+    async def test_daily_pair_is_never_retried_during_current_scheduler_run(self):
+        records, calls = [], []
+
+        async def transport(model, body):
+            calls.append(model)
+            if len(calls) == 1:
+                raise ProviderError("daily", daily_quota=True)
+            return {"context": "ok"}
+
+        scheduler = Scheduler(transport=transport, keys=["one", "two", "three"], spacing=0)
+        await scheduler.request("one", {}, Context, records.append)
+        scheduler.cursor = 0
+        await scheduler.request("two", {}, Context, records.append)
+        successes = [event["key_slot"] for event in records if event["status"] == "success"]
+        self.assertEqual(successes, [2, 2])
+        self.assertIn((MODELS[0], 0), scheduler.daily_exhausted)
+
+    async def test_rpm_cooldown_rotates_immediately_and_reenables_after_60_seconds(self):
+        records, clock, calls = [], [0.0], []
+
+        async def transport(model, body):
+            calls.append(model)
+            if len(calls) == 1:
+                raise ProviderError("rpm", True, category=ErrorCategory.RPM_LIMIT)
+            return {"context": "ok"}
+
+        async def sleep(delay):
+            clock[0] += delay
+
+        with (
+            patch("lncrawl.translation.scheduler.time.monotonic", side_effect=lambda: clock[0]),
+            patch("lncrawl.translation.scheduler.asyncio.sleep", side_effect=sleep),
+        ):
+            scheduler = Scheduler(transport=transport, keys=["one", "two", "three"], spacing=0)
+            await scheduler.request("one", {}, Context, records.append)
+            scheduler.cursor = 0
+            await scheduler.request("two", {}, Context, records.append)
+            clock[0] += 60
+            scheduler.cursor = 0
+            await scheduler.request("three", {}, Context, records.append)
+        self.assertEqual(
+            [event["key_slot"] for event in records if event["status"] == "success"], [2, 2, 1]
+        )
+        self.assertTrue(
+            any(
+                event["status"] == "rate_limit_cooldown" and event["retry_after"] == 60
+                for event in records
+            )
+        )
 
     async def test_quota_rotates_key_before_model_and_never_logs_credentials(self):
         original_client = httpx.AsyncClient
@@ -225,7 +307,12 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
                 expected.extend([(MODELS[1], "private-primary"), (MODELS[1], "private-backup")])
             self.assertEqual(seen, expected)
             self.assertEqual(result.context, "ok")
-            self.assertTrue(any(record["status"] == "key_rotation" for record in records))
+            self.assertTrue(
+                any(
+                    record["status"] in ("daily_quota_disabled", "rate_limit_cooldown")
+                    for record in records
+                )
+            )
             self.assertEqual(records[-1]["key_slot"], 2)
             self.assertNotIn("private-primary", json.dumps(records))
             self.assertNotIn("private-backup", json.dumps(records))
@@ -255,7 +342,25 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
             ):
                 with self.assertRaises(ProviderError):
                     await Scheduler(spacing=0).request("test", {}, Context, lambda record: None)
-            self.assertEqual(seen, ["primary"] * (1 if status == 403 else 6))
+            self.assertEqual(
+                seen,
+                ["primary", "backup"]
+                if status == 403
+                else [
+                    "primary",
+                    "primary",
+                    "backup",
+                    "backup",
+                    "primary",
+                    "primary",
+                    "backup",
+                    "backup",
+                    "primary",
+                    "primary",
+                    "backup",
+                    "backup",
+                ],
+            )
 
     async def test_retry_waits_past_rounded_provider_quota_window(self):
         clock, starts = [0.0], []
@@ -316,14 +421,11 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
                 )
         self.assertEqual(seen, [MODELS[0], MODELS[1], MODELS[2], MODELS[2]])
         message = str(caught.exception)
-        self.assertIn("All configured Gemini models failed", message)
+        self.assertIn("No usable Gemini model/API-key combination remains", message)
         self.assertLess(message.index(MODELS[0]), message.index(MODELS[1]))
         self.assertLess(message.index(MODELS[1]), message.index(MODELS[2]))
         self.assertIn("daily quota exhausted", message)
         self.assertIn("HTTP 503", message)
-        self.assertEqual(
-            [r["model"] for r in records if r["status"] == "fallback"], list(MODELS[1:])
-        )
         self.assertEqual([r["model"] for r in records if r["status"] == "retrying"], [MODELS[2]])
 
     async def test_primary_success_never_calls_fallback(self):

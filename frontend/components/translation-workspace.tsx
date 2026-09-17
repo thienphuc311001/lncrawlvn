@@ -5,7 +5,7 @@ import { useEffect, useState, type ReactNode } from 'react';
 const API = 'http://127.0.0.1:8000/api/translation';
 type TranslationEvent = {
   id?: string; timestamp?: string; task?: string; model?: string; status: string;
-  attempt?: number; key_slot?: number; retry_after?: number; error?: string; message?: string;
+  attempt?: number; key_slot?: number; retry_after?: number; category?: string; error?: string; message?: string;
 };
 type Job = {
   job_id: string; status: string; stage?: string; error?: string; error_detail?: unknown;
@@ -62,6 +62,7 @@ function TranslationLog({ logs = [] }: { logs?: TranslationEvent[] }) {
           {event.task && <span>{event.task}</span>}
           {event.model && <span>{event.model}</span>}
           {event.key_slot && <span>Key slot {event.key_slot}</span>}
+          {event.category && <span>{event.category}</span>}
           {event.attempt && <span>Attempt {event.attempt}/2</span>}
         </div>
         {(event.error || event.message) && <p>{event.error ?? event.message}</p>}

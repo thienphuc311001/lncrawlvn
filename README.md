@@ -101,6 +101,7 @@ Copy `.env.example` to `.env` if needed, then fill in your key:
 ```dotenv
 GOOGLE_AI_API_KEY=your Google AI Studio key
 GOOGLE_AI_API_KEY_BACKUP=your optional backup Google AI Studio key
+GOOGLE_AI_API_KEY_THIRD=your optional third Google AI Studio key
 # More keys, if needed: GOOGLE_AI_API_KEYS=key3,key4
 TRANSLATION_WORKERS=2
 ```
@@ -108,10 +109,14 @@ TRANSLATION_WORKERS=2
 Restart the backend after editing `.env`. This file is ignored by Git; keep it in the
 project root, separate from the frontend directory. Workers are optional (1–3, default 2).
 
-On HTTP 429/quota exhaustion, the same task tries the next key on the **same model**
-before falling back to another model. Keys are deduplicated in this order: primary,
-backup, then the comma-separated additional keys. Logs show only key slot numbers.
-HTTP 503 uses bounded retries/model fallback; authentication errors stop immediately.
+The scheduler rotates fairly across every model/key pair. A daily quota error disables
+only that pair for the current process run. RPM and TPM quota errors suspend only that
+pair for 60 seconds while work continues on ready pairs. A 429 without a recognized
+quota dimension is logged as `UNKNOWN_ERROR`, never assumed to be a daily limit. Keys
+are deduplicated in this order: primary, backup, third, then the comma-separated
+additional keys. Logs show only key slot numbers. HTTP 503 uses bounded retries before
+the pair is skipped for that operation; authentication/configuration errors disable the
+affected key for the current run.
 Google applies quota per project, not per key, so keys from the same project share
 quota ([Google rate-limit documentation](https://ai.google.dev/gemini-api/docs/rate-limits)).
 

@@ -139,9 +139,9 @@ test('model attempts, fallback reasons and final failure are visible in activity
     { id: '2', status: 'failed', model: 'gemini-3.1-flash-lite', error: 'Daily quota exhausted' },
     { id: '3', status: 'fallback', model: 'gemini-3.5-flash-lite', message: 'Switching to fallback' },
     { id: '4', status: 'failed', model: 'gemini-3.7-flash', error: 'HTTP 503 <unsafe>' },
-    { id: '5', status: 'key_rotation', model: 'gemini-3.1-flash-lite', key_slot: 1, message: 'Switching to key slot 2 for the same model' },
+    { id: '5', status: 'rate_limit_cooldown', model: 'gemini-3.1-flash-lite', key_slot: 1, category: 'RPM_LIMIT', message: 'Suspended for 60 seconds' },
   ] } });
   const html = renderToStaticMarkup(React.createElement(api.TranslationWorkspace));
-  for (const text of ['Translation activity', 'role="log"', 'gemini-3.1-flash-lite', 'gemini-3.5-flash-lite', 'gemini-3.7-flash', 'Attempt 1/2', 'Key slot 1', 'Switching to key slot 2 for the same model', 'Daily quota exhausted', 'Switching to fallback', 'HTTP 503 &lt;unsafe&gt;']) assert.ok(html.includes(text), text);
+  for (const text of ['Translation activity', 'role="log"', 'gemini-3.1-flash-lite', 'gemini-3.5-flash-lite', 'gemini-3.7-flash', 'Attempt 1/2', 'Key slot 1', 'RPM_LIMIT', 'Suspended for 60 seconds', 'Daily quota exhausted', 'Switching to fallback', 'HTTP 503 &lt;unsafe&gt;']) assert.ok(html.includes(text), text);
   assert.ok(html.indexOf('HTTP 503') < html.indexOf('Switching to fallback'), 'Newest event appears first');
 });
