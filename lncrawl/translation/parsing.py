@@ -17,8 +17,13 @@ from .models import Alignment, AlignmentGroup, Chapter
 
 logger = logging.getLogger(__name__)
 NUMERAL = r"[零〇一二两三四五六七八九十百千万\d]+"
+# One canonical lexer for every supported heading form. VietPhrase.app renders a
+# RAW ``第101章 <title>`` heading as ``Thứ 101 chương <title>``, so that reversed
+# Vietnamese word order is a first-class heading here, not a separate search.
 HEADING = re.compile(
-    rf"^\s*(?:第\s*({NUMERAL})\s*[章回节]|(?:chapter|chương)\s+(\d+)\b)(.*)$",
+    rf"^\s*(?:第\s*({NUMERAL})\s*[章回节]"
+    rf"|(?:chapter|chương)\s+(\d+)\b"
+    rf"|thứ\s+(\d+)\s+chương\b)(.*)$",
     re.I,
 )
 VOLUME = re.compile(
@@ -52,6 +57,47 @@ def chapter_number(value):
     return total + section + number
 
 
+@dataclass(frozen=True)
+class ChapterHeading:
+    """One recognized chapter heading, normalized to its positive number.
+
+    This is the single canonical result every consumer (RAW scan, VietPhrase
+    scan, validator, alignment) uses. It never renumbers: ``number`` is exactly
+    the integer written in the source heading, so a file may begin at any
+    positive chapter such as 101 or 1201.
+    """
+
+    number: int
+    title: str
+    raw: str
+    family: str
+
+
+def parse_chapter_heading(text):
+    """Recognize ``第<N>章``, ``Chapter <N>``, ``Chương <N>`` or ``Thứ <N> chương``.
+
+    Returns ``None`` when the line is not a chapter heading. Arabic and
+    full-width digits, Chinese numerals and ``第 101 章`` whitespace are all
+    handled by the shared ``HEADING`` lexer and ``chapter_number``. ``N`` must be
+    a positive chapter number, so a file may begin at any chapter (the first
+    detected number is its starting chapter) and chapter 1 is never special. The
+    matched text is never rewritten or renumbered.
+    """
+    match = HEADING.match(text)
+    if not match:
+        return None
+    number = chapter_number(match[1] or match[2] or match[3])
+    if number < 1:
+        return None
+    if match[1]:
+        family = "han"
+    elif match[3] or text.lstrip().lower().startswith("chương"):
+        family = "vietnamese"
+    else:
+        family = "english"
+    return ChapterHeading(number=number, title=match[4], raw=text, family=family)
+
+
 def has_meaningful_body_content(text):
     """Short dialogue counts; whitespace and purely decorative punctuation do not.
 
@@ -72,7 +118,7 @@ class Candidate:
 
     @property
     def nested(self):
-        return HEADING.match(self.title.lstrip(" :：-—"))
+        return parse_chapter_heading(self.title.lstrip(" :：-—"))
 
 
 @dataclass
@@ -144,17 +190,11 @@ def _scan(text, label):
                 "Input contains invalid text; provide valid UTF-8 files",
                 line=line_number,
             )
-        match = HEADING.match(line)
+        heading = parse_chapter_heading(line)
         volume = VOLUME.match(line)
-        if match:
+        if heading:
             candidates[line_number] = Candidate(
-                line_number,
-                line,
-                chapter_number(match[1] or match[2]),
-                match[3],
-                "han"
-                if match[1]
-                else ("vietnamese" if line.lower().startswith("chương") else "english"),
+                line_number, heading.raw, heading.number, heading.title, heading.family
             )
         elif volume:
             candidates[line_number] = Candidate(
@@ -252,7 +292,7 @@ def _normalized_title(candidate):
     title = candidate.title.lstrip(" :：-—")
     nested = candidate.nested
     if nested:
-        title = nested[3]
+        title = nested.title
     return "".join(c.casefold() for c in title if c.isalnum())
 
 
@@ -314,13 +354,15 @@ def _exporter_duplicate(
     if nested_number != current_candidate.number or nested_number != candidate.number:
         return None
     # Normalize titles only after independently checking all three numbers.
-    nested = HEADING.match(wrapper[2])
+    nested = parse_chapter_heading(wrapper[2])
+    if nested is None:
+        return None
 
     def normalize(text):
         text = unicodedata.normalize("NFKC", text).casefold()
         return "".join(c for c in text if not c.isspace())
 
-    left, right = normalize(nested[3]), normalize(candidate.title)
+    left, right = normalize(nested.title), normalize(candidate.title)
     match_kind = "normalized_exact"
     if "".join(c for c in left if c.isalnum()) != "".join(c for c in right if c.isalnum()):
         # Real exporter artifact: title cut off INSIDE a parenthetical note.
@@ -367,10 +409,12 @@ def _vietphrase_exporter_duplicate(
 ):
     """Recognize the VietPhrase text binder's repeated title line.
 
-    Its wrapper is ``Chapter N: Thứ N chương <title>`` but the embedded title
-    begins with ``Thứ N chương`` and therefore is intentionally not a chapter
-    boundary. It must still be removed before semantic alignment: unlike RAW,
-    leaving it in the body creates a source paragraph with no counterpart.
+    VietPhrase.app renders the Chinese heading ``第N章 <title>`` as
+    ``Thứ N chương <title>``, so the embedded line is itself a recognized heading
+    form. In a legacy export it repeats the ``Chapter N: Thứ N chương <title>``
+    wrapper of the same chapter, so it is that exporter's duplicate rather than a
+    second chapter. It must still be removed before semantic alignment: unlike
+    RAW, leaving it in the body creates a source paragraph with no counterpart.
     """
     if meaningful or pending_volume_lines:
         return None
@@ -499,6 +543,37 @@ def parse_document(text, label):
             candidate = None
         if candidate and candidate.kind == "chapter":
             if current and candidate.number == current.number and volume == current.volume:
+                # VietPhrase.app renders the same chapter as ``Thứ N chương ...``,
+                # which is now a recognized heading form. A legacy export repeats
+                # it right after its ``Chapter N: Thứ N chương <title>`` wrapper:
+                # that repeat is the exporter's own duplicate of the same chapter,
+                # not a second boundary, and must stay out of prose for alignment.
+                vietphrase = _vietphrase_exporter_duplicate(
+                    document,
+                    candidate.text,
+                    candidate.line,
+                    current,
+                    current_candidate,
+                    meaningful,
+                    pending_volume_lines,
+                )
+                if vietphrase is not None:
+                    while current.paragraphs and not has_meaningful_body_content(
+                        current.paragraphs[-1]
+                    ):
+                        current.paragraphs.pop()
+                        current.paragraph_lines.pop()
+                    _record(
+                        document,
+                        label,
+                        "WARNING",
+                        "duplicate_embedded_vietphrase_title",
+                        candidate,
+                        current,
+                        meaningful_characters=0,
+                        **vietphrase,
+                    )
+                    continue
                 exporter = _exporter_duplicate(
                     document,
                     candidate,
@@ -625,11 +700,13 @@ def parse_document(text, label):
         elif has_meaningful_body_content(line):
             preamble.append((index, line))
     if not chapters:
+        # A whole-file absence has no offending line; leave ``line`` unset so the
+        # report renders it as unavailable instead of blaming line 1.
         _fail(
             label,
             "no_chapter_headings",
-            "Chapter headings required: 第1章, Chapter 1, or Chương 1",
-            line=1,
+            "No valid chapter heading found. Expected a heading such as "
+            "第101章, Chapter 101, Chương 101, or Thứ 101 chương.",
         )
     if pending_volume_lines:
         current.paragraphs.extend(pending_volume_lines)

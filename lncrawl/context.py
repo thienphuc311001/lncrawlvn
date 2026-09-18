@@ -80,6 +80,10 @@ class SimpleConfig:
     archive_max_age = 0.0
     impersonate = ""
     ignore_images = False
+    # VietPhrase-safe export chunking (``None`` = unset, so the environment
+    # variable stays visible to the binder; an explicit value always wins).
+    safe_block_target = None
+    safe_block_max = None
 
 
 class AppContext:

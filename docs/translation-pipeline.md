@@ -36,7 +36,9 @@ order, complete bodies and normalized line endings are retained. Chapters pair b
 structural identity, including volume where available; a missing chapter does not
 silently shift every later pair. Paragraph alignment is monotonic and deterministic,
 with only proven adjacent split/merge recovery. Ambiguous structures fail with a
-concrete input error.
+concrete input error. Current RAW TXT exports carry blank safe-block boundaries
+(≤3000 characters per block) that the parser already treats as block boundaries,
+so no alignment change was needed for them.
 
 ## Terminology
 

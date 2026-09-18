@@ -533,12 +533,37 @@ CONFIG_FIELDS = [
         help="auto | headed | headless — how the challenge solver runs.",
     ),
     ConfigField(key="ignore_images", type="bool", label="Ignore images", help="Skip image downloads during extraction."),
+    ConfigField(
+        key="safe_block_target",
+        type="int",
+        min=500,
+        max=3800,
+        label="VietPhrase block target (chars)",
+        help="Start looking for a clean paragraph/sentence boundary here. TXT exports split chapters into safe blocks for VietPhrase.app.",
+    ),
+    ConfigField(
+        key="safe_block_max",
+        type="int",
+        min=500,
+        max=3800,
+        label="VietPhrase block max (chars)",
+        help="Hard limit for one TXT block; a complete paragraph that would exceed it moves to the next block.",
+    ),
 ]
 
 
 @app.get("/api/config", response_model=List[ConfigField])
 def get_config() -> List[ConfigField]:
-    return [f.model_copy(update={"value": getattr(ctx.config, f.key, f.default)}) for f in CONFIG_FIELDS]
+    from .binder.vietphrase import SAFE_BLOCK_MAX, SAFE_BLOCK_TARGET
+
+    fallback = {"safe_block_target": SAFE_BLOCK_TARGET, "safe_block_max": SAFE_BLOCK_MAX}
+    fields = []
+    for f in CONFIG_FIELDS:
+        value = getattr(ctx.config, f.key, f.default)
+        if value is None and f.key in fallback:
+            value = fallback[f.key]
+        fields.append(f.model_copy(update={"value": value, "default": fallback.get(f.key, f.default)}))
+    return fields
 
 
 @app.post("/api/config")
@@ -570,8 +595,23 @@ def set_config(payload: Dict[str, Any]) -> Dict[str, Any]:
             continue
         setattr(ctx.config, key, value)
         updated[key] = value
+    if "safe_block_target" in updated or "safe_block_max" in updated:
+        from .binder.vietphrase import resolve_safe_block_limits
+
+        try:
+            target, maximum = resolve_safe_block_limits(
+                getattr(ctx.config, "safe_block_target", None),
+                getattr(ctx.config, "safe_block_max", None),
+            )
+        except Exception:
+            pass
+        else:
+            if getattr(ctx.config, "safe_block_target", None) != target:
+                ctx.config.safe_block_target = target
+                updated["safe_block_target"] = target
+                logger.warning("Clamped safe_block_target to safe_block_max (%d)", maximum)
     if updated:
-        _persist_settings(updated)
+        _persist_settings({**_load_settings(), **updated})
     if errors:
         raise HTTPException(status_code=422, detail=errors)
     return updated

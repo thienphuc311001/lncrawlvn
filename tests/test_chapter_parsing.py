@@ -7,6 +7,7 @@ from lncrawl.translation.parsing import (
     chapter_number,
     has_meaningful_body_content,
     pair_chapters,
+    parse_chapter_heading,
     parse_chapters,
     validate_inputs,
 )
@@ -92,10 +93,13 @@ class RobustParsingTests(unittest.TestCase):
         self.assertEqual(duplicate["original_text"], "Thứ 1 chương nguy cơ khứu giác")
         pair_chapters(parse_chapters(raw), chapters)
 
-    def test_vietphrase_title_mismatch_remains_prose(self):
+    def test_vietphrase_title_mismatch_is_a_reported_conflict(self):
+        # ``Thứ N chương`` is itself a recognized heading form, so an embedded
+        # title that disagrees with its wrapper is a conflicting duplicate of the
+        # same chapter, exactly like the RAW ``Chapter N: 第N章 ...`` mismatch.
+        # It must not be silently merged into the body of either chapter.
         text = "Chapter 1: thứ 1 chương tên cũ\n" + "-" * 60 + ("\nThứ 1 chương tên mới\nNội dung.")
-        chapter = parse_chapters(text, "VIETPHRASE")[0]
-        self.assertEqual(chapter.paragraphs, ["-" * 60, "Thứ 1 chương tên mới", "Nội dung."])
+        self.assert_failure(text, "duplicate_chapter", "VIETPHRASE")
 
     def test_uploaded_vietphrase_chapter_62_truncated_title(self):
         wrapper = "Chapter 62: thứ 62 chương Tần Schumann khôi phục thân thể (cảm tạ “Kawabunga”"
@@ -379,6 +383,162 @@ class RobustParsingTests(unittest.TestCase):
         self.assertEqual(caught.exception.detail["reason"], "missing_chinese_source")
         self.assertNotIn("meaningful_text", raw[0].model_dump())
         self.assertNotIn("source_line", raw[0].model_dump())
+
+
+class PartialRangeHeadingTests(unittest.TestCase):
+    """A file may begin at any positive chapter; chapter 1 is not special."""
+
+    def assert_failure(self, text, reason, label="RAW"):
+        with self.assertRaises(ChapterValidationError) as caught:
+            parse_chapters(text, label)
+        self.assertEqual(caught.exception.detail["reason"], reason)
+        self.assertEqual(caught.exception.detail["input"], label)
+        return caught.exception.detail
+
+    def test_chinese_range_beginning_at_101(self):
+        text = "-" * 60 + "\n第101章 标题\n正文\n" + "-" * 60 + "\n第102章 标题\n正文"
+        chapters = parse_chapters(text)
+        self.assertEqual([c.number for c in chapters], [101, 102])
+        self.assertEqual(chapters[0].title, "第101章 标题")
+
+    def test_chinese_range_beginning_at_501(self):
+        self.assertEqual([c.number for c in parse_chapters("第501章 标题\n正文")], [501])
+
+    def test_english_partial_range(self):
+        text = "Chapter 101: Title\nbody\n\nChapter 102: Title\nbody"
+        self.assertEqual([c.number for c in parse_chapters(text)], [101, 102])
+
+    def test_vietnamese_partial_range(self):
+        text = "Chương 101: Tiêu đề\nnội dung"
+        self.assertEqual([c.number for c in parse_chapters(text, "VIETPHRASE")], [101])
+
+    def test_front_matter_before_chapter_101(self):
+        text = (
+            "book title\nauthor\n\nSource: https://example.test\nTags: 历史\n"
+            "Chapters: 100\n\n" + "+" * 60 + "\n\n"
+            + "-" * 60 + "\n第101章 标题\n正文"
+        )
+        chapters = parse_chapters(text)
+        self.assertEqual(len(chapters), 1)
+        self.assertEqual(chapters[0].number, 101)
+
+    def test_no_headings_reports_file_level_failure(self):
+        detail = self.assert_failure(
+            "book title\nauthor\nnormal body text", "no_chapter_headings", "VIETPHRASE"
+        )
+        self.assertEqual(detail["severity"], "FATAL")
+        self.assertIsNone(detail["line"])
+        self.assertIsNone(detail["heading"])
+        self.assertIn("No valid chapter heading found", detail["message"])
+        self.assertIn("Thứ 101 chương", detail["message"])
+        self.assertNotIn("required: 第1章", detail["message"])
+
+    def test_chapter_one_still_works(self):
+        self.assertEqual([c.number for c in parse_chapters("第1章 标题\n正文")], [1])
+
+    def test_large_chapter_numbers(self):
+        self.assertEqual([c.number for c in parse_chapters("第1234章 标题\n正文")], [1234])
+
+    def test_vietphrase_accepts_the_same_chinese_heading_as_raw(self):
+        text = "第101章 标题\n正文"
+        self.assertEqual([c.number for c in parse_chapters(text, "RAW")], [101])
+        self.assertEqual([c.number for c in parse_chapters(text, "VIETPHRASE")], [101])
+
+    def test_duplicate_detection_remains_intact(self):
+        self.assert_failure("第101章 A\n正文\n第101章 B\n正文", "duplicate_chapter")
+
+    def test_partial_range_alignment_compares_identities(self):
+        raw = "第101章 开始\n他走了。\n\n第102章 结束\n她来了。"
+        vp = "第101章 ...\nHắn đi rồi.\n\n第102章 ...\nNàng tới rồi."
+        pairs = validate_inputs(raw, vp)
+        self.assertEqual([r.number for r, _ in pairs], [101, 102])
+        self.assertEqual([v.number for _, v in pairs], [101, 102])
+
+    def test_heading_forms_do_not_regress(self):
+        for heading in ("第 101 章", "第１０１章", "第一百零一章"):
+            with self.subTest(heading=heading):
+                self.assertEqual([c.number for c in parse_chapters(heading + " 标题\n正文")], [101])
+
+    def test_canonical_parser_normalizes_positive_numbers(self):
+        for text, number, family in (
+            ("第101章 明摄宗张居正", 101, "han"),
+            ("第 1201 章 标题", 1201, "han"),
+            ("Chapter 101: Title", 101, "english"),
+            ("Chapter 501 - Title", 501, "english"),
+            ("Chương 101: Tiêu đề", 101, "vietnamese"),
+        ):
+            with self.subTest(text=text):
+                heading = parse_chapter_heading(text)
+                self.assertIsNotNone(heading)
+                self.assertEqual(heading.number, number)
+                self.assertEqual(heading.family, family)
+                self.assertEqual(heading.raw, text)
+        self.assertIsNone(parse_chapter_heading("第0章 序"))
+        self.assertIsNone(parse_chapter_heading("normal body text"))
+
+
+class VietPhraseHeadingTests(unittest.TestCase):
+    """VietPhrase.app renders ``第101章 <title>`` as ``Thứ 101 chương <title>``."""
+
+    def assert_failure(self, text, reason, label="RAW"):
+        with self.assertRaises(ChapterValidationError) as caught:
+            parse_chapters(text, label)
+        self.assertEqual(caught.exception.detail["reason"], reason)
+        return caught.exception.detail
+
+    def test_thu_chuong_heading_forms(self):
+        for text, number in (
+            ("Thứ 101 chương minh nhiếp tông Trương Cư Chính", 101),
+            ("thứ 501 chương tiêu đề", 501),
+            ("Thứ 1234 chương abc", 1234),
+            ("THỨ 101 CHƯƠNG abc", 101),
+            ("Thứ 1 chương mở đầu", 1),
+        ):
+            with self.subTest(text=text):
+                self.assertEqual([c.number for c in parse_chapters(text + "\nNội dung.")], [number])
+
+    def test_canonical_parser_normalizes_vietphrase_headings(self):
+        heading = parse_chapter_heading("Thứ 101 chương minh nhiếp tông Trương Cư Chính")
+        self.assertEqual(heading.number, 101)
+        self.assertEqual(heading.family, "vietnamese")
+        self.assertEqual(heading.raw, "Thứ 101 chương minh nhiếp tông Trương Cư Chính")
+        # The rendered text is never rewritten into another heading form.
+        self.assertEqual(heading.title, " minh nhiếp tông Trương Cư Chính")
+
+    def test_vietphrase_number_is_never_renumbered(self):
+        text = "Thứ 101 chương a\nNội dung.\n\nThứ 102 chương b\nNội dung."
+        self.assertEqual([c.number for c in parse_chapters(text, "VIETPHRASE")], [101, 102])
+
+    def test_real_vietphrase_file_after_front_matter(self):
+        text = (
+            "朕真的不务正业\nby 吾谁与归\n\nSource: https://example.test\nTags: 历史\n"
+            "Volumes: 0\nChapters: 100\n\n" + "+" * 60 + "\n\n"
+            + "-" * 60 + "\nThứ 101 chương minh nhiếp tông Trương Cư Chính\nHắn đi rồi."
+        )
+        self.assertEqual([c.number for c in parse_chapters(text, "VIETPHRASE")], [101])
+
+    def test_raw_and_vietphrase_share_one_parser_for_alignment(self):
+        raw = "第101章 明摄宗张居正\n他走了。"
+        vp = "Thứ 101 chương minh nhiếp tông Trương Cư Chính\nHắn đi rồi."
+        self.assertEqual([c.number for c in parse_chapters(raw, "RAW")], [101])
+        self.assertEqual([c.number for c in parse_chapters(vp, "VIETPHRASE")], [101])
+        pairs = validate_inputs(raw, vp)
+        self.assertEqual([(r.number, v.number) for r, v in pairs], [(101, 101)])
+
+    def test_duplicate_vietphrase_headings_stay_fatal(self):
+        self.assert_failure(
+            "Thứ 101 chương A\nNội dung.\nThứ 101 chương B\nNội dung khác.",
+            "duplicate_chapter",
+            "VIETPHRASE",
+        )
+
+    def test_decreasing_vietphrase_headings_stay_fatal(self):
+        detail = self.assert_failure(
+            "Thứ 102 chương A\nNội dung.\n\nThứ 101 chương B\nNội dung.",
+            "backward_numbering_without_volume_boundary",
+            "VIETPHRASE",
+        )
+        self.assertEqual((detail["chapter"], detail["previous_chapter"]), (101, 102))
 
 
 if __name__ == "__main__":

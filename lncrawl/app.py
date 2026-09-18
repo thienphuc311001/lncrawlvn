@@ -51,6 +51,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="Do not download or generate a cover image.",
     )
     parser.add_argument(
+        "--safe-block-target",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Start looking for a clean TXT block boundary here (default 2600 chars).",
+    )
+    parser.add_argument(
+        "--safe-block-max",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Hard limit for one TXT block (default 3000 chars).",
+    )
+    parser.add_argument(
         "-v",
         "--verbose",
         action="store_true",
@@ -117,7 +131,13 @@ def main(argv=None) -> None:
         epub_file = make_epub(
             novel, results, out_dir / f"{safe_filename(novel.title)}.epub", cover_file
         )
-        txt_file = make_text(novel, results, out_dir / f"{safe_filename(novel.title)}.txt")
+        txt_file = make_text(
+            novel,
+            results,
+            out_dir / f"{safe_filename(novel.title)}.txt",
+            target=args.safe_block_target,
+            maximum=args.safe_block_max,
+        )
 
         print(f"\nEPUB: {epub_file}")
         print(f"TXT : {txt_file}")

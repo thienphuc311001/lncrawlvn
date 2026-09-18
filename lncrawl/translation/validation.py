@@ -5,7 +5,7 @@ from collections import Counter
 
 from .dictionary import terminology_findings
 from .models import Issue
-from .parsing import HAN, HEADING, chapter_number
+from .parsing import HAN, parse_chapter_heading
 
 PLACEHOLDER = re.compile(
     r"\{\{[^{}\n]+\}\}|\{[^{}\n]+\}|<[/\w][^<>\n]*>|%\([^)]+\)[sd]|\$\{[^}\n]+\}"
@@ -72,12 +72,12 @@ def local_findings(payload, translation):
             )
         residue = len(HAN.findall(text))
         if paragraph_id == -1:
-            source_heading, output_heading = HEADING.match(raw), HEADING.match(text)
+            source_heading = parse_chapter_heading(raw)
+            output_heading = parse_chapter_heading(text)
             if (
                 source_heading
                 and output_heading
-                and chapter_number(source_heading[1] or source_heading[2])
-                != chapter_number(output_heading[1] or output_heading[2])
+                and source_heading.number != output_heading.number
             ):
                 issues.append(
                     Issue(
