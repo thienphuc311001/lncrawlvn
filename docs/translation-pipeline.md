@@ -71,6 +71,15 @@ frozen artifact contains confirmed entries only. Its content hash is carried by
 every translation chunk and chapter. After freeze, no resolver call, alias merge,
 mapping change or dictionary mutation is permitted.
 
+Character aliases/forms are identity references, not context translations. Resolver
+metadata is cleaned before insertion: canonical-name-plus-predicate fragments such as
+`邱途来` and `邱途接` are removed, while independently supported title/nickname forms
+such as `邱科长`, `邱探员` and `老邱` may remain. A form must be independently attested
+in RAW and have a reference shape or explicit co-reference evidence; a context window
+or VietPhrase phrase cannot become a form. Legacy frozen dictionaries and resolved-term
+checkpoints go through the same cleanup. Cleanup writes a concise audit and produces a
+new dictionary hash.
+
 ## Translation contract
 
 Each request receives only:
@@ -97,13 +106,19 @@ Local validation is small and deterministic:
   by the application.
 
 Differences from VietPhrase wording alone never fail validation. Terminology findings
-include the RAW source, required Vietnamese wording, actual realization, reason and
-location. A failed translation chunk receives at most one targeted repair containing
-only the failed RAW IDs, their aligned VietPhrase region, findings and relevant
-confirmed mappings. The same deterministic validator runs once after repair. A
-persistent failure stops with the exact findings; there is no recursive repair or
-repair-time dictionary mutation. Full-chapter assembly is an audit, not a second
-repair loop.
+use exact confirmed canonical/alias/form keys only. Each occurrence preserves `start`,
+`end`, `matched_source`, and separate left/right context; the invariant
+`raw[start:end] == matched_source` is checked before a finding is emitted. Longest-match
+selection applies only among confirmed keys and never absorbs adjacent Chinese,
+punctuation, ASCII or numbers. Required Vietnamese text comes only from the frozen
+mapping. Findings include the exact RAW source, required Vietnamese wording, actual
+realization, reason and location. A failed translation chunk receives at most one
+targeted repair containing only the failed RAW IDs, their aligned VietPhrase region,
+findings and relevant confirmed mappings. The same deterministic validator runs once
+after repair. A persistent failure stops with the exact findings; there is no recursive
+repair or repair-time dictionary mutation. On resume, serialized findings are never
+trusted: the current RAW, frozen dictionary and translation recompute local findings
+before any repair. Full-chapter assembly is an audit, not a second repair loop.
 
 ## Checkpoints and outputs
 
@@ -111,6 +126,11 @@ Existing parsed chapters, alignments, frozen dictionaries, completed chunks and
 validated chapters are reused when their input and dictionary hashes remain
 compatible. Old non-confirmed terminology is quarantined as `IGNORE`; an incompatible
 or contradictory inherited confirmed mapping fails clearly rather than being guessed.
+When a compatible frozen dictionary is cleaned, completed chapters are revalidated
+against the new hash. Passing chapters are rewritten with the cleaned hash; failing
+chapters fall back to chunk-level checkpoint validation and repair, so unaffected work
+is reused. Old validation findings naming removed forms are overwritten by current
+RAW/dictionary/output findings.
 
 The job writes:
 

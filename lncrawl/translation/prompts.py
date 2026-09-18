@@ -74,6 +74,11 @@ grammar fragments. Attach proved titles/aliases to the canonical actor with exac
 Chinese-keyed forms; uncertain identity is IGNORE and never a provisional mapping. Eligibility
 booleans must reflect RAW evidence. Do not translate prose. When repairing a batch,
 correct only the candidates included in that request, preserving accepted decisions.
+Only attach a form when the complete Chinese expression independently functions as a
+reference to the same identity. Never create an alias/form by adding characters from
+the left or right of a canonical name; context windows and VietPhrase phrase readings
+are evidence only, never form strings. Canonical-name-plus-predicate fragments such as
+name+verb/adverb/aspect residue must be rejected.
 Never return type=character_alias as a canonical term. A proved person address form
 must return type=character with the attested canonical Chinese full name, merged
 aliases, and forms[original_source] preserving the address wording. For example, if
@@ -125,7 +130,9 @@ source-aware, never blind Vietnamese global replacement. List missed important C
 terms with exact RAW evidence. Return empty arrays only when these checks pass.
 Check every explicit dictionary source/alias/form occurrence in RAW against its mapped
 Vietnamese wording in the corresponding segment, using the longest overlapping source
-name. A fluent synonym is still a terminology error. Respect mapped address forms.
+name. The reported source is exactly that confirmed key; never append neighboring RAW
+characters from a context window. A fluent synonym is still a terminology error.
+Respect mapped address forms.
 Validate ONLY translation.title and translation.segments as the produced Vietnamese.
 Context and reference text are not translation output and must not be reported as errors.
 """
@@ -142,6 +149,9 @@ consistency. Preserve unrelated translated text unless a grammatical adjustment 
 necessary. The previous repair feedback is evidence about the exact findings that
 remained or regressed; do not repeat a no-progress wording. Return the complete repaired
 chunk for exactly the requested affected segment IDs only, with no explanations or
-patches. -1 denotes chapter title. Do not regenerate unaffected segments.
+patches. Terminology findings contain an exact confirmed source and required mapping;
+context, left_context, right_context and offsets are diagnostics only and must never be
+copied into the terminology source. -1 denotes chapter title. Do not regenerate
+unaffected segments.
 """
 )

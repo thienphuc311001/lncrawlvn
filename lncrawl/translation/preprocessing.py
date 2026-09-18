@@ -5,7 +5,7 @@ import re
 import unicodedata
 from collections import Counter, defaultdict
 
-from .dictionary import quantity_source_problem, source_name, source_problem
+from .dictionary import REFERENCE_SUFFIX, quantity_source_problem, source_name, source_problem
 from .models import Term
 
 HAN_RUN = re.compile(r"[\u3400-\u9fff]+")
@@ -183,6 +183,32 @@ def classify_candidate(source, reasons, contexts, frequency=0, inherited=False):
     return None
 
 
+def remove_contextual_person_extensions(reasons):
+    """Drop fixed-length surname-pattern extensions of an already found name.
+
+    A three-character substring is not independently a character reference just
+    because a two-character name before it was detected. Formal title/role
+    endings remain eligible; ordinary predicate residue does not.
+    """
+    for source in list(reasons):
+        if "person_name_pattern" not in reasons[source]:
+            continue
+        prefix = next(
+            (
+                candidate
+                for candidate in reasons
+                if candidate != source
+                and "person_name_pattern" in reasons[candidate]
+                and source.startswith(candidate)
+            ),
+            None,
+        )
+        if prefix and not REFERENCE_SUFFIX.search(source):
+            reasons[source].discard("person_name_pattern")
+            if not reasons[source]:
+                del reasons[source]
+
+
 def normalized(text):
     return " ".join(unicodedata.normalize("NFC", text).casefold().split())
 
@@ -311,6 +337,7 @@ def build_index(pairs, alignments, inherited):
             r"(?:任意|任何)[\u3400-\u9fff]{1,12}(?:抓捕|派遣|调动|处理)[\u3400-\u9fff]{0,8}", text
         ):
             reasons[match.group()].add("compositional_descriptive_phrase")
+    remove_contextual_person_extensions(reasons)
     for source, count in counts.items():
         suffix = next((ending for ending in SUFFIXES if source.endswith(ending)), None)
         if count >= 2 and suffix and not set(source[: -len(suffix)]).intersection(GRAMMAR):

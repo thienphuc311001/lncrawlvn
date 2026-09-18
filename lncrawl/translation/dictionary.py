@@ -11,6 +11,45 @@ ORDINARY = set(
     "不会 继续 或者 直接 刚才 只要 连忙 眼睛 比如 主动 只能 轻轻 小声 不好 抬头 故意 开口 不再 嘴里 低声 有没有 一边 世界 中山装 方法 温柔 任何 任命 任务".split()
 )
 FRAGMENTS = ("也", "不", "没", "竟然", "缓缓", "有")
+CHARACTER_TYPES = {"character", "character_form"}
+REFERENCE_SUFFIXES = (
+    "副署长",
+    "副科长",
+    "探员",
+    "署长",
+    "科长",
+    "处长",
+    "将军",
+    "上校",
+    "中校",
+    "少校",
+    "队长",
+    "长官",
+    "主任",
+    "警官",
+    "医生",
+    "老师",
+    "先生",
+    "小姐",
+    "夫人",
+    "阁下",
+    "殿下",
+    "大人",
+    "前辈",
+    "师兄",
+    "师姐",
+    "师弟",
+    "师妹",
+    "掌门",
+)
+REFERENCE_SUFFIX = re.compile(
+    r"(?:" + "|".join(map(re.escape, REFERENCE_SUFFIXES)) + r")$"
+)
+NICKNAME = re.compile(r"^(?:老|小|阿)[\u3400-\u9fff]{1,3}$")
+IDENTITY_CUE = re.compile(
+    r"(?:就是|是|名为|名字是|叫做|称为|原名|又名|也叫|被称为|"
+    r"升为|晋升为|改称|改任|成为)"
+)
 
 
 def source_name(source):
@@ -72,6 +111,87 @@ def source_problem(source, known=()):
     ):
         return "entity plus grammar fragment"
     return None
+
+
+def _identity_evidence(name, canonical, contexts=(), evidence=""):
+    """Return whether RAW/evidence explicitly links a reference to a person."""
+    values = [*contexts, evidence]
+    if not name.startswith(canonical) and any(
+        name + canonical in value or canonical + name in value
+        for value in values
+        if value
+    ):
+        return True
+    pair = re.compile(
+        r"(?:"
+        + re.escape(name)
+        + r".{0,24}"
+        + IDENTITY_CUE.pattern
+        + r".{0,24}"
+        + re.escape(canonical)
+        + r"|"
+        + re.escape(canonical)
+        + r".{0,24}"
+        + IDENTITY_CUE.pattern
+        + r".{0,24}"
+        + re.escape(name)
+        + r")"
+    )
+    return any(pair.search(value) for value in values if value)
+
+
+def identity_form_problem(term, name, contexts=(), require_evidence=False):
+    """Reject contextual sentence extensions from character aliases/forms.
+
+    A form is accepted only as an independently shaped reference expression or
+    when RAW/evidence explicitly links it to the canonical character.  A name
+    followed by arbitrary Han text is never made safe by substring attestation.
+    """
+    if term.type not in CHARACTER_TYPES or name == term.source:
+        return None
+    if source_problem(name):
+        return "invalid alias/form"
+    evidence = _identity_evidence(name, term.source, contexts, term.evidence)
+    suffix = name[len(term.source) :] if name.startswith(term.source) else ""
+    if suffix:
+        if REFERENCE_SUFFIX.search(suffix) or evidence:
+            return None
+        return "canonical character plus contextual residue"
+    if REFERENCE_SUFFIX.search(name) or NICKNAME.fullmatch(name):
+        if require_evidence and not evidence:
+            return "character reference identity is not independently proven"
+        return None
+    if evidence:
+        return None
+    if require_evidence:
+        return "character reference identity is not independently proven"
+    return "unrecognized character reference form"
+
+
+def clean_identity_forms(term, contexts=(), require_evidence=False):
+    """Remove contaminated character forms while preserving the canonical term."""
+    if term.type not in CHARACTER_TYPES:
+        return [], []
+    removed, preserved = [], []
+    aliases = []
+    for name in term.aliases:
+        problem = identity_form_problem(term, name, contexts, require_evidence)
+        if problem:
+            removed.append({"source": name, "reason": problem, "field": "aliases"})
+        else:
+            aliases.append(name)
+            preserved.append(name)
+    forms = {}
+    for name, translation in term.forms.items():
+        problem = identity_form_problem(term, name, contexts, require_evidence)
+        if problem:
+            removed.append({"source": name, "reason": problem, "field": "forms"})
+        else:
+            forms[name] = translation
+            preserved.append(name)
+    term.aliases = sorted(set(aliases))
+    term.forms = forms
+    return removed, sorted(set(preserved))
 
 
 def term_problem(term, known=()):
@@ -175,6 +295,17 @@ def load_legacy(data):
             term.forms = {
                 name: value for name, value in term.forms.items() if name != term.source
             }
+            removed, preserved = clean_identity_forms(term)
+            if removed:
+                problems.append(
+                    {
+                        "classification": "form_cleanup",
+                        "source": term.source,
+                        "removed_forms": removed,
+                        "preserved_forms": preserved,
+                        "reason": "removed contextual character pseudo-forms",
+                    }
+                )
             problem = term_problem(term)
             if problem:
                 raise ValueError(problem)
@@ -258,6 +389,11 @@ def sanity(terms, allow_shared_translations=True):
         problem = term_problem(term, terms)
         if problem:
             errors.append(f"{source}: {problem}")
+        if term.type in CHARACTER_TYPES:
+            for name in [*term.aliases, *term.forms]:
+                form_problem = identity_form_problem(term, name)
+                if form_problem:
+                    errors.append(f"{source}.{name}: {form_problem}")
         for name in [source, *term.aliases, *term.forms]:
             if name in owners and owners[name] != source:
                 errors.append(f"{name}: alias/canonical collision")
@@ -303,6 +439,8 @@ def _term_value(term, field, default=None):
 
 def _mapping_entries(terms):
     """Yield source-aware frozen mappings, excluding non-enforceable metadata."""
+    if isinstance(terms, dict):
+        terms = terms.values()
     result = []
     for term in terms:
         if not term_is_enforceable(term):
@@ -322,18 +460,72 @@ def _mapping_entries(terms):
     return [item for item in result if item["source"]]
 
 
-def _selected_source_occurrences(raw, names):
-    """Choose longest overlapping source keys at each RAW occurrence."""
-    matches = []
-    for name in sorted(set(names), key=lambda value: (-len(value), value)):
+def _context(raw, start, end, radius=80):
+    """Return context separately from an exact terminology span."""
+    left = raw[max(0, start - radius) : start]
+    right = raw[end : min(len(raw), end + radius)]
+    return left, right
+
+
+def _selected_source_occurrences(raw, mappings):
+    """Select exact, non-overlapping confirmed keys from RAW.
+
+    Matching is leftmost-longest, but the selected span is always the actual
+    dictionary key.  In particular, a context character after a name can
+    never be absorbed into the finding or its required translation.
+    """
+    by_start = defaultdict(list)
+    for mapping in mappings:
+        name = mapping["source"]
         for match in re.finditer(re.escape(name), raw):
-            matches.append((match.start(), match.end(), name))
+            start, end = match.span()
+            if raw[start:end] != name:
+                # ``re.escape`` should make this impossible. Keep the check
+                # explicit so a future field-mapping change cannot create an
+                # expanded terminology occurrence.
+                raise ValueError(
+                    f"Internal terminology matcher error at {start}:{end}: "
+                    f"{raw[start:end]!r} != {name!r}"
+                )
+            by_start[start].append({**mapping, "start": start, "end": end})
+
     selected = []
-    for start, end, name in sorted(matches, key=lambda item: (item[0], -(item[1] - item[0]), item[2])):
-        if any(start >= left and end <= right for left, right, _ in selected):
+    cursor = 0
+    for start in sorted(by_start):
+        if start < cursor:
             continue
-        selected.append((start, end, name))
+        occurrence = max(
+            by_start[start],
+            key=lambda item: (item["end"] - item["start"], item["source"]),
+        )
+        end = occurrence["end"]
+        if raw[start:end] != occurrence["source"]:
+            raise ValueError(
+                f"Internal terminology matcher error at {start}:{end}: "
+                f"{raw[start:end]!r} != {occurrence['source']!r}"
+            )
+        left, right = _context(raw, start, end)
+        selected.append(
+            {
+                **occurrence,
+                "matched_source": occurrence["source"],
+                "left_context": left,
+                "right_context": right,
+                "context": left + occurrence["source"] + right,
+            }
+        )
+        cursor = end
     return selected
+
+
+def terminology_occurrences(terms, raw):
+    """Return exact confirmed terminology spans in one RAW string.
+
+    This is intentionally separate from ``terminology_findings`` so tests,
+    resume diagnostics and repair tooling can inspect spans even when the
+    translation already satisfies every mapping.
+    """
+    return _selected_source_occurrences(raw, _mapping_entries(terms))
 
 
 def _normalized_count(text, expected):
@@ -363,8 +555,8 @@ def terminology_findings(terms, raw, translated, location=None):
     if not mappings:
         return []
     by_name = {item["source"]: item for item in mappings}
-    selected = _selected_source_occurrences(raw, by_name)
-    grouped = Counter(name for _, _, name in selected)
+    selected = terminology_occurrences(mappings, raw)
+    grouped = Counter(item["source"] for item in selected)
     # Different Chinese identities may intentionally share one Vietnamese
     # target.  Count that target once across its confirmed source group;
     # validating each source against the same global surface independently
@@ -386,15 +578,33 @@ def terminology_findings(terms, raw, translated, location=None):
         for name, source_occurrences in sorted(group):
             mapping = by_name[name]
             actual = _actual_variant(expected, translated)
-            reason = "frozen_mapping_mismatch" if actual else "required_term_missing"
+            source_spans = [item for item in selected if item["source"] == name]
+            occurrence = source_spans[0]
+            reason = "confirmed_mapping_mismatch" if actual else "required_term_missing"
             findings.append(
                 {
                     "type": "terminology",
                     "source": name,
+                    "matched_source": occurrence["matched_source"],
                     "canonical_source": mapping["canonical_source"],
                     "required_translation": expected,
                     "actual_text": actual,
                     "reason": reason,
+                    "start": occurrence["start"],
+                    "end": occurrence["end"],
+                    "left_context": occurrence["left_context"],
+                    "right_context": occurrence["right_context"],
+                    "context": occurrence["context"],
+                    "source_spans": [
+                        {
+                            "matched_source": item["matched_source"],
+                            "start": item["start"],
+                            "end": item["end"],
+                            "left_context": item["left_context"],
+                            "right_context": item["right_context"],
+                        }
+                        for item in source_spans
+                    ],
                     "source_occurrences": source_occurrences,
                     "expected_occurrences": source_occurrences,
                     "matched_occurrences": matched_total,

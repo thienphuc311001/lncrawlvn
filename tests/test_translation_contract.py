@@ -10,7 +10,7 @@ from lncrawl.translation.parsing import deterministic_alignment, validate_inputs
 from lncrawl.translation.pipeline import Pipeline, QualityError
 from lncrawl.translation.preprocessing import build_index
 from lncrawl.translation.scheduler import Scheduler
-from lncrawl.translation.store import Store
+from lncrawl.translation.store import Store, digest
 
 
 class TranslationContractTests(unittest.TestCase):
@@ -76,6 +76,63 @@ class TranslationContractTests(unittest.TestCase):
 
 
 class TargetedRepairContractTests(unittest.IsolatedAsyncioTestCase):
+    async def test_resume_recomputes_stale_expanded_terminology_finding(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = Store(
+                Path(root),
+                Inputs(
+                    raw="第1章\n邱途接了电话。",
+                    vietphrase="Chương 1\nKhâu Đồ nhận điện thoại.",
+                ).model_dump(),
+            )
+            pipeline = Pipeline(store, Scheduler(concurrency=1, spacing=0))
+            pipeline.freeze(
+                {
+                    "entries": [
+                        {
+                            "source": "邱途",
+                            "translation": "Khâu Đồ",
+                            "type": "character",
+                            "status": "locked",
+                        }
+                    ]
+                }
+            )
+            task = "chapter:1:chunk:0"
+            store.write(
+                f"validation-rejections/{digest(task)}.json",
+                {
+                    "task": task,
+                    "findings": [
+                        {
+                            "source": "邱途接",
+                            "required_translation": "Khâu Đồ tiếp",
+                        }
+                    ],
+                },
+            )
+            payload = {
+                "raw_title": "第1章",
+                "raw": [{"id": 0, "text": "邱途接了电话。"}],
+                "terminology": [
+                    {
+                        "source": "邱途",
+                        "translation": "Khâu Đồ",
+                        "type": "character",
+                        "status": "locked",
+                    }
+                ],
+                "location": {"chapter": 1, "chunk": 0},
+            }
+            translation = Translation(
+                title="Chương 1",
+                segments=[Segment(id=0, text="Khâu Đồ nhận điện thoại.")],
+            )
+            await pipeline.validate_and_repair(task, payload, translation)
+            recomputed = store.read(f"validation-rejections/{digest(task)}.json")
+            self.assertEqual(recomputed["findings"], [])
+            self.assertNotIn("邱途接", json.dumps(recomputed, ensure_ascii=False))
+
     async def test_persistent_failure_stops_after_one_repair(self):
         calls = []
 
@@ -85,6 +142,9 @@ class TargetedRepairContractTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(instruction, prompts.REPAIR)
             request = json.loads(body["contents"][0]["parts"][0]["text"])
             self.assertEqual(request["affected_ids"], [0])
+            self.assertEqual(request["issues"][0]["source"], "黄哥")
+            self.assertEqual(request["issues"][0]["required_translation"], "Hoàng ca")
+            self.assertNotIn("走", request["issues"][0]["source"])
             return {"segments": [{"id": 0, "text": "anh Hoàng đi rồi."}]}
 
         with tempfile.TemporaryDirectory() as root:

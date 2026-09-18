@@ -318,10 +318,17 @@ class Issue(StrictModel):
     # old checkpoints and callers remain valid.
     type: Optional[str] = None
     source: Optional[str] = None
+    matched_source: Optional[str] = None
     canonical_source: Optional[str] = None
     required_translation: Optional[str] = None
     actual_text: Optional[str] = None
     reason: Optional[str] = None
+    start: Optional[int] = None
+    end: Optional[int] = None
+    left_context: Optional[str] = None
+    right_context: Optional[str] = None
+    context: Optional[str] = None
+    source_spans: Optional[List[Dict[str, object]]] = None
     source_occurrences: Optional[int] = None
     expected_occurrences: Optional[int] = None
     matched_occurrences: Optional[int] = None

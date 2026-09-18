@@ -14,6 +14,7 @@ from types import MappingProxyType
 from . import prompts
 from .dictionary import (
     export_dictionary,
+    clean_identity_forms,
     load_legacy,
     quantity_source_problem,
     relevant,
@@ -64,6 +65,7 @@ class Pipeline:
         self.cache_keys = {}
         self.decisions = {}
         self.ignored = {}
+        self.form_cleanup = []
         self.outcomes = {}
         self.metrics = Counter()
         self.frozen_hash = None
@@ -254,6 +256,30 @@ class Pipeline:
         self.ignored[source] = record
         self.store.write(f"term-audit/{digest(source)}.json", record)
 
+    def raw_contexts(self):
+        return [
+            text
+            for raw, _ in self.pairs
+            for text in [raw.title, *raw.paragraphs]
+        ]
+
+    def record_form_cleanup(self, problems):
+        cleanup = [
+            problem
+            for problem in problems
+            if problem.get("classification") == "form_cleanup"
+        ]
+        if not cleanup:
+            return
+        self.form_cleanup.extend(cleanup)
+        removed = sum(len(item.get("removed_forms", [])) for item in self.form_cleanup)
+        preserved = sum(len(item.get("preserved_forms", [])) for item in self.form_cleanup)
+        self.store.write("dictionary-form-cleanup.json", {"entries": self.form_cleanup})
+        self.local(
+            "dictionary_form_cleanup",
+            f"Removed contextual pseudo-forms: {removed}; preserved identity forms: {preserved}",
+        )
+
     def apply_resolution(self, source, inherited, result):
         """Install only a complete ACCEPT result; all uncertainty is IGNORE."""
         if self.frozen_hash is not None:
@@ -288,6 +314,24 @@ class Pipeline:
         inherited_names = (
             [inherited.source, *inherited.aliases, *inherited.forms] if inherited else []
         )
+
+        removed, preserved = clean_identity_forms(
+            term,
+            self.raw_contexts(),
+            require_evidence=True,
+        )
+        if removed:
+            self.record_form_cleanup(
+                [
+                    {
+                        "classification": "form_cleanup",
+                        "source": term.source,
+                        "removed_forms": removed,
+                        "preserved_forms": preserved,
+                        "reason": "removed resolver-proposed contextual character pseudo-forms",
+                    }
+                ]
+            )
 
         def attested(name):
             return not source_problem(name) and (
@@ -493,6 +537,12 @@ class Pipeline:
         entries = sorted(self.outcomes.values(), key=lambda item: item.get("source", ""))
         confirmed = len(self.terms)
         ignored = len(self.ignored)
+        removed_forms = sum(
+            len(item.get("removed_forms", [])) for item in self.form_cleanup
+        )
+        preserved_forms = sum(
+            len(item.get("preserved_forms", [])) for item in self.form_cleanup
+        )
         return {
             "summary": {
                 "confirmed_terms": confirmed,
@@ -513,8 +563,11 @@ class Pipeline:
                     for item in self.index.get("report_only", {}).values()
                 ),
                 "fatal_conflicts": 0,
+                "removed_contextual_forms": removed_forms,
+                "preserved_identity_forms": preserved_forms,
             },
             "entries": entries,
+            "form_cleanup": self.form_cleanup,
             "policy": self.policy.model_dump(),
             "metrics": dict(self.metrics),
         }
@@ -522,6 +575,7 @@ class Pipeline:
     async def prepare_dictionary(self, inputs):
         """Parse candidates from RAW, use VP as evidence, then freeze once."""
         inherited, problems = load_legacy(inputs.get("dictionary"))
+        self.record_form_cleanup(problems)
         self.store.write("legacy-audit.json", problems)
         fatal = [item for item in problems if item.get("classification") == "fatal"]
         if fatal:
@@ -548,11 +602,29 @@ class Pipeline:
 
         saved = self.store.read("resolved-terms.json")
         if saved and saved.get("input_hash") in {self.input_hash, self.store.id}:
-            self.terms = {
-                term.source: term
-                for term in (Term.model_validate(item) for item in saved.get("terms", []))
-                if term.enforceable
-            }
+            loaded_terms = []
+            for item in saved.get("terms", []):
+                term = Term.model_validate(item)
+                removed, preserved = clean_identity_forms(
+                    term,
+                    self.raw_contexts(),
+                    require_evidence=True,
+                )
+                if removed:
+                    self.record_form_cleanup(
+                        [
+                            {
+                                "classification": "form_cleanup",
+                                "source": term.source,
+                                "removed_forms": removed,
+                                "preserved_forms": preserved,
+                                "reason": "removed checkpointed contextual character pseudo-forms",
+                            }
+                        ]
+                    )
+                if term.enforceable:
+                    loaded_terms.append(term)
+            self.terms = {term.source: term for term in loaded_terms}
             self.decisions = {
                 source: state
                 for source, state in saved.get("decisions", {}).items()
@@ -641,6 +713,12 @@ class Pipeline:
 
     def freeze(self, dictionary):
         terms, invalid = load_legacy(dictionary)
+        self.record_form_cleanup(invalid)
+        invalid = [
+            problem
+            for problem in invalid
+            if problem.get("classification") != "form_cleanup"
+        ]
         if invalid:
             raise QualityError("Malformed frozen dictionary checkpoint")
         confirmed = {
@@ -719,6 +797,19 @@ class Pipeline:
             issues = local_findings(payload, translation)
         except ValueError as exc:
             self.fail(task, str(exc))
+        # Never trust findings serialized by an older validator.  Every resume
+        # path reaches this point with the current RAW, frozen dictionary and
+        # translated text, so the findings used for repair are freshly derived.
+        self.store.write(
+            f"validation-rejections/{digest(task)}.json",
+            {
+                "task": task,
+                "pipeline_version": PIPELINE_VERSION,
+                "dictionary_hash": self.frozen_hash,
+                "findings": self.finding_data(issues),
+                "recomputed": True,
+            },
+        )
         if not issues:
             self.local("normal_output_validation", f"{task}: local checks passed")
             return translation
@@ -730,6 +821,8 @@ class Pipeline:
             f"validation-rejections/{digest(task)}.json",
             {
                 "task": task,
+                "pipeline_version": PIPELINE_VERSION,
+                "dictionary_hash": self.frozen_hash,
                 "issues": self.finding_data(issues),
                 "translation": translation.model_dump(),
             },
@@ -821,21 +914,42 @@ class Pipeline:
             "terminology": relevant(self.terms, raw.title + "\n" + "\n".join(raw.paragraphs)),
         }
         saved = self.store.read(f"chapters/{key}.json")
-        if (
+        saved_dictionary_hash = saved.get("dictionary_hash") if saved else None
+        saved_is_compatible = (
             saved
             and saved.get("pipeline_input_hash")
             in {self.input_hash, *self.compatible_input_hashes}
-            and saved.get("dictionary_hash")
-            in {self.frozen_hash, *self.compatible_frozen_hashes}
-        ):
-            checked = await self.validate_and_repair(
-                f"chapter:{key}:full",
-                whole,
-                Translation.model_validate(saved["translation"]),
-                allow_repair=False,
-            )
-            self.store.write(f"chapters/{key}.json", {**saved, "translation": checked.model_dump()})
-            return
+            and saved_dictionary_hash in {self.frozen_hash, *self.compatible_frozen_hashes}
+        )
+        if saved_is_compatible:
+            try:
+                checked = await self.validate_and_repair(
+                    f"chapter:{key}:full",
+                    whole,
+                    Translation.model_validate(saved["translation"]),
+                    allow_repair=False,
+                )
+            except QualityError:
+                if saved_dictionary_hash not in self.compatible_frozen_hashes:
+                    raise
+                self.store.log(
+                    {
+                        "status": "local_success",
+                        "operation": "dictionary_migration",
+                        "message": f"Chapter {key} requires chunk-level revalidation after dictionary cleanup",
+                    }
+                )
+            else:
+                self.store.write(
+                    f"chapters/{key}.json",
+                    {
+                        **saved,
+                        "dictionary_hash": self.frozen_hash,
+                        "pipeline_input_hash": self.input_hash,
+                        "translation": checked.model_dump(),
+                    },
+                )
+                return
 
         segments, title = [], ""
         for index, chunk in enumerate(self.chunks[key]):
@@ -863,7 +977,11 @@ class Pipeline:
             }
             chunk_hash = digest({"payload": payload, "pipeline_input_hash": self.input_hash})
             checkpoint = self.store.read(f"chunks/{key}-{index}.json")
-            if checkpoint and checkpoint.get("input_hash") == chunk_hash:
+            checkpoint_reusable = checkpoint and (
+                checkpoint.get("input_hash") == chunk_hash
+                or checkpoint.get("dictionary_hash") in self.compatible_frozen_hashes
+            )
+            if checkpoint_reusable:
                 translated = Translation.model_validate(checkpoint["translation"])
             else:
                 translated = await self.ai(
@@ -979,6 +1097,7 @@ class Pipeline:
         if not frozen:
             await self.prepare_dictionary(inputs)
         self.assert_frozen()
+        self.store.write("dictionary-resolution-report.json", self.dictionary_report())
         await self.parallel(self.pairs, self.chapter)
         self.assert_frozen()
 

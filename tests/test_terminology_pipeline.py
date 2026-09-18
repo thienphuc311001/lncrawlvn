@@ -3,8 +3,13 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from lncrawl.translation.dictionary import load_legacy, terminology_findings
-from lncrawl.translation.models import Inputs, Segment, Term, Translation
+from lncrawl.translation.dictionary import (
+    export_dictionary,
+    load_legacy,
+    terminology_findings,
+    terminology_occurrences,
+)
+from lncrawl.translation.models import Inputs, Resolution, Segment, Term, Translation
 from lncrawl.translation.parsing import deterministic_alignment, validate_inputs
 from lncrawl.translation.pipeline import Pipeline
 from lncrawl.translation.preprocessing import build_index, local_resolution
@@ -96,11 +101,198 @@ class TerminologyPipelineRegressionTests(unittest.TestCase):
         by_source = {finding["source"]: finding for finding in findings}
         self.assertEqual(by_source["黄哥"]["required_translation"], "Hoàng ca")
         self.assertEqual(by_source["黄哥"]["actual_text"], "anh Hoàng")
-        self.assertEqual(by_source["黄哥"]["reason"], "frozen_mapping_mismatch")
+        self.assertEqual(by_source["黄哥"]["reason"], "confirmed_mapping_mismatch")
         # Presence of the confirmed target is sufficient; a shorter source key
         # is not counted inside the longer source key.
         self.assertNotIn("龙山", by_source)
         self.assertNotIn("龙山道", by_source)
+
+    def test_canonical_span_never_absorbs_adjacent_raw_text(self):
+        term = Term(
+            source="邱途",
+            translation="Khâu Đồ",
+            type="character",
+            status="locked",
+        )
+        raw = "邱途接了电话"
+        occurrences = terminology_occurrences([term.model_dump()], raw)
+        self.assertEqual(len(occurrences), 1)
+        occurrence = occurrences[0]
+        self.assertEqual(occurrence["matched_source"], "邱途")
+        self.assertEqual(raw[occurrence["start"] : occurrence["end"]], "邱途")
+        self.assertEqual(occurrence["right_context"], "接了电话")
+        self.assertNotIn("接", occurrence["matched_source"])
+
+        findings = terminology_findings(
+            [term.model_dump()], raw, "Đợi Khâu nhận điện thoại。"
+        )
+        self.assertEqual(findings[0]["source"], "邱途")
+        self.assertEqual(findings[0]["canonical_source"], "邱途")
+        self.assertEqual(findings[0]["required_translation"], "Khâu Đồ")
+        self.assertEqual(findings[0]["start"], 0)
+        self.assertEqual(findings[0]["end"], 2)
+        self.assertEqual(
+            [raw[item["start"] : item["end"]] for item in findings[0]["source_spans"]],
+            ["邱途"],
+        )
+        self.assertNotIn("接", findings[0]["source"])
+        self.assertNotIn("接", findings[0]["required_translation"])
+
+    def test_alias_punctuation_ascii_and_overlapping_keys_keep_exact_offsets(self):
+        alias = Term(
+            source="丁小七",
+            translation="Đinh Tiểu Thất",
+            aliases=["小七"],
+            type="character",
+            status="locked",
+        )
+        occurrences = terminology_occurrences(
+            [alias.model_dump()], "“小七说道42A"
+        )
+        self.assertEqual(occurrences[0]["source"], "小七")
+        self.assertEqual(occurrences[0]["canonical_source"], "丁小七")
+        self.assertEqual(occurrences[0]["matched_source"], "小七")
+        self.assertEqual(occurrences[0]["right_context"], "说道42A")
+        self.assertEqual(
+            "“小七说道42A"[occurrences[0]["start"] : occurrences[0]["end"]],
+            "小七",
+        )
+
+        short = Term(
+            source="龙山",
+            translation="Long Sơn",
+            type="location",
+            status="locked",
+        )
+        long = Term(
+            source="龙山道",
+            translation="Long Sơn Đạo",
+            type="location",
+            status="locked",
+        )
+        overlap = terminology_occurrences(
+            [short.model_dump(), long.model_dump()], "龙山道人来了"
+        )
+        self.assertEqual([item["matched_source"] for item in overlap], ["龙山道"])
+        self.assertEqual(overlap[0]["right_context"], "人来了")
+        self.assertEqual("龙山道人来了"[overlap[0]["start"] : overlap[0]["end"]], "龙山道")
+
+    def test_fake_serialized_span_metadata_cannot_change_the_source(self):
+        record = Term(
+            source="邱途",
+            translation="Khâu Đồ",
+            type="character",
+            status="locked",
+        ).model_dump()
+        record.update(start=14, end=28, context_span="邱途接了电话")
+        occurrence = terminology_occurrences([record], "邱途接了电话")
+        self.assertEqual(occurrence[0]["matched_source"], "邱途")
+        self.assertEqual(occurrence[0]["start"], 0)
+        self.assertEqual(occurrence[0]["end"], 2)
+
+    def test_timestamp_like_raw_text_is_not_a_fatal_terminology_candidate(self):
+        pairs = validate_inputs(
+            "第1章\n时间是23：59：59。",
+            "Chương 1\nThời gian là 23：59：59.",
+        )
+        index = build_index(
+            pairs, {raw.key: deterministic_alignment(raw, vp) for raw, vp in pairs}, []
+        )
+        self.assertNotIn("23：59：59", index["candidates"])
+        self.assertNotIn("23：59：59", index["report_only"])
+
+    def test_legacy_cleanup_removes_contextual_forms_but_preserves_titles(self):
+        terms, problems = load_legacy(
+            {
+                "entries": [
+                    {
+                        "source": "邱途",
+                        "translation": "Khâu Đồ",
+                        "type": "character",
+                        "status": "locked",
+                        "aliases": ["邱副科长", "邱探员", "邱科长"],
+                        "forms": {
+                            "邱途来": "Khâu Đồ đến",
+                            "邱途接": "Khâu Đồ tiếp",
+                            "邱途笑": "Khâu Đồ cười",
+                            "邱副科长": "Khâu phó khoa trưởng",
+                            "邱探员": "Khâu thám viên",
+                            "邱科长": "Khâu khoa trưởng",
+                        },
+                    }
+                ]
+            }
+        )
+        self.assertEqual(len(terms), 1)
+        term = terms[0]
+        self.assertEqual(set(term.forms), {"邱副科长", "邱探员", "邱科长"})
+        self.assertEqual(set(term.aliases), {"邱副科长", "邱探员", "邱科长"})
+        cleanup = [item for item in problems if item["classification"] == "form_cleanup"]
+        self.assertEqual(
+            {item["source"] for item in cleanup[0]["removed_forms"]},
+            {"邱途来", "邱途接", "邱途笑"},
+        )
+        self.assertEqual(
+            set(cleanup[0]["preserved_forms"]),
+            {"邱副科长", "邱探员", "邱科长"},
+        )
+        self.assertNotIn("邱途接", json.dumps(export_dictionary({"邱途": term}), ensure_ascii=False))
+
+    def test_resolver_forms_require_identity_shape_or_raw_identity_evidence(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = Store(
+                Path(root),
+                Inputs(
+                    raw="第1章\n邱途来了。\n邱科长就是邱途。",
+                    vietphrase="Chương 1\nKhâu Đồ đến.\nKhoa trưởng Khâu là Khâu Đồ.",
+                ).model_dump(),
+            )
+            pipeline = Pipeline(store, Scheduler(concurrency=1, spacing=0))
+            pipeline.pairs = validate_inputs(
+                store.read("inputs.json")["raw"], store.read("inputs.json")["vietphrase"]
+            )
+            raw, vp = pipeline.pairs[0]
+            pipeline.alignments[raw.key] = deterministic_alignment(raw, vp)
+            result = Resolution.model_validate(
+                {
+                    "decision": "ACCEPT",
+                    "eligibility": {
+                        "complete_semantic_unit": True,
+                        "named_or_novel_specific": True,
+                        "consistency_matters": True,
+                        "evidence_supports": True,
+                    },
+                    "term": {
+                        "source": "邱途",
+                        "translation": "Khâu Đồ",
+                        "type": "character",
+                        "aliases": ["邱途来", "邱科长"],
+                        "forms": {
+                            "邱途接": "Khâu Đồ tiếp",
+                            "邱科长": "Khâu khoa trưởng",
+                        },
+                    },
+                    "reason": "fixture",
+                }
+            )
+            term = pipeline.apply_resolution("邱途", None, result)
+            self.assertEqual(term.aliases, ["邱科长"])
+            self.assertEqual(term.forms, {"邱科长": "Khâu khoa trưởng"})
+            self.assertEqual(
+                {item["source"] for item in pipeline.form_cleanup[0]["removed_forms"]},
+                {"邱途来", "邱途接"},
+            )
+
+    def test_candidate_discovery_does_not_turn_fixed_length_name_extensions_into_terms(self):
+        pairs = validate_inputs(
+            "第1章\n邱途来走了。",
+            "Chương 1\nKhâu Đồ đi rồi.",
+        )
+        index = build_index(
+            pairs, {raw.key: deterministic_alignment(raw, vp) for raw, vp in pairs}, []
+        )
+        self.assertNotIn("邱途来", index["report_only"])
+        self.assertNotIn("邱途来", index["candidates"])
 
     def test_shared_vietnamese_surface_is_not_identity_conflict(self):
         with tempfile.TemporaryDirectory() as root:
@@ -136,6 +328,74 @@ class TerminologyPipelineRegressionTests(unittest.TestCase):
 
 
 class TerminologyResumeRegressionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_contaminated_frozen_dictionary_is_cleaned_and_completed_chapter_reused(self):
+        with tempfile.TemporaryDirectory() as root:
+            old_dictionary = {
+                "version": 3,
+                "entries": [
+                    {
+                        "source": "邱途",
+                        "translation": "Khâu Đồ",
+                        "type": "character",
+                        "status": "locked",
+                        "aliases": ["邱副科长", "邱探员", "邱科长"],
+                        "forms": {
+                            "邱途来": "Khâu Đồ đến",
+                            "邱途接": "Khâu Đồ tiếp",
+                            "邱途笑": "Khâu Đồ cười",
+                            "邱科长": "Khâu khoa trưởng",
+                        },
+                    }
+                ],
+            }
+            inputs = Inputs(
+                raw="第1章\n邱途来了。",
+                vietphrase="Chương 1\nKhâu Đồ đến.",
+                dictionary=old_dictionary,
+            ).model_dump()
+            store = Store(Path(root), inputs)
+            old_hash = digest(old_dictionary)
+            store.write(
+                "frozen-dictionary.json",
+                {
+                    "input_hash": "legacy-input-hash",
+                    "dictionary_hash": old_hash,
+                    "dictionary": old_dictionary,
+                },
+            )
+            store.write(
+                "chapters/1.json",
+                {
+                    "dictionary_hash": old_hash,
+                    "pipeline_input_hash": "legacy-input-hash",
+                    "number": 1,
+                    "translation": {
+                        "title": "Chương 1",
+                        "segments": [{"id": 0, "text": "Khâu Đồ đến."}],
+                    },
+                },
+            )
+
+            async def must_not_translate(model, body):
+                raise AssertionError("a valid completed chapter should be reused")
+
+            await Pipeline(
+                store,
+                Scheduler(transport=must_not_translate, concurrency=1, spacing=0),
+            ).run()
+            cleaned = store.read("dictionary.json")
+            entry = cleaned["entries"][0]
+            self.assertNotIn("邱途来", json.dumps(cleaned["entries"], ensure_ascii=False))
+            self.assertEqual(set(entry["forms"]), {"邱科长"})
+            self.assertNotEqual(cleaned["dictionary_hash"], old_hash)
+            self.assertEqual(
+                store.read("chapters/1.json")["dictionary_hash"],
+                cleaned["dictionary_hash"],
+            )
+            summary = store.read("dictionary-resolution-report.json")["summary"]
+            self.assertEqual(summary["removed_contextual_forms"], 3)
+            self.assertEqual(summary["preserved_identity_forms"], 3)
+
     async def test_old_report_only_frozen_entry_is_migrated_without_retranslation_contract(self):
         with tempfile.TemporaryDirectory() as root:
             inputs = Inputs(

@@ -24,10 +24,11 @@ type Job = {
     locked_terms?: number; provisional_terms?: number; needs_review?: number;
     report_only_terms?: number; unresolved_terms: number; unresolved_plausible_terms?: number;
     rejected_generic_candidates?: number; fatal_conflicts?: number;
+    removed_contextual_forms?: number; preserved_identity_forms?: number;
   };
   dictionary_review?: Array<{
     source: string; translation?: string | null; reason?: string; severity?: string;
-    resolution_status?: string; confidence?: number; resolver_attempts?: number;
+    state?: string; resolution_status?: string; confidence?: number; resolver_attempts?: number;
     fallback?: string; continue?: boolean;
   }>;
   request_statistics?: {
@@ -265,10 +266,10 @@ export default function TranslationWorkspace() {
       {job.dictionary_frozen && <p>Dictionary frozen for this batch · {job.dictionary_hash?.slice(0, 12)}</p>}
       {job.dictionary_report && <details className="dictionary-report" open={(job.dictionary_report.ignored_candidates ?? job.dictionary_report.report_only_terms ?? job.dictionary_report.provisional_terms ?? 0) > 0 || (job.dictionary_report.fatal_conflicts ?? 0) > 0}>
         <summary>Dictionary summary · {job.dictionary_report.confirmed_terms ?? job.dictionary_report.locked_terms ?? 0} confirmed · {job.dictionary_report.ignored_candidates ?? job.dictionary_report.report_only_terms ?? job.dictionary_report.provisional_terms ?? 0} ignored</summary>
-        <p>Confirmed: {job.dictionary_report.confirmed_terms ?? job.dictionary_report.locked_terms ?? 0} · Ignored candidates: {job.dictionary_report.ignored_candidates ?? job.dictionary_report.report_only_terms ?? job.dictionary_report.provisional_terms ?? 0} · Rejected generic: {job.dictionary_report.rejected_generic_candidates ?? 0} · Fatal conflicts: {job.dictionary_report.fatal_conflicts ?? 0}</p>
+        <p>Confirmed: {job.dictionary_report.confirmed_terms ?? job.dictionary_report.locked_terms ?? 0} · Ignored candidates: {job.dictionary_report.ignored_candidates ?? job.dictionary_report.report_only_terms ?? job.dictionary_report.provisional_terms ?? 0} · Rejected generic: {job.dictionary_report.rejected_generic_candidates ?? 0} · Removed contextual forms: {job.dictionary_report.removed_contextual_forms ?? 0} · Preserved identity forms: {job.dictionary_report.preserved_identity_forms ?? 0} · Fatal conflicts: {job.dictionary_report.fatal_conflicts ?? 0}</p>
         {(job.dictionary_review ?? []).map(entry => <article className="dictionary-review-entry" key={entry.source}>
           <strong>{entry.source}</strong>{entry.translation && <span> → {entry.translation}</span>}
-          <span> · {entry.severity ?? 'REVIEW_REQUIRED'} · {entry.reason ?? entry.resolution_status ?? 'Review required'}</span>
+          <span> · {entry.state === 'IGNORE' ? 'IGNORED' : entry.severity ?? 'REVIEW_REQUIRED'} · {entry.reason ?? entry.resolution_status ?? (entry.state === 'IGNORE' ? 'Ignored candidate' : 'Review required')}</span>
           {entry.confidence !== undefined && <span> · confidence {(entry.confidence * 100).toFixed(1)}%</span>}
           {entry.resolver_attempts !== undefined && <span> · {entry.resolver_attempts} resolver attempt(s)</span>}
           {entry.fallback && <span> · fallback: {entry.fallback}</span>}
