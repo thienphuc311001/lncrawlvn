@@ -37,6 +37,35 @@ identity evidence, gender evidence, conflicting VP readings, uncertainty and con
 Keep findings compact (under 2000 characters), retaining contradictions. Do not translate prose.
 """
 )
+ADDRESS_STYLE = """
+ADDRESS/TITLE STYLE. A Chinese title, honorific, kinship-style address, rank or
+official form of address is an identity reference with a semantic function, not
+free prose. Apply this fixed priority:
+1. preserve the canonical character identity;
+2. preserve the semantic function of the title/address form;
+3. preserve the novel's established Sino-Vietnamese style;
+4. prefer consistency with already confirmed terminology;
+5. only then optimize for modern Vietnamese naturalness.
+Never choose a rendering only because it is the most natural modern conversational
+wording. If the confirmed terminology uses Sino-Vietnamese address forms, prefer the
+compatible Sino-Vietnamese rendering over mixed modern forms such as anh..., chị...,
+ông..., sếp... unless RAW clearly requires modern conversational Vietnamese.
+Classify each form as exactly one of: literal_kinship, social_honorific,
+official_title, rank, role_reference, nickname, alias. Compare a new form against
+already confirmed forms of the same class. RAW decides whether a kinship word is a
+literal family relationship or only a social address form; a social address form
+attaches to the canonical identity with the established register.
+Preferred project renderings (keep the confirmed terminology when it already exists):
+哥->ca, 姐->tỷ, 弟->đệ, 妹->muội, 叔->thúc, 伯->bá, 爷->gia, 少爷->thiếu gia,
+小姐->tiểu thư, 将军->tướng quân, 科长->khoa trưởng, 处长->xử trưởng,
+署长->thự trưởng, 部长->bộ trưởng, 长官->trưởng quan. 唐姐 is Đường tỷ (never
+Chị Đường) when 唐姐 addresses 唐菲菲; 秦四爷 is Tần Tứ gia; 叶将军 is Diệp Tướng quân;
+邱长官 is Trưởng quan Khâu. Never create a separate character identity for a bare
+address form: 唐姐 stays forms["唐姐"] of 唐菲菲. Keep exactly one preferred
+Vietnamese rendering per confirmed Chinese reference form; never add a second
+rendering as an alias. Set form_kinds for every form you return, and use the
+translation_style and address_form fields of the request as authoritative context.
+"""
 RESOLVE = (
     AUTHORITY
     + """Resolve ONE candidate using all occurrence evidence and summaries.
@@ -59,6 +88,7 @@ consistent wording matters to the book. ACCEPT requires all eligibility checks t
 REVIEW requires a complete named/novel-specific unit whose consistency matters, with
 uncertain evidence. Never save generic vocabulary as a cumulative Book Dictionary.
 """
+    + ADDRESS_STYLE
 )
 BATCH_RESOLVE = (
     RESOLVE.replace(
@@ -112,6 +142,9 @@ RAW support. Follow relevant dictionary forms tied to corresponding source occur
 Use each confirmed canonical translation verbatim (capitalization may follow sentence grammar).
 Do not paraphrase or substitute synonyms for dictionary entries. For a forms key use
 that key's mapped address form; prefer the longest matching Chinese source name.
+Address/title forms must keep the mapped register: never replace a mapped
+Sino-Vietnamese address form with a colloquial kinship word (anh, chị, em, ông, bà,
+chú, bác, sếp) or the reverse without an explicit finding.
 The dictionary is frozen for this entire batch. Do not create new dictionary mappings.
 If a possible new term is uncertain, translate it naturally from RAW context and return
 unresolved_terms=[]; uncertainty is diagnostics, not a reason to mutate or block the
@@ -132,7 +165,8 @@ Check every explicit dictionary source/alias/form occurrence in RAW against its 
 Vietnamese wording in the corresponding segment, using the longest overlapping source
 name. The reported source is exactly that confirmed key; never append neighboring RAW
 characters from a context window. A fluent synonym is still a terminology error.
-Respect mapped address forms.
+Respect mapped address forms: a modern colloquial substitute for a mapped
+Sino-Vietnamese title/kinship form is a terminology error, and so is the reverse.
 Validate ONLY translation.title and translation.segments as the produced Vietnamese.
 Context and reference text are not translation output and must not be reported as errors.
 """

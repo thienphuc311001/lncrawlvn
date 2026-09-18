@@ -104,6 +104,8 @@ GOOGLE_AI_API_KEY_BACKUP=your optional backup Google AI Studio key
 GOOGLE_AI_API_KEY_THIRD=your optional third Google AI Studio key
 # More keys, if needed: GOOGLE_AI_API_KEYS=key3,key4
 TRANSLATION_WORKERS=2
+# Address/title register: sino-vietnamese (default for Chinese novels), modern, or auto
+TRANSLATION_DICTIONARY_REGISTER=sino-vietnamese
 ```
 
 Restart the backend after editing `.env`. This file is ignored by Git; keep it in the
@@ -194,7 +196,17 @@ namespace collisions and RAW presence are audited locally. Malformed inherited r
 are quarantined; different Chinese identities may share one Vietnamese target. Only
 CONFIRMED entries are frozen and enforced. A new uncertain term after freeze is
 diagnostic-only and cannot mutate the dictionary.
-The final dictionary is frozen with a stable hash **before the first translation**.
+
+Address and title forms keep one consistent style. Each confirmed Chinese reference form
+is classified as literal kinship, social honorific, official title, rank, role reference,
+nickname or alias, and a new form is compared against confirmed forms of the same class.
+The batch register is Sino-Vietnamese by default (`TRANSLATION_DICTIONARY_REGISTER`,
+also `sino-vietnamese`/`modern`/`auto`), so the resolver never picks a wording only
+because it is the most natural modern conversational option. Before freeze, a form that
+contradicts the register is rewritten to the established rendering (`唐姐` → `Đường tỷ`,
+`邱长官` → `Trưởng quan Khâu`) or dropped with an audit record; the canonical identity is
+never changed and a bare address form never becomes its own character. The final dictionary
+is frozen with a stable hash **before the first translation**.
 All chapters/chunks use this same hash. New uncertain terminology reported later is
 written to the ignored-term audit; it never changes the frozen dictionary or finalized work.
 
@@ -232,28 +244,33 @@ Use `(volume, number)` as the chapter identity when a volume is present, not `nu
 }
 ```
 
-The dictionary format is version 3. `entries` contains confirmed mappings only;
+The dictionary format is version 4. `entries` contains confirmed mappings only;
 ignored candidates are stored separately in audit/report checkpoints. A durable
 `dictionary-resolution-report.json` checkpoint and the job snapshot expose counts and
-reasons without turning diagnostics into enforcement rules.
+reasons without turning diagnostics into enforcement rules. `form_kinds` and
+`address_register` record the class and register enforced for the confirmed address
+forms, and the top-level `register` key makes re-freezing a checkpoint a fixed point.
 
 ```json
 {
-  "version": 3,
+  "version": 4,
   "entries": [
     {
-      "source": "邱途",
-      "translation": "Khâu Đồ",
+      "source": "唐菲菲",
+      "translation": "Đường Phỉ Phỉ",
       "type": "character",
       "status": "locked",
       "gender": "unknown",
       "aliases": [],
-      "forms": {"邱科长": "Khoa trưởng Khâu"},
+      "forms": {"唐姐": "Đường tỷ", "邱科长": "Khoa trưởng Khâu"},
+      "form_kinds": {"唐姐": "social_honorific", "邱科长": "official_title"},
+      "address_register": "sino-vietnamese",
       "evidence": "RAW evidence supporting this mapping",
       "runtime_state": "CONFIRMED"
     }
   ],
-  "statistics": {"total_terms": 1, "total_characters": 1, "total_locations": 0}
+  "statistics": {"total_terms": 1, "total_characters": 1, "total_locations": 0},
+  "register": "sino-vietnamese"
 }
 ```
 
@@ -271,7 +288,10 @@ unvalidated final artifacts.
 can resume with their original inputs. Confirmed mappings and valid completed chunks are
 reused; old provisional/report-only/fallback records migrate to IGNORE. Frozen dictionaries
 from incompatible terminology schemas are reduced to confirmed entries before translation,
-and contradictory confirmed mappings fail clearly rather than being guessed.
+and contradictory confirmed mappings fail clearly rather than being guessed. Cleaning an
+address/title form against the batch register rewrites or drops only that form, updates the
+dictionary hash and revalidates completed chapters through the existing compatible-hash
+path, so unaffected translation work is reused.
 
 Translation API routes:
 

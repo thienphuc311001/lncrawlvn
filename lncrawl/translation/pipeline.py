@@ -11,11 +11,13 @@ import asyncio
 from collections import Counter
 from types import MappingProxyType
 
-from . import prompts
+from . import prompts, style
 from .dictionary import (
-    export_dictionary,
+    AUDIT_ONLY_CLASSIFICATIONS,
     clean_identity_forms,
+    export_dictionary,
     load_legacy,
+    normalize_term_register,
     quantity_source_problem,
     relevant,
     sanity,
@@ -66,6 +68,11 @@ class Pipeline:
         self.decisions = {}
         self.ignored = {}
         self.form_cleanup = []
+        self._raw_contexts = None
+        self.register_cleanup = []
+        self.style_profile = {}
+        self.address_register = style.SINO_VIETNAMESE
+        self.address_register_source = "configured"
         self.outcomes = {}
         self.metrics = Counter()
         self.frozen_hash = None
@@ -242,7 +249,7 @@ class Pipeline:
             ),
             None,
         )
-        return {
+        payload = {
             "source": source,
             "frequency": candidate.get("frequency", 0),
             "signals": candidate.get("reasons", []),
@@ -250,6 +257,27 @@ class Pipeline:
             "representative_evidence": candidate.get("representative_evidence", []),
             "inherited_confirmed": inherited.model_dump() if inherited else None,
         }
+        # A title/kinship/address shape is not a character identity: tell the
+        # resolver its class and the register it must render it in.
+        address = style.address_payload(
+            source,
+            inherited.source if inherited else "",
+            inherited.translation if inherited else "",
+            self.address_register,
+            self.evidence_contexts(source),
+        )
+        if address:
+            payload["address_form"] = address
+        return payload
+
+    def evidence_contexts(self, source):
+        """Bounded RAW windows already selected for one candidate (no rescan)."""
+        candidate = self.index.get("candidates", {}).get(source, {})
+        return [
+            item.get("raw", "")
+            for item in candidate.get("representative_evidence", [])
+            if item.get("raw")
+        ]
 
     def ignore(self, source, reason, **extra):
         record = {"source": source, "state": "IGNORE", "reason": reason, **extra}
@@ -257,11 +285,15 @@ class Pipeline:
         self.store.write(f"term-audit/{digest(source)}.json", record)
 
     def raw_contexts(self):
-        return [
-            text
-            for raw, _ in self.pairs
-            for text in [raw.title, *raw.paragraphs]
-        ]
+        # Called once per confirmed term by the register guard, so the whole
+        # batch's paragraphs are collected at most once.
+        if self._raw_contexts is None:
+            self._raw_contexts = [
+                text
+                for raw, _ in self.pairs
+                for text in [raw.title, *raw.paragraphs]
+            ]
+        return self._raw_contexts
 
     def record_form_cleanup(self, problems):
         cleanup = [
@@ -278,6 +310,69 @@ class Pipeline:
         self.local(
             "dictionary_form_cleanup",
             f"Removed contextual pseudo-forms: {removed}; preserved identity forms: {preserved}",
+        )
+
+    def record_register_cleanup(self, problems):
+        """Audit address/title forms that were normalized or dropped locally."""
+        cleanup = [
+            problem
+            for problem in problems
+            if problem.get("classification") == "register_form_cleanup"
+        ]
+        if not cleanup:
+            return
+        self.register_cleanup.extend(cleanup)
+        normalized = sum(len(item.get("normalizations", [])) for item in cleanup)
+        removed = sum(len(item.get("removed_forms", [])) for item in cleanup)
+        self.store.write(
+            "dictionary-register-cleanup.json", {"entries": self.register_cleanup}
+        )
+        self.local(
+            "dictionary_register_cleanup",
+            f"Register {self.address_register}: normalized forms={normalized}; removed forms={removed}",
+        )
+
+    def refresh_style(self):
+        """Derive the batch address/title register from confirmed terminology."""
+        stored = style.stored_register(
+            self.store.read("frozen-dictionary.json"),
+            self.terms.values(),
+        )
+        self.style_profile = style.profile(
+            self.terms.values(),
+            self.policy.min_register_evidence,
+            self.policy.min_register_dominance,
+        )
+        if stored in (style.SINO_VIETNAMESE, style.MODERN):
+            self.address_register, self.address_register_source = stored, "stored"
+        else:
+            self.address_register, self.address_register_source = style.effective_register(
+                self.policy.address_register, self.style_profile
+            )
+        self.style_profile["register"] = self.address_register
+        self.style_profile["source"] = self.address_register_source
+        self.store.write("dictionary-style-profile.json", self.style_profile)
+        return self.style_profile
+
+    def apply_register_policy(self, term, reason):
+        """Normalize or drop address forms that contradict the batch register."""
+        normalizations, removed = normalize_term_register(
+            term, self.address_register, self.evidence_contexts(term.source)
+        )
+        if not normalizations and not removed:
+            return
+        self.record_register_cleanup(
+            [
+                {
+                    "classification": "register_form_cleanup",
+                    "source": term.source,
+                    "register": self.address_register,
+                    "normalizations": normalizations,
+                    "removed_forms": removed,
+                    "preserved_forms": sorted(term.forms),
+                    "reason": reason,
+                }
+            ]
         )
 
     def apply_resolution(self, source, inherited, result):
@@ -310,6 +405,16 @@ class Pipeline:
         term.forms.pop(term.source, None)
         if term.source != source and source not in [*term.aliases, *term.forms]:
             raise QualityError(f"Resolver lost source term {source}")
+        # A surname-prefixed address form is a reference to a person, never a
+        # person: 唐姐 must be attached to 唐菲菲, not created as its own
+        # character.  Bare nicknames (老秦) and bare titles stay eligible
+        # because they can be the only attested way a character is named.
+        spec = style.address_spec(source)
+        if spec and spec["surname"] and term.source == source:
+            raise QualityError(
+                f"address form {source} cannot be a canonical identity; "
+                "attach it to the proven full name"
+            )
 
         inherited_names = (
             [inherited.source, *inherited.aliases, *inherited.forms] if inherited else []
@@ -364,6 +469,14 @@ class Pipeline:
             term.gender = existing.gender
             term.aliases = sorted(set(existing.aliases + term.aliases))
             term.forms = {**term.forms, **existing.forms}
+            term.form_kinds = {**term.form_kinds, **existing.form_kinds}
+
+        # Address/title forms must keep the batch register: rewrite them to the
+        # deterministic established rendering, or drop the form and keep only
+        # the canonical identity.
+        self.apply_register_policy(
+            term, "aligned resolver address/title forms with the batch register"
+        )
 
         for name in [*term.aliases, *term.forms]:
             other = next(
@@ -434,7 +547,14 @@ class Pipeline:
             result = await self.ai(
                 f"batch:terminology:{digest(page_sources)}",
                 prompts.BATCH_RESOLVE,
-                {"candidates": page},
+                {
+                    "candidates": page,
+                    "translation_style": style.resolver_context(
+                        self.address_register,
+                        self.address_register_source,
+                        self.style_profile,
+                    ),
+                },
                 BatchResolution,
                 operation="terminology_resolver",
                 reason="Ambiguous plausible terminology candidates",
@@ -565,9 +685,19 @@ class Pipeline:
                 "fatal_conflicts": 0,
                 "removed_contextual_forms": removed_forms,
                 "preserved_identity_forms": preserved_forms,
+                "register": self.address_register,
+                "register_source": self.address_register_source,
+                "register_conflicts": sum(
+                    len(item.get("removed_forms", [])) for item in self.register_cleanup
+                ),
+                "register_normalizations": sum(
+                    len(item.get("normalizations", [])) for item in self.register_cleanup
+                ),
             },
             "entries": entries,
             "form_cleanup": self.form_cleanup,
+            "register_cleanup": self.register_cleanup,
+            "style_profile": self.style_profile,
             "policy": self.policy.model_dump(),
             "metrics": dict(self.metrics),
         }
@@ -576,6 +706,7 @@ class Pipeline:
         """Parse candidates from RAW, use VP as evidence, then freeze once."""
         inherited, problems = load_legacy(inputs.get("dictionary"))
         self.record_form_cleanup(problems)
+        self.record_register_cleanup(problems)
         self.store.write("legacy-audit.json", problems)
         fatal = [item for item in problems if item.get("classification") == "fatal"]
         if fatal:
@@ -622,6 +753,9 @@ class Pipeline:
                             }
                         ]
                     )
+                self.apply_register_policy(
+                    term, "aligned checkpointed address/title forms with the batch register"
+                )
                 if term.enforceable:
                     loaded_terms.append(term)
             self.terms = {term.source: term for term in loaded_terms}
@@ -652,6 +786,14 @@ class Pipeline:
             raise QualityError(
                 "Confirmed dictionary has duplicate source identities: "
                 + ", ".join(sorted(conflicts)[:20])
+            )
+
+        # Derive the batch style profile before the resolver runs, then apply it
+        # to the confirmed set so the resolver sees one consistent register.
+        self.refresh_style()
+        for term in self.terms.values():
+            self.apply_register_policy(
+                term, "aligned confirmed address/title forms with the batch register"
             )
 
         pending = []
@@ -714,10 +856,11 @@ class Pipeline:
     def freeze(self, dictionary):
         terms, invalid = load_legacy(dictionary)
         self.record_form_cleanup(invalid)
+        self.record_register_cleanup(invalid)
         invalid = [
             problem
             for problem in invalid
-            if problem.get("classification") != "form_cleanup"
+            if problem.get("classification") not in AUDIT_ONLY_CLASSIFICATIONS
         ]
         if invalid:
             raise QualityError("Malformed frozen dictionary checkpoint")
@@ -726,6 +869,7 @@ class Pipeline:
         }
         sanity(confirmed, allow_shared_translations=True)
         self.terms = MappingProxyType(confirmed)
+        self.refresh_style()
         self.frozen_hash = digest(export_dictionary(self.terms))
         self.progress(
             "Dictionary frozen",
@@ -1097,6 +1241,7 @@ class Pipeline:
         if not frozen:
             await self.prepare_dictionary(inputs)
         self.assert_frozen()
+        self.refresh_style()
         self.store.write("dictionary-resolution-report.json", self.dictionary_report())
         await self.parallel(self.pairs, self.chapter)
         self.assert_frozen()

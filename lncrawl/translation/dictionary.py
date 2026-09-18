@@ -4,6 +4,7 @@ import re
 import unicodedata
 from collections import Counter, defaultdict
 
+from . import style
 from .models import CONFIRMED, DICTIONARY_VERSION, IGNORE, Term
 from .parsing import HAN
 
@@ -46,6 +47,9 @@ REFERENCE_SUFFIX = re.compile(
     r"(?:" + "|".join(map(re.escape, REFERENCE_SUFFIXES)) + r")$"
 )
 NICKNAME = re.compile(r"^(?:老|小|阿)[\u3400-\u9fff]{1,3}$")
+# Non-enforceable audit records: they document local cleanup instead of
+# rejecting a checkpoint.
+AUDIT_ONLY_CLASSIFICATIONS = frozenset({"form_cleanup", "register_form_cleanup"})
 IDENTITY_CUE = re.compile(
     r"(?:就是|是|名为|名字是|叫做|称为|原名|又名|也叫|被称为|"
     r"升为|晋升为|改称|改任|成为)"
@@ -157,7 +161,7 @@ def identity_form_problem(term, name, contexts=(), require_evidence=False):
         if REFERENCE_SUFFIX.search(suffix) or evidence:
             return None
         return "canonical character plus contextual residue"
-    if REFERENCE_SUFFIX.search(name) or NICKNAME.fullmatch(name):
+    if style.ADDRESS_SUFFIX.search(name) or NICKNAME.fullmatch(name):
         if require_evidence and not evidence:
             return "character reference identity is not independently proven"
         return None
@@ -192,6 +196,20 @@ def clean_identity_forms(term, contexts=(), require_evidence=False):
     term.aliases = sorted(set(aliases))
     term.forms = forms
     return removed, sorted(set(preserved))
+def normalize_term_register(term, register, contexts=()):
+    """Apply the batch address/title register to one confirmed term.
+
+    Returns ``(normalizations, removed)``.  The canonical identity and its
+    canonical translation are never modified.
+    """
+    normalizations, removed = [], []
+    if term.type not in style.CHARACTER_TYPES:
+        return normalizations, removed
+    _kinds, normalizations, removed = style.normalize_forms(term, register, contexts)
+    return normalizations, removed
+
+
+
 
 
 def term_problem(term, known=()):
@@ -377,11 +395,35 @@ def load_legacy(data):
             )
     for source in conflicts:
         terms[source].status = "provisional"
+    register = style.stored_register(data, terms.values())
+    if register is None:
+        register, _source = style.effective_register(
+            style.configured_register(), style.profile(terms.values())
+        )
+    for term in terms.values():
+        normalized, removed = normalize_term_register(term, register)
+        if not normalized and not removed:
+            continue
+        problems.append(
+            {
+                "classification": "register_form_cleanup",
+                "source": term.source,
+                "register": register,
+                "normalizations": normalized,
+                "removed_forms": removed,
+                "preserved_forms": sorted(term.forms),
+                "reason": "aligned address/title forms with the batch register",
+            }
+        )
     return list(terms.values()), problems
 
 
 def sanity(terms, allow_shared_translations=True):
     errors, owners = [], {}
+    register, _source = style.effective_register(
+        style.configured_register(),
+        style.profile(term for term in terms.values() if term.enforceable),
+    )
     # Only confirmed mappings are part of the strict namespace.  Ignored
     # diagnostics are deliberately not allowed to make a batch fail.
     strict = {source: term for source, term in terms.items() if term.enforceable}
@@ -394,6 +436,11 @@ def sanity(terms, allow_shared_translations=True):
                 form_problem = identity_form_problem(term, name)
                 if form_problem:
                     errors.append(f"{source}.{name}: {form_problem}")
+            for name, value in term.forms.items():
+                spec = style.address_spec(name, source)
+                register_problem = style.conflict(spec, value, register)
+                if register_problem:
+                    errors.append(f"{source}.{name}: {register_problem}")
         for name in [source, *term.aliases, *term.forms]:
             if name in owners and owners[name] != source:
                 errors.append(f"{name}: alias/canonical collision")
@@ -655,10 +702,15 @@ def export_dictionary(terms, include_ignored=False):
         for field in ("confidence", "resolver_source", "fallback"):
             if value.get(field) is None:
                 value.pop(field, None)
+        if not value.get("form_kinds"):
+            value.pop("form_kinds", None)
+        if value.get("address_register") is None:
+            value.pop("address_register", None)
         return value
 
     strict = [terms[s] for s in sorted(terms) if terms[s].enforceable]
     ignored = [terms[s] for s in sorted(terms) if not terms[s].enforceable]
+    register = style.stored_register(None, strict)
     result = {
         "version": DICTIONARY_VERSION,
         "entries": [exported(term) for term in strict],
@@ -673,6 +725,8 @@ def export_dictionary(terms, include_ignored=False):
             "total_locations": sum(t.type == "location" for t in strict),
         },
     }
+    if register:
+        result["register"] = register
     if include_ignored:
         result["ignored"] = [exported(term) for term in ignored]
     return result

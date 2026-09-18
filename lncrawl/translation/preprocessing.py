@@ -5,6 +5,7 @@ import re
 import unicodedata
 from collections import Counter, defaultdict
 
+from . import style
 from .dictionary import REFERENCE_SUFFIX, quantity_source_problem, source_name, source_problem
 from .models import Term
 
@@ -138,7 +139,40 @@ DESCRIPTIVE_MARKERS = {
     "数量",
     "办法",
 }
-TITLE_PATTERN = re.compile(r"(?:副)?(?:署长|科长|处长|将军|上校|队长|长官|先生|小姐|掌门)$")
+# A locally discovered title/address shape is not a character identity.  It
+# stays a report-only reference unless RAW proves the full identity; a bare
+# kinship address such as 唐姐 must never become its own dictionary character.
+TITLE_PATTERN = re.compile(
+    r"(?:副)?(?:"
+    + "|".join(
+        sorted(
+            {
+                "署长",
+                "科长",
+                "处长",
+                "将军",
+                "上校",
+                "队长",
+                "长官",
+                "先生",
+                "小姐",
+                "掌门",
+                "师兄",
+                "师姐",
+                "师弟",
+                "师妹",
+                "前辈",
+                "大人",
+                "阁下",
+                "殿下",
+                *style.KINSHIP_SUFFIXES,
+            },
+            key=len,
+            reverse=True,
+        )
+    )
+    + r")$"
+)
 
 
 def classify_candidate(source, reasons, contexts, frequency=0, inherited=False):

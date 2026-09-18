@@ -73,12 +73,63 @@ mapping change or dictionary mutation is permitted.
 
 Character aliases/forms are identity references, not context translations. Resolver
 metadata is cleaned before insertion: canonical-name-plus-predicate fragments such as
-`邱途来` and `邱途接` are removed, while independently supported title/nickname forms
-such as `邱科长`, `邱探员` and `老邱` may remain. A form must be independently attested
-in RAW and have a reference shape or explicit co-reference evidence; a context window
-or VietPhrase phrase cannot become a form. Legacy frozen dictionaries and resolved-term
-checkpoints go through the same cleanup. Cleanup writes a concise audit and produces a
-new dictionary hash.
+`邱途来` and `邱途接` are removed, while independently supported title, honorific,
+kinship and nickname forms such as `邱科长`, `邱探员`, `唐姐` and `老邱` may remain. A
+form must be independently attested in RAW and have a reference shape or explicit
+co-reference evidence; a context window or VietPhrase phrase cannot become a form.
+Legacy frozen dictionaries and resolved-term checkpoints go through the same cleanup.
+Cleanup writes a concise audit and produces a new dictionary hash.
+
+## Translation style and address register
+
+A Chinese title, honorific, kinship-style address, rank or official form of address is
+an identity reference with a semantic function, not free prose. The resolver may not
+choose a Vietnamese rendering only because it is the most natural modern conversational
+wording. The fixed priority is:
+
+```text
+1. preserve the canonical character identity
+2. preserve the semantic function of the title/address form
+3. preserve the novel's established Sino-Vietnamese style
+4. prefer consistency with existing confirmed terminology
+5. only then optimize for modern Vietnamese naturalness
+```
+
+Every confirmed Chinese reference form is classified as exactly one of
+`literal_kinship`, `social_honorific`, `official_title`, `rank`, `role_reference`,
+`nickname` or `alias`, so a new form is compared against confirmed forms of the same
+class. The batch register is `sino-vietnamese` by default
+(`TRANSLATION_DICTIONARY_REGISTER`); `modern` expects modern Vietnamese, and `auto`
+derives the register from confirmed terminology and falls back to the Sino-Vietnamese
+baseline. The register recorded by a frozen dictionary or by the confirmed terms
+outranks an auto-derived profile, so re-freezing a checkpoint stays a fixed point.
+
+```text
+inherited + locally confirmed + resolver-accepted terms
+        ↓ derive the class-scoped style profile (local, no model calls)
+batch register  →  resolver request (translation_style + per-candidate address_form)
+                →  deterministic guard before freeze
+                →  frozen dictionary + dictionary-style-profile.json
+```
+
+The guard only touches forms whose Chinese shape has a known address suffix. A form
+whose wording contradicts the batch register is rewritten to the deterministic
+established rendering when the shape is unambiguous (`唐姐` → `Đường tỷ`,
+`老秦` → `Lão Tần`, `秦四爷` → `Tần Tứ gia`, `邱科长` → `Khoa trưởng Khâu`,
+`邱长官` → `Trưởng quan Khâu`, `唐副署长` → `Phó thự trưởng Đường`), and otherwise
+dropped with an audit record instead of being guessed. The canonical identity and its
+canonical translation are never modified, `唐姐` is never promoted to its own character
+identity, and exactly one preferred Vietnamese rendering is kept per confirmed Chinese
+key. A surname-prefixed address form is never promoted into its own character identity:
+RAW that does not prove the full name keeps it a report-only `IGNORE` reference in
+candidate discovery, and a resolver result that returns it as a bare canonical source is
+rejected so it can only exist as a form of the proven identity (bare nicknames such as
+`老秦` and bare titles stay eligible, because they can be the only attested way a
+character is named). RAW alone decides whether a kinship word is
+a literal family relationship or only a social address form; that answer is recorded as
+a hint and never used to mix registers. Rewrites and drops are written to
+`dictionary-register-cleanup.json` and counted as `register_normalizations` and
+`register_conflicts` in the dictionary report.
 
 ## Translation contract
 
@@ -137,6 +188,8 @@ The job writes:
 - `translated.json` and the CLI's final Vietnamese TXT/export;
 - `dictionary.json` and `frozen-dictionary.json` containing confirmed entries only;
 - `dictionary-audit.json` and the existing resolution report for ignored candidates;
+- `dictionary-style-profile.json`, `dictionary-register-cleanup.json` and
+  `dictionary-form-cleanup.json` for the derived style and local cleanup audits;
 - parser, alignment, chunk, chapter and validation checkpoints.
 
 Normal logs report parsed/aligned chapters, RAW candidates, ignored candidates,

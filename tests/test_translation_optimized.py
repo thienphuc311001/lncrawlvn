@@ -392,6 +392,10 @@ class OptimizedPipelineTests(unittest.IsolatedAsyncioTestCase):
                     "gender": "unknown",
                     "aliases": [],
                     "evidence": "",
+                    # The confirmed address form keeps its class and the batch
+                    # register that was enforced for it.
+                    "form_kinds": {"秦科长": "official_title"},
+                    "address_register": "sino-vietnamese",
                     "runtime_state": "CONFIRMED",
                 }],
             )

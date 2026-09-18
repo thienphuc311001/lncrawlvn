@@ -6,9 +6,11 @@ from typing import Dict, List, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 
+from .style import AUTO, MODERN, SINO_VIETNAMESE, configured_register
+
 MODELS = ("gemini-3.1-flash-lite", "gemini-3.5-flash-lite", "gemini-3.7-flash")
-PIPELINE_VERSION = 7
-DICTIONARY_VERSION = 3
+PIPELINE_VERSION = 8
+DICTIONARY_VERSION = 4
 PARSER_VERSION = 5
 CONFIRMED = "CONFIRMED"
 IGNORE = "IGNORE"
@@ -28,6 +30,11 @@ class ResolutionPolicy(StrictModel):
     min_contexts: int = Field(default=3, ge=1, le=100)
     min_dominance: float = Field(default=0.95, ge=0.5, le=1.0)
     min_coverage: float = Field(default=0.95, ge=0.5, le=1.0)
+    # Address/title register.  Sino-Vietnamese is the project default, so the
+    # resolver may not silently drift into modern conversational wording.
+    address_register: Literal[SINO_VIETNAMESE, MODERN, AUTO] = SINO_VIETNAMESE
+    min_register_evidence: int = Field(default=2, ge=1, le=1000)
+    min_register_dominance: float = Field(default=0.6, ge=0.5, le=1.0)
 
     @classmethod
     def from_environment(cls):
@@ -39,6 +46,9 @@ class ResolutionPolicy(StrictModel):
             min_contexts=number("TRANSLATION_DICTIONARY_MIN_CONTEXTS", 3),
             min_dominance=number("TRANSLATION_DICTIONARY_MIN_DOMINANCE", 0.95),
             min_coverage=number("TRANSLATION_DICTIONARY_MIN_COVERAGE", 0.95),
+            address_register=configured_register(),
+            min_register_evidence=number("TRANSLATION_DICTIONARY_REGISTER_MIN_EVIDENCE", 2),
+            min_register_dominance=number("TRANSLATION_DICTIONARY_REGISTER_MIN_DOMINANCE", 0.6),
         )
 
 
@@ -117,6 +127,11 @@ class Term(StrictModel):
     gender: Literal["male", "female", "unknown"] = "unknown"
     aliases: List[str] = Field(default_factory=list)
     forms: Dict[str, str] = Field(default_factory=dict)
+    # Address/title class of each form (kinship, honorific, official title,
+    # rank, role, nickname, alias) and the register enforced for them, so a
+    # frozen dictionary documents its own style instead of re-deriving it.
+    form_kinds: Dict[str, str] = Field(default_factory=dict)
+    address_register: Optional[Literal[SINO_VIETNAMESE, MODERN]] = None
     evidence: str = ""
     semantic_resolution: Literal["resolved", "unresolved"] = "resolved"
     needs_review: bool = False
@@ -175,6 +190,7 @@ class ResolverTerm(StrictModel):
     gender: str = "unknown"
     aliases: List[str] = Field(default_factory=list)
     forms: Dict[str, str] = Field(default_factory=dict)
+    form_kinds: Dict[str, str] = Field(default_factory=dict)
     evidence: str = ""
     semantic_resolution: Literal["resolved", "unresolved"] = "resolved"
     needs_review: bool = False
