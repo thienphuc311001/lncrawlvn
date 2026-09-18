@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState, type ReactNode } from 'react';
+import { useEffect, useId, useRef, useState, type ReactNode } from 'react';
 
 const API = 'http://127.0.0.1:8000/api/translation';
 type TranslationEvent = {
@@ -55,25 +55,81 @@ function ErrorNotice({ detail }: { detail: unknown }) {
   return <div role="alert" className="error-text">{readableError(detail)}</div>;
 }
 
-function TranslationLog({ logs = [] }: { logs?: TranslationEvent[] }) {
-  return <section className="translation-log" aria-label="Translation activity">
-    <h3>Translation activity</h3>
-    <p className="muted">Primary → Fallback → Backup. A later model is used only after the preceding model fails. Latest 100 events, newest first.</p>
-    {logs.length === 0 ? <p>No activity recorded yet.</p> : <ol role="log" aria-live="polite" aria-relevant="additions" className="translation-log-events">
-      {[...logs].reverse().map((event, index) => <li key={event.id ?? `${event.timestamp ?? ''}-${logs.length - index}`}>
-        <div className="translation-log-meta">
-          {event.timestamp && <time dateTime={event.timestamp}>{event.timestamp.replace('T', ' ').replace(/\.\d+/, '')}</time>}
-          <strong className={`translation-log-status translation-log-status-${event.status}`}>{event.status}</strong>
-          {event.task && <span>{event.task}</span>}
-          {event.operation && <span>{event.operation.replaceAll('_', ' ')}</span>}
-          {event.model && <span>{event.model}</span>}
-          {event.key_slot && <span>Key slot {event.key_slot}</span>}
-          {event.category && <span>{event.category}</span>}
-          {event.attempt && <span>Attempt {event.attempt}/2</span>}
-        </div>
-        {(event.error || event.message || event.reason) && <p>{event.error ?? event.message ?? event.reason}</p>}
-      </li>)}
-    </ol>}
+function translationLogText(event: TranslationEvent): string {
+  const metadata = [
+    event.status.toUpperCase(), event.task, event.operation?.replaceAll('_', ' '), event.model,
+    event.key_slot !== undefined ? `Key slot ${event.key_slot}` : null,
+    event.category, event.attempt !== undefined ? `Attempt ${event.attempt}/2` : null,
+    event.retry_after !== undefined ? `Retry after ${event.retry_after}s` : null,
+  ].filter(Boolean).join(' · ');
+  const timestamp = event.timestamp ? `[${event.timestamp.replace('T', ' ').replace(/\.\d+/, '')}] ` : '';
+  const message = event.error ?? event.message ?? event.reason;
+  return `${timestamp}${metadata}${message ? ` — ${message}` : ''}`;
+}
+
+function translationLogLevel(event: TranslationEvent): string {
+  if (event.status === 'failed' || event.status === 'error') return 'error';
+  if (['retrying', 'fallback', 'key_rotation', 'rate_limit_cooldown', 'waiting_for_rate_limit', 'cancelled', 'interrupted'].includes(event.status)) return 'warning';
+  return '';
+}
+
+function TranslationLog({ logs = [], status }: { logs?: TranslationEvent[]; status: string }) {
+  const [open, setOpen] = useState(true);
+  const [copied, setCopied] = useState(false);
+  const boxRef = useRef<HTMLDivElement | null>(null);
+  const copyTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const bodyId = useId();
+  const running = status === 'pending' || status === 'running';
+  const consoleStatus = running ? 'running' : status === 'done' ? 'done' : status === 'failed' ? 'failed' : 'idle';
+  const visible = logs.slice(-100);
+  const logText = visible.map(translationLogText).join('\n');
+
+  useEffect(() => {
+    const box = boxRef.current;
+    if (box && open) box.scrollTop = box.scrollHeight;
+  }, [logText, open]);
+
+  useEffect(() => () => {
+    if (copyTimer.current !== null) clearTimeout(copyTimer.current);
+  }, []);
+
+  async function copyLog() {
+    try {
+      await navigator.clipboard.writeText(logText);
+      setCopied(true);
+      if (copyTimer.current !== null) clearTimeout(copyTimer.current);
+      copyTimer.current = setTimeout(() => setCopied(false), 1500);
+    } catch {
+      setCopied(false);
+    }
+  }
+
+  return <section className={`job-console translation-log${open ? ' open' : ''}`} aria-label="Translation activity">
+    <header className="job-console-head">
+      <button type="button" className="job-console-title" onClick={() => setOpen(value => !value)}
+        aria-expanded={open} aria-controls={bodyId} title={open ? 'Thu gọn' : 'Mở rộng'}>
+        <span className={`jc-dot ${consoleStatus}`} aria-hidden="true" />
+        <span className={`jc-status ${consoleStatus}`}>{status.toUpperCase()}</span>
+        <span className="jc-name">Translation activity</span>
+        <span className="jc-meta" title="Latest 100 events, oldest first">{visible.length} dòng</span>
+      </button>
+      <div className="job-console-actions">
+        <button type="button" className="btn btn-ghost" disabled={!visible.length} onClick={() => void copyLog()}>
+          {copied ? '✓ Đã copy' : '⧉ Copy'}
+        </button>
+        <button type="button" className="btn btn-ghost" onClick={() => setOpen(value => !value)}
+          aria-label={open ? 'Thu gọn translation console' : 'Mở rộng translation console'} aria-expanded={open} aria-controls={bodyId}>
+          {open ? '▾' : '▴'}
+        </button>
+      </div>
+    </header>
+    {open && <div id={bodyId} className="job-console-body" role="log" aria-label="Translation events"
+      aria-live="polite" aria-relevant="additions" tabIndex={0} ref={boxRef}>
+      {!visible.length && <span className="line muted">No activity recorded yet.</span>}
+      {visible.map((event, index) => <span key={event.id ?? `${event.timestamp ?? ''}-${index}`}
+        className={`line line-in ${translationLogLevel(event)}`}>{translationLogText(event)}</span>)}
+      {running && <span className="line"><span className="job-cursor" aria-hidden="true" /></span>}
+    </div>}
   </section>;
 }
 
@@ -198,7 +254,7 @@ export default function TranslationWorkspace() {
         <a className="btn btn-primary" href={`${API}/jobs/${job.job_id}/outputs/translated.json`}>Translated Chapters</a>
         <a className="btn btn-primary" href={`${API}/jobs/${job.job_id}/outputs/dictionary.json`}>Updated Book Dictionary</a>
       </div>}
-      <TranslationLog logs={job.logs} />
+      <TranslationLog key={job.job_id} logs={job.logs} status={job.status} />
       {job.request_statistics && <details className="translation-statistics"><summary>Request statistics · {job.request_statistics.total_requests} API requests</summary>
         <table><thead><tr><th>Operation</th><th>Logical calls</th><th>API attempts</th></tr></thead><tbody>
           {Object.entries(job.request_statistics.requests).map(([operation, count]) => <tr key={operation}>

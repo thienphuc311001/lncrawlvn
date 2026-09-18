@@ -27,12 +27,12 @@ type TestModule = {
   errorDetail: (error: unknown) => unknown;
 };
 
-function load({ job = null, error = null, detail = null, status = 422 }: {
-  job?: Record<string, unknown> | null; error?: unknown; detail?: unknown; status?: number;
+function load({ job = null, error = null, detail = null, status = 422, logOpen = true }: {
+  job?: Record<string, unknown> | null; error?: unknown; detail?: unknown; status?: number; logOpen?: boolean;
 } = {}) {
   const module = { exports: {} as TestModule };
-  // Mirror the six workspace states: files, jobs, selected job, config, error, busy.
-  const states = [{}, [], job, null, error, false];
+  // Workspace states followed by the nested console's open/copy states.
+  const states = [{}, [], job, null, error, false, logOpen, false];
   let stateIndex = 0;
   const calls: string[] = [];
   runInNewContext(script, {
@@ -41,6 +41,8 @@ function load({ job = null, error = null, detail = null, status = 422 }: {
       assert.ok(stateIndex < states.length, 'Update state fixtures if workspace hooks change.');
       return [states[stateIndex++], () => {}];
     },
+    useRef: React.useRef,
+    useId: React.useId,
     useEffect: () => {}, // No polling/network effects during an offline render.
     fetch: async (url: string) => {
       calls.push(url);
@@ -143,7 +145,41 @@ test('model attempts, fallback reasons and final failure are visible in activity
   ] } });
   const html = renderToStaticMarkup(React.createElement(api.TranslationWorkspace));
   for (const text of ['Translation activity', 'role="log"', 'gemini-3.1-flash-lite', 'gemini-3.5-flash-lite', 'gemini-3.7-flash', 'Attempt 1/2', 'Key slot 1', 'RPM_LIMIT', 'Suspended for 60 seconds', 'Daily quota exhausted', 'Switching to fallback', 'HTTP 503 &lt;unsafe&gt;']) assert.ok(html.includes(text), text);
-  assert.ok(html.indexOf('HTTP 503') < html.indexOf('Switching to fallback'), 'Newest event appears first');
+  assert.ok(html.indexOf('HTTP 503') > html.indexOf('Switching to fallback'), 'Newest event appears last, like the crawler console');
+  assert.ok(html.includes('job-console translation-log open'));
+  assert.ok(html.includes('job-console-head'));
+  assert.ok(html.includes('job-console-body'));
+  assert.ok(html.includes('class="line line-in error"'));
+  assert.ok(html.includes('class="line line-in warning"'));
+  assert.ok(html.includes('⧉ Copy'));
+  assert.ok(html.includes('aria-expanded="true"'));
+});
+
+test('translation console bounds history and preserves retry metadata', () => {
+  const logs = Array.from({ length: 105 }, (_, index) => ({
+    id: String(index), status: 'retrying', message: `event-${index}-end`, retry_after: 60,
+  }));
+  const api = load({ job: { job_id: 'test', status: 'running', logs } });
+  const html = renderToStaticMarkup(React.createElement(api.TranslationWorkspace));
+  assert.ok(!html.includes('event-4-end'));
+  assert.ok(html.includes('event-5-end'));
+  assert.ok(html.includes('event-104-end'));
+  assert.ok(html.includes('100 dòng'));
+  assert.ok(html.includes('Retry after 60s'));
+  assert.ok(html.includes('job-cursor'));
+});
+
+test('empty and collapsed consoles retain the crawler-style header', () => {
+  const empty = load({ job: { job_id: 'test', status: 'done' } });
+  const html = renderToStaticMarkup(React.createElement(empty.TranslationWorkspace));
+  assert.ok(html.includes('No activity recorded yet.'));
+  assert.ok(html.includes('disabled="">⧉ Copy'));
+  assert.ok(!html.includes('job-cursor'));
+  const collapsed = load({ job: { job_id: 'test', status: 'running' }, logOpen: false });
+  const collapsedHtml = renderToStaticMarkup(React.createElement(collapsed.TranslationWorkspace));
+  assert.ok(collapsedHtml.includes('Translation activity'));
+  assert.ok(collapsedHtml.includes('aria-expanded="false"'));
+  assert.ok(!collapsedHtml.includes('role="log"'));
 });
 
 test('frozen dictionary, request reasons and local zero-request statistics are visible', () => {

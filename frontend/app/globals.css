@@ -651,15 +651,24 @@ html { scroll-behavior: smooth; }
 .translation-progress { border: 1px solid var(--border); border-radius: 12px; padding: 24px; margin-block: 24px; }
 .translation-downloads { display: flex; flex-wrap: wrap; gap: 12px; }
 .translation-workspace p { margin-block: 12px; }
-.translation-log { margin-top: 24px; border-top: 1px solid var(--border); padding-top: 20px; }
-.translation-log-events { max-height: 380px; overflow-y: auto; list-style: none; padding: 0; }
-.translation-log-events li { border-bottom: 1px solid var(--border); padding: 12px 4px; overflow-wrap: anywhere; }
-.translation-log-meta { display: flex; flex-wrap: wrap; gap: 8px 12px; font-size: 0.85rem; }
-.translation-log-meta time { color: var(--muted); }
-.translation-log-status { text-transform: uppercase; }
-.translation-log-status-failed { color: #dc2626; }
-.translation-log-status-success, .translation-log-status-done { color: #228b36; }
-.translation-log-status-running, .translation-log-status-retrying, .translation-log-status-fallback, .translation-log-status-key_rotation { color: #a16207; }
+/* Reuse the crawler terminal styles without its fixed bottom dock. */
+.translation-log.job-console {
+  position: relative;
+  inset: auto;
+  z-index: auto;
+  margin-top: 24px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  overflow: hidden;
+  box-shadow: none;
+}
+.translation-log .job-console-head { padding: 10px 16px; flex-wrap: wrap; }
+.translation-log .job-console-title { flex: 1; flex-wrap: wrap; }
+.translation-log .job-console-body { padding: 16px 16px 20px; }
+@media (max-width: 600px) {
+  .translation-log .job-console-title { flex-basis: 100%; }
+  .translation-log .job-console-actions { margin-left: auto; }
+}
 .translation-statistics { margin-top: 20px; }
 .translation-statistics summary { cursor: pointer; }
 .translation-statistics table { width: 100%; margin-top: 12px; border-collapse: collapse; }
