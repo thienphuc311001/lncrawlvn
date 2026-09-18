@@ -182,23 +182,21 @@ prints those request events. If all three models fail, the error reports each mo
 failure in the configured order, rather than showing only the last backup error.
 
 The mandatory global dictionary phase scans the **entire input batch locally** before
-any translation. It indexes every occurrence of each candidate, analyzes VietPhrase
-readings, reuses valid inherited source/alias/form mappings, and samples compact RAW
-and VP evidence without AI summaries. Very consistent, verified full-name readings
-can become local provisional entries; identity, gender, titles and alias relationships
-are never inferred from frequency alone. Other candidates are resolved in dynamic
-context-size batches with independent source-tagged decisions. Invalid independent
-results receive at most two targeted corrections without discarding valid decisions.
+any translation. Candidates originate in RAW; aligned VietPhrase readings are only
+supporting evidence. Generic phrases, malformed spans and uncertain candidates become
+`IGNORE` diagnostics and never enter the strict dictionary. Strong local full-name
+evidence can become `CONFIRMED`; genuinely plausible ambiguity is sent to one bounded
+resolver batch. Resolver review, malformed output and uncertain aliases become IGNORE,
+not provisional runtime mappings.
 
 Schema, Unicode, source eligibility, duplicate sources, translations, aliases/forms,
 namespace collisions and RAW presence are audited locally. Malformed inherited records
-are quarantined; identical source duplicates are merged while preserving locked state.
-Only concrete unresolved semantic conflicts use the batched resolver. Valid cumulative
-entries absent from this batch are retained and explicitly marked in the internal audit.
+are quarantined; different Chinese identities may share one Vietnamese target. Only
+CONFIRMED entries are frozen and enforced. A new uncertain term after freeze is
+diagnostic-only and cannot mutate the dictionary.
 The final dictionary is frozen with a stable hash **before the first translation**.
-All chapters/chunks use this same hash. New important unresolved terminology reported
-later stops explicitly with a frozen-conflicts report: review and submit an updated
-inherited dictionary as a new batch, preserving the existing finalized work.
+All chapters/chunks use this same hash. New uncertain terminology reported later is
+written to the ignored-term audit; it never changes the frozen dictionary or finalized work.
 
 Chunks are built locally at paragraph boundaries, normally around 4,000–6,000 RAW
 characters. Translation uses only the current RAW/VP window, local chapter metadata,
@@ -206,20 +204,21 @@ relevant frozen dictionary entries and the previous two finalized paragraphs (bo
 in size). There is no separate AI chapter analysis. Output checks run locally for
 coverage, IDs/order, emptiness, Chinese residue, frozen wording, Unicode, title shape,
 length anomalies, literal placeholders and suspicious duplicated paragraphs. A successful
-translation causes zero AI review/repair requests. Only actual findings invoke targeted
-repair for exact failed IDs, preserving unaffected text, with at most two repair attempts.
+translation causes zero AI review/repair requests. Only actual findings invoke one targeted
+repair for exact failed IDs, preserving unaffected text. A persistent failure stops with
+concrete findings.
 These deterministic checks detect concrete defects; they do not prove full semantic
 equivalence or replace human editorial review of subtle narrative meaning.
 
 **Request statistics** show logical operations and physical API attempts separately for
-terminology resolution, semantic dictionary conflicts, translation and repair. Retry,
+terminology resolution, translation and repair. Retry,
 model fallback and cache reuse counts are also visible. Alignment, scanning, occurrence
 aggregation, evidence selection, structural audit, chunking and normal validation explicitly
 report zero API calls. Every Gemini activity event includes its operation and reason.
 See [the architecture and verification report](docs/translation-pipeline.md) for the
 previous-operation inventory, exact pipeline order, measurements and behavioral tests.
 
-A completed batch exposes exactly two downloads: **translated.json** and **dictionary.json**.
+A completed batch exposes **translated.txt**, **translated.json**, and **dictionary.json**.
 `translated.json` contains a `chapters` array of records with `number`, `title`, and `text`.
 Volume-scoped records also include `volume`; unscoped records retain the existing shape.
 Use `(volume, number)` as the chapter identity when a volume is present, not `number` alone:
@@ -233,11 +232,14 @@ Use `(volume, number)` as the chapter identity when a volume is present, not `nu
 }
 ```
 
-The dictionary format is:
+The dictionary format is version 3. `entries` contains confirmed mappings only;
+ignored candidates are stored separately in audit/report checkpoints. A durable
+`dictionary-resolution-report.json` checkpoint and the job snapshot expose counts and
+reasons without turning diagnostics into enforcement rules.
 
 ```json
 {
-  "version": 1,
+  "version": 3,
   "entries": [
     {
       "source": "邱途",
@@ -247,14 +249,15 @@ The dictionary format is:
       "gender": "unknown",
       "aliases": [],
       "forms": {"邱科长": "Khoa trưởng Khâu"},
-      "evidence": "RAW evidence supporting this mapping"
+      "evidence": "RAW evidence supporting this mapping",
+      "runtime_state": "CONFIRMED"
     }
   ],
   "statistics": {"total_terms": 1, "total_characters": 1, "total_locations": 0}
 }
 ```
 
-Checkpoints, quarantined legacy records, per-operation model/retry diagnostics, original
+Checkpoints, ignored legacy records, per-operation model/retry diagnostics, original
 inputs and temporary dictionaries stay under `$LNCRAWL_DATA_PATH/translations/` (default
 `~/.lncrawl-mini/translations/`). They contain novel text and should be stored on a private
 volume. Writes are atomic. Identical inputs, pipeline version and model configuration
@@ -264,10 +267,11 @@ batch and choose **Resume batch** after quota recovery or server restart. A fail
 never deletes completed chunks from other chapters. Failed validation does not expose
 unvalidated final artifacts.
 
-**Parser upgrade:** unfinished jobs created with the legacy parser must be resubmitted
-from their original RAW, VIETPHRASE, and optional dictionary inputs. Do not resume their old
-checkpoints under the new chapter/volume identity rules. Existing completed outputs remain
-available; new submissions use the current parser and checkpoint identity.
+**Pipeline upgrade:** compatible version-5 jobs that stopped during dictionary preparation
+can resume with their original inputs. Confirmed mappings and valid completed chunks are
+reused; old provisional/report-only/fallback records migrate to IGNORE. Frozen dictionaries
+from incompatible terminology schemas are reduced to confirmed entries before translation,
+and contradictory confirmed mappings fail clearly rather than being guessed.
 
 Translation API routes:
 
@@ -276,9 +280,11 @@ GET  /api/translation/config
 POST /api/translation/jobs                 {raw, vietphrase, dictionary?}
 GET  /api/translation/jobs
 GET  /api/translation/jobs/{id}
+GET  /api/translation/jobs/{id}/dictionary-report
 POST /api/translation/jobs/{id}/cancel
 POST /api/translation/jobs/{id}/resume
 GET  /api/translation/jobs/{id}/outputs/translated.json
+GET  /api/translation/jobs/{id}/outputs/translated.txt
 GET  /api/translation/jobs/{id}/outputs/dictionary.json
 ```
 

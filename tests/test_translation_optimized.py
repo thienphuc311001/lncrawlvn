@@ -159,6 +159,15 @@ class OptimizedPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(candidate["occurrences"][0]["positions"])
         self.assertEqual(len(candidate["representative_evidence"]), 1)
 
+    def test_quantified_measure_word_fragment_is_rejected(self):
+        pairs = validate_inputs(
+            "第1章\n那块极光石很亮。\n1块极光石很贵。",
+            "Chương 1\nKhối Cực Quang Thạch rất sáng.\n1 khối Cực Quang Thạch rất quý.",
+        )
+        index = build_index(pairs, {r.key: deterministic_alignment(r, v) for r, v in pairs}, [])
+        self.assertNotIn("块极光石", index["candidates"])
+        self.assertEqual(index["rejected"]["块极光石"], "quantity modifier is not a canonical entity name")
+
     def test_ordinary_fragments_and_unverified_name_readings_are_not_local_characters(self):
         pairs = validate_inputs(
             "第1章\n方法来了。贾枢从。苏小碗来了。\n方法点头。贾枢从。苏小碗点头。\n方法笑了。贾枢从。苏小碗笑了。",
@@ -178,7 +187,7 @@ class OptimizedPipelineTests(unittest.IsolatedAsyncioTestCase):
             terms = store.read("dictionary.json")["entries"]
             self.assertEqual(
                 [(t["source"], t["translation"], t["status"]) for t in terms],
-                [("秦舒曼", "Tần Thư Mạn", "provisional")],
+                [("秦舒曼", "Tần Thư Mạn", "locked")],
             )
             index = store.read("terminology-index.json")["index"]["candidates"]["秦舒曼"]
             self.assertEqual(index["frequency"], 3)
@@ -276,10 +285,11 @@ class OptimizedPipelineTests(unittest.IsolatedAsyncioTestCase):
                 },
             )
             provider = BookProvider(store)
-            await self.run_book(store, provider)
+            with self.assertRaisesRegex(QualityError, "broken canonical reference"):
+                await self.run_book(store, provider)
             self.assertEqual(len(store.read("legacy-audit.json")), 8)
-            self.assertEqual([call[0] for call in provider.calls], [prompts.TRANSLATE])
-            self.assertEqual(store.read("dictionary.json")["entries"], [])
+            self.assertEqual(store.read("legacy-audit.json")[-1]["classification"], "fatal")
+            self.assertEqual(provider.calls, [])
 
     async def test_duplicate_inherited_source_preserves_locked_mapping_locally(self):
         with tempfile.TemporaryDirectory() as root:
@@ -299,6 +309,20 @@ class OptimizedPipelineTests(unittest.IsolatedAsyncioTestCase):
             )
             self.assertEqual(store.read("dictionary.json")["entries"][0]["status"], "locked")
             self.assertIn("duplicate source", store.read("legacy-audit.json")[0]["reason"])
+
+    async def test_two_locked_mappings_for_one_source_are_fatal(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.make_store(
+                root,
+                dictionary={"entries": [
+                    {"source": "祖石", "translation": "Tổ Thạch", "type": "artifact", "status": "locked"},
+                    {"source": "祖石", "translation": "Tổ Đá", "type": "artifact", "status": "locked"},
+                ]},
+            )
+            provider = BookProvider(store)
+            with self.assertRaisesRegex(QualityError, "Fatal inherited dictionary"):
+                await self.run_book(store, provider)
+            self.assertEqual(provider.calls, [])
 
     async def test_concrete_inherited_canonical_conflict_uses_semantic_batch(self):
         with tempfile.TemporaryDirectory() as root:
@@ -326,8 +350,8 @@ class OptimizedPipelineTests(unittest.IsolatedAsyncioTestCase):
             provider = BookProvider(store)
             await self.run_book(store, provider)
             stats = store.request_statistics()
-            self.assertEqual(stats["requests"]["semantic_dictionary_conflict"], 1)
-            self.assertEqual(stats["requests"]["terminology_resolver"], 0)
+            self.assertEqual(stats["requests"]["semantic_dictionary_conflict"], 0)
+            self.assertEqual(stats["requests"]["terminology_resolver"], 1)
             self.assertEqual(len(store.read("dictionary.json")["entries"]), 1)
 
     def test_pipeline_cache_identity_changes_with_inputs_prompts_and_models(self):
@@ -363,7 +387,13 @@ class OptimizedPipelineTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual([call[0] for call in provider.calls], [prompts.TRANSLATE])
             self.assertEqual(
                 store.read("dictionary.json")["entries"],
-                [{**dictionary["entries"][0], "gender": "unknown", "aliases": [], "evidence": ""}],
+                [{
+                    **dictionary["entries"][0],
+                    "gender": "unknown",
+                    "aliases": [],
+                    "evidence": "",
+                    "runtime_state": "CONFIRMED",
+                }],
             )
 
     async def test_dictionary_is_frozen_and_identical_for_all_chunks(self):
@@ -510,11 +540,14 @@ class OptimizedPipelineTests(unittest.IsolatedAsyncioTestCase):
             pages = [
                 data for instruction, data in provider.calls if instruction == prompts.BATCH_RESOLVE
             ]
-            self.assertEqual(len(pages), 2)
-            self.assertEqual([item["source"] for item in pages[1]["candidates"]], ["祖石"])
+            self.assertEqual(len(pages), 1)
             self.assertEqual(
-                {t["source"] for t in store.read("dictionary.json")["entries"]}, {"祖石", "梦境术"}
+                {item["source"] for item in pages[0]["candidates"]}, {"祖石", "梦境术"}
             )
+            self.assertEqual(
+                {t["source"] for t in store.read("dictionary.json")["entries"]}, {"梦境术"}
+            )
+            self.assertIn("祖石", {item["source"] for item in store.read("dictionary-audit.json")["ignored"]})
 
     async def test_resume_reuses_frozen_dictionary_and_completed_api_work(self):
         with tempfile.TemporaryDirectory() as root:
@@ -553,15 +586,223 @@ class OptimizedPipelineTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(provider.calls), count)
             self.assertEqual(store.request_statistics()["total_requests"], stats)
 
-    async def test_new_term_after_freeze_stops_explicitly_without_dictionary_mutation(self):
+    async def test_uncertain_item_translation_is_ignored(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.make_store(
+                root,
+                raw="第1章\n极光石发光。\n极光石很贵。\n极光石被收起。",
+                vp="Chương 1\nCực Quang Thạch phát sáng.\nCực Quang Thạch rất quý.\nCực Quang Thạch được cất đi.",
+            )
+            provider = BookProvider(store)
+            await self.run_book(store, provider)
+            self.assertNotIn("极光石", {t["source"] for t in store.read("dictionary.json")["entries"]})
+            self.assertGreater(store.read("dictionary-audit.json")["ignored_candidates"], 0)
+            self.assertEqual(
+                [call[0] for call in provider.calls],
+                [prompts.BATCH_RESOLVE, prompts.TRANSLATE],
+            )
+            self.assertEqual(store.read("dictionary-resolution-report.json")["summary"]["fatal_conflicts"], 0)
+
+    async def test_stable_person_name_is_resolved_locally_without_alias_inference(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.make_store(
+                root,
+                raw="第1章\n秦政光来了。\n秦政光点头。\n秦政光离开。",
+                vp="Chương 1\nTần Chính Quang đến.\nTần Chính Quang gật đầu.\nTần Chính Quang rời đi.",
+            )
+            provider = BookProvider(store)
+            await self.run_book(store, provider)
+            entry = next(t for t in store.read("dictionary.json")["entries"] if t["source"] == "秦政光")
+            self.assertEqual((entry["translation"], entry["type"], entry["aliases"]), ("Tần Chính Quang", "character", []))
+            self.assertEqual(store.request_statistics()["requests"]["terminology_resolver"], 0)
+
+    async def test_uncertain_alias_is_ignored_without_identity_inference(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.make_store(
+                root,
+                raw="第1章\n秦舒曼来了。\n老秦点头。\n老秦离开。\n老秦回来了。",
+                vp="Chương 1\nTần Thư Mạn đến.\nLão Tần gật đầu.\nLão Tần rời đi.\nLão Tần quay lại.",
+            )
+
+            async def provider(model, body):
+                data = json.loads(body["contents"][0]["parts"][0]["text"])
+                if body["systemInstruction"]["parts"][0]["text"] == prompts.BATCH_RESOLVE:
+                    results = []
+                    for item in data["candidates"]:
+                        source = item["source"]
+                        results.append({
+                            "source": source,
+                            "decision": "REVIEW",
+                            "eligibility": {
+                                "complete_semantic_unit": True,
+                                "named_or_novel_specific": True,
+                                "consistency_matters": True,
+                                "evidence_supports": False,
+                            },
+                            "term": {
+                                "source": "秦舒曼",
+                                "translation": "Tần Thư Mạn",
+                                "type": "character",
+                                "forms": {source: "Lão Tần"},
+                            },
+                            "reason": "Alias identity is uncertain",
+                        })
+                    return {"results": results}
+                if body["systemInstruction"]["parts"][0]["text"] == prompts.TRANSLATE:
+                    data = json.loads(body["contents"][0]["parts"][0]["text"])
+                    return {
+                        "title": data["CHAPTER CONTEXT"]["vp_title"],
+                        "segments": [{"id": item["id"], "text": data["VIETPHRASE REFERENCE"][item["id"]]["text"]}
+                                     for item in data["RAW TO TRANSLATE"]],
+                    }
+                raise AssertionError("Unexpected provider operation")
+
+            await self.run_book(store, provider)
+            entries = {entry["source"]: entry for entry in store.read("dictionary.json")["entries"]}
+            self.assertNotIn("老秦", entries)
+            self.assertNotIn("老秦", entries.get("秦舒曼", {}).get("aliases", []))
+            self.assertGreater(store.read("dictionary-audit.json")["ignored_candidates"], 0)
+
+    async def test_invalid_metadata_falls_back_without_repeating_corrections(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.make_store(
+                root,
+                raw="第1章\n【祖石】发光。",
+                vp="Chương 1\n【Tổ Thạch】 phát sáng.",
+            )
+            calls = []
+
+            async def provider(model, body):
+                instruction = body["systemInstruction"]["parts"][0]["text"]
+                calls.append(instruction)
+                data = json.loads(body["contents"][0]["parts"][0]["text"])
+                if instruction == prompts.BATCH_RESOLVE:
+                    source = data["candidates"][0]["source"]
+                    return {"results": [{
+                        "source": source,
+                        "decision": "ACCEPT",
+                        "eligibility": {
+                            "complete_semantic_unit": True,
+                            "named_or_novel_specific": True,
+                            "consistency_matters": True,
+                            "evidence_supports": True,
+                        },
+                        "term": {
+                            "source": source,
+                            "translation": "Tổ Thạch",
+                            "type": "character_alias",
+                        },
+                        "reason": "Metadata is not canonical",
+                    }]}
+                if instruction == prompts.TRANSLATE:
+                    return {"title": data["CHAPTER CONTEXT"]["vp_title"], "segments": [
+                        {"id": item["id"], "text": data["VIETPHRASE REFERENCE"][item["id"]]["text"]}
+                        for item in data["RAW TO TRANSLATE"]
+                    ]}
+                raise AssertionError("Metadata-only fallback should not issue a repair request")
+
+            await self.run_book(store, provider)
+            self.assertEqual(calls.count(prompts.BATCH_RESOLVE), 1)
+            self.assertEqual(store.read("dictionary.json")["entries"], [])
+            self.assertIn("祖石", {item["source"] for item in store.read("dictionary-audit.json")["ignored"]})
+
+    async def test_malformed_resolver_translation_is_ignored_without_retry(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.make_store(
+                root,
+                raw="第1章\n【祖石】发光。",
+                vp="Chương 1\n【Tổ Thạch】 phát sáng.",
+            )
+            calls = []
+
+            async def provider(model, body):
+                instruction = body["systemInstruction"]["parts"][0]["text"]
+                calls.append(instruction)
+                data = json.loads(body["contents"][0]["parts"][0]["text"])
+                if instruction == prompts.BATCH_RESOLVE:
+                    source = data["candidates"][0]["source"]
+                    return {"results": [{
+                        "source": source,
+                        "decision": "ACCEPT",
+                        "eligibility": {
+                            "complete_semantic_unit": True,
+                            "named_or_novel_specific": True,
+                            "consistency_matters": True,
+                            "evidence_supports": True,
+                        },
+                        "term": {"source": source, "translation": "中文", "type": "artifact"},
+                        "reason": "Bad translation",
+                    }]}
+                if instruction == prompts.TRANSLATE:
+                    return {"title": data["CHAPTER CONTEXT"]["vp_title"], "segments": [
+                        {"id": item["id"], "text": data["VIETPHRASE REFERENCE"][item["id"]]["text"]}
+                        for item in data["RAW TO TRANSLATE"]
+                    ]}
+                raise AssertionError("Unexpected provider operation")
+
+            await self.run_book(store, provider)
+            self.assertEqual(calls.count(prompts.BATCH_RESOLVE), 1)
+            self.assertEqual(store.read("dictionary.json")["entries"], [])
+
+    async def test_legacy_dictionary_stage_resume_reuses_exhausted_wording(self):
+        with tempfile.TemporaryDirectory() as root:
+            inputs = Inputs(
+                raw="第1章\n【祖石】发光。",
+                vietphrase="Chương 1\n【Tổ Thạch】 phát sáng.",
+            ).model_dump()
+            current = Store(Path(root), inputs)
+            legacy_id = "a" * 64
+            current.path.rename(Path(root) / legacy_id)
+            store = Store(Path(root), job_id=legacy_id)
+            store.write("resolved-terms.json", {
+                "input_hash": legacy_id,
+                "terms": [],
+                "decisions": {},
+            })
+            response = {
+                "source": "祖石",
+                "decision": "ACCEPT",
+                "eligibility": {
+                    "complete_semantic_unit": True,
+                    "named_or_novel_specific": True,
+                    "consistency_matters": True,
+                    "evidence_supports": True,
+                },
+                "term": {"source": "祖石", "translation": "Tổ Thạch", "type": "artifact"},
+                "reason": "Stable inherited resolver wording",
+            }
+            for attempt in range(3):
+                store.write(
+                    f"resolution-rejections/{digest('祖石')}-{attempt}.json",
+                    {"error": "legacy metadata rejection", "response": response},
+                )
+            calls = []
+
+            async def provider(model, body):
+                instruction = body["systemInstruction"]["parts"][0]["text"]
+                calls.append(instruction)
+                if instruction == prompts.BATCH_RESOLVE:
+                    raise AssertionError("Legacy exhausted resolver result was not migrated")
+                data = json.loads(body["contents"][0]["parts"][0]["text"])
+                return {
+                    "title": data["CHAPTER CONTEXT"]["vp_title"],
+                    "segments": [{"id": item["id"], "text": data["VIETPHRASE REFERENCE"][item["id"]]["text"]}
+                                 for item in data["RAW TO TRANSLATE"]],
+                }
+
+            await Pipeline(store, Scheduler(transport=provider, spacing=0)).run()
+            self.assertNotIn(prompts.BATCH_RESOLVE, calls)
+            self.assertEqual(store.read("dictionary.json")["entries"][0]["translation"], "Tổ Thạch")
+            self.assertEqual(store.read("resolved-terms.json")["input_hash"], pipeline_identity(inputs))
+
+    async def test_unresolved_term_after_freeze_is_audit_only(self):
         with tempfile.TemporaryDirectory() as root:
             store = self.make_store(
                 root, raw="第1章\n隐秘宫开放。", vp="Chương 1\nẨn Bí Cung mở cửa."
             )
             provider = BookProvider(store)
             provider.report_unresolved = True
-            with self.assertRaisesRegex(QualityError, "after dictionary freeze"):
-                await self.run_book(store, provider)
+            await self.run_book(store, provider)
             self.assertEqual(store.read("frozen-dictionary.json")["dictionary"]["entries"], [])
-            self.assertIsNone(store.read("translated.json"))
-            self.assertEqual(len(list((store.path / "frozen-conflicts").glob("*.json"))), 1)
+            self.assertIsNotNone(store.read("translated.json"))
+            self.assertIsNotNone(next((store.path / "ignored-terms").glob("*.json"), None))

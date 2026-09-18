@@ -10,12 +10,10 @@ from .models import Term
 
 HAN_RUN = re.compile(r"[\u3400-\u9fff]+")
 WORDS = re.compile(r"[^\W\d_]+", re.UNICODE)
-VP_COMMON = set(
-    "là người đã đang của và với này kia một cái có không nói hỏi nhìn nghe đi đến rồi thì mà hắn nàng anh cô ông bà trưởng phó đội cục thành phố trợ lý phương pháp chén nhỏ vui".split()
-)
 # A deliberately small local reading lexicon permits safe lowercase VietPhrase
 # names too. Unknown or colloquially translated given names stay semantic work.
 GIVEN_READINGS = {
+    "极": "cực",
     "舒": "thư",
     "曼": "mạn",
     "菲": "phỉ",
@@ -51,6 +49,9 @@ GIVEN_READINGS = {
     "武": "vũ",
     "杰": "kiệt",
     "峰": "phong",
+    "政": "chính",
+    "光": "quang",
+    "石": "thạch",
 }
 SURNAMES = dict(
     pair.split(":")
@@ -111,6 +112,75 @@ SUFFIXES = (
     "剑",
     "刀",
 )
+
+# These are classification signals, not a blanket stop-list.  A phrase that
+# is explicitly named, has a proved identity, or is inherited from the book
+# dictionary is kept for semantic review even when one of its characters is a
+# common word.
+GENERIC_VERB_PHRASES = {"会派", "会让", "会把", "可以看", "能够看"}
+GENERIC_COMMON_PHRASES = {
+    "世界基石",
+    "任意抓捕处长",
+    "增进感情的方式",
+    "方法",
+    "方式",
+    "感情",
+    "基石",
+}
+DESCRIPTIVE_MARKERS = {
+    "方式",
+    "方法",
+    "感情",
+    "任意",
+    "任何",
+    "增进",
+    "抓捕",
+    "数量",
+    "办法",
+}
+TITLE_PATTERN = re.compile(r"(?:副)?(?:署长|科长|处长|将军|上校|队长|长官|先生|小姐|掌门)$")
+
+
+def classify_candidate(source, reasons, contexts, frequency=0, inherited=False):
+    """Classify obvious ordinary-language candidates before resolver work.
+
+    The classifier deliberately returns ``None`` for uncertain material.  A
+    positive classification is only used for conservative local rejection or
+    report-only bookkeeping; it never promotes a candidate into a dictionary
+    entry.
+    """
+    if inherited:
+        return None
+    named_signals = {
+        "explicit_named_marker",
+        "explicit_naming_context",
+        "possible_person_alias",
+    }
+    if named_signals.intersection(reasons):
+        return None
+    if source in GENERIC_VERB_PHRASES:
+        return "verb_phrase", "ordinary verb phrase"
+    if source in GENERIC_COMMON_PHRASES:
+        return "common_noun", "ordinary compositional noun phrase"
+    if re.match(r"^\d+(?:[-–~～]\d+)?(?:种|类|个|名|件|种)", source):
+        return "descriptive_phrase", "numeric descriptive phrase"
+    if any(marker in source for marker in DESCRIPTIVE_MARKERS) and not TITLE_PATTERN.search(source):
+        return "descriptive_phrase", "compositional descriptive phrase"
+    if TITLE_PATTERN.search(source):
+        # A title/address remains a plausible candidate when RAW proves an
+        # identity relationship.  Otherwise it is audit-only, never a new
+        # canonical character identity.
+        identity = re.compile(
+            re.escape(source) + r".{0,18}(?:就是|是|名为|叫做|称为)[\u3400-\u9fff]{2,8}"
+        )
+        reverse = re.compile(
+            r"[\u3400-\u9fff]{2,8}.{0,18}(?:就是|是|名为|叫做|称为)" + re.escape(source)
+        )
+        if not any(identity.search(context) or reverse.search(context) for context in contexts):
+            return "character_form", "title/reference identity is not proven locally"
+    # A suffix by itself is not enough evidence.  Keep uncertain novel terms
+    # for the resolver; this is what protects short fictional concepts.
+    return None
 
 
 def normalized(text):
@@ -228,6 +298,19 @@ def build_index(pairs, alignments, inherited):
             r"(?:名为|称为|代号为|命名为)[：:“\"‘「『]*([\u3400-\u9fff]{2,8})", text
         ):
             reasons[match.group(1)].add("explicit_naming_context")
+        # Capture only high-signal ordinary-language shapes for audit.  These
+        # never enter the resolver and are not later treated as terminology.
+        for match in re.finditer(
+            r"\d+(?:[-–~～]\d+)?(?:种|类|个|名|件)[\u3400-\u9fff]{2,32}", text
+        ):
+            reasons[match.group()].add("numeric_descriptive_phrase")
+        for phrase in GENERIC_VERB_PHRASES | GENERIC_COMMON_PHRASES:
+            if phrase in text:
+                reasons[phrase].add("local_generic_phrase")
+        for match in re.finditer(
+            r"(?:任意|任何)[\u3400-\u9fff]{1,12}(?:抓捕|派遣|调动|处理)[\u3400-\u9fff]{0,8}", text
+        ):
+            reasons[match.group()].add("compositional_descriptive_phrase")
     for source, count in counts.items():
         suffix = next((ending for ending in SUFFIXES if source.endswith(ending)), None)
         if count >= 2 and suffix and not set(source[: -len(suffix)]).intersection(GRAMMAR):
@@ -238,22 +321,71 @@ def build_index(pairs, alignments, inherited):
         for source in [term.source, *term.aliases, *term.forms]:
             reasons[source].add("inherited_dictionary")
     texts = [unit["raw"] for unit in units]
-    rejected, candidates = {}, {}
+    rejected, report_only, candidates = {}, {}, {}
+    contexts = texts
     for source in sorted(reasons):
         issue = source_problem(source) or quantity_source_problem(source, texts)
         if re.search(r"[+＋]\d+|^\d+(?:天|小时|分钟|岁)(?:$|[（(])", source) and not any(
             "《" + source + "》" in text for text in texts
         ):
             issue = "dynamic status/duration value, not a stable named entity"
-        if issue or (reasons[source] == {"person_name_pattern"} and counts[source] < 2):
-            rejected[source] = issue or "unconfirmed single person-name pattern"
+        classification = classify_candidate(
+            source,
+            reasons[source],
+            contexts,
+            counts[source],
+            inherited=any(
+                source in [term.source, *term.aliases, *term.forms] for term in inherited
+            ),
+        )
+        if issue or classification or (
+            reasons[source] == {"person_name_pattern"} and counts[source] < 2
+        ):
+            reason = issue or (
+                classification[1] if classification else "unconfirmed single person-name pattern"
+            )
+            category = classification[0] if classification else (
+                "common_noun" if issue == "ordinary vocabulary" else "unknown"
+            )
+            rejected[source] = reason
+            report_only[source] = {
+                "source": source,
+                "classification": category,
+                "status": "report_only",
+                "state": "IGNORE",
+                "enforceable": False,
+                "reason": reason,
+                "reasons": sorted(reasons[source]),
+                "frequency": 0,
+                "occurrences": [],
+            }
             continue
         candidates[source] = {
             "source": source,
             "reasons": sorted(reasons[source]),
+            "classification": (
+                "character_name"
+                if "person_name_pattern" in reasons[source]
+                else "character_form"
+                if "named_title_or_address_form" in reasons[source]
+                else "proper_noun"
+                if {
+                    "explicit_named_marker",
+                    "explicit_naming_context",
+                    "repeated_entity_or_genre_suffix",
+                }.intersection(reasons[source])
+                else "unknown"
+            ),
             "frequency": 0,
             "occurrences": [],
             "vietphrase_variants": {},
+            "verified_mapping_count": 0,
+            "dominant_translation": None,
+            "dominant_confidence": 0.0,
+            "mapping_coverage": 0.0,
+            "proper_name_pattern_confidence": 0.0,
+            "inherited_agreement": False,
+            "source_conflicts": [],
         }
     # Remove lexical suffix fragments only when a longer candidate has exactly
     # the same whole-novel occurrence frequency. Preserve independently used names.
@@ -267,6 +399,17 @@ def build_index(pairs, alignments, inherited):
                 break
     for source in fragments:
         rejected[source] = "contained lexical fragment with no independent occurrence"
+        report_only[source] = {
+            "source": source,
+            "classification": "common_noun",
+            "status": "report_only",
+            "state": "IGNORE",
+            "enforceable": False,
+            "reason": rejected[source],
+            "reasons": candidates[source]["reasons"],
+            "frequency": 0,
+            "occurrences": [],
+        }
         del candidates[source]
     variants = {source: Counter() for source in candidates}
     by_length = defaultdict(set)
@@ -294,16 +437,19 @@ def build_index(pairs, alignments, inherited):
             if not positions:
                 continue
             proposals = []
-            if "person_name_pattern" in candidates[source]["reasons"] and source[0] in SURNAMES:
-                surname = normalized(SURNAMES[source[0]])
-                for index, word in enumerate(words):
-                    selected = words[index : index + len(source)]
-                    if (
-                        normalized(word) == surname
-                        and len(selected) == len(source)
-                        and not any(normalized(token) in VP_COMMON for token in selected[1:])
-                    ):
-                        proposals.append(" ".join(value.capitalize() for value in selected))
+            expected_reading = (
+                [SURNAMES.get(source[0]), *[GIVEN_READINGS.get(char) for char in source[1:]]]
+                if source and source[0] in SURNAMES
+                else [GIVEN_READINGS.get(char) for char in source]
+            )
+            if expected_reading and all(expected_reading):
+                expected_words = [normalized(word) for word in expected_reading]
+                vp_words = [normalized(word) for word in words]
+                if any(
+                    vp_words[index : index + len(expected_words)] == expected_words
+                    for index in range(max(0, len(vp_words) - len(expected_words) + 1))
+                ):
+                    proposals.append(" ".join(value.capitalize() for value in expected_reading))
             if "explicit_named_marker" in candidates[source]["reasons"]:
                 raw_markers = re.findall(r"【([^】]+)】|《([^》]+)》", unit["raw"])
                 vp_markers = re.findall(r"【([^】]+)】|《([^》]+)》|«([^»]+)»", unit["vp"])
@@ -315,7 +461,8 @@ def build_index(pairs, alignments, inherited):
                         ).strip()
                     )
             proposals = sorted(set(proposals))
-            variants[source].update(proposals)
+            for proposal in proposals:
+                variants[source][proposal] += len(positions)
             candidate = candidates[source]
             candidate["frequency"] += len(positions)
             candidate["occurrences"].append(
@@ -323,24 +470,70 @@ def build_index(pairs, alignments, inherited):
             )
     for source, candidate in candidates.items():
         candidate["vietphrase_variants"] = dict(variants[source].most_common())
+        candidate["verified_mapping_count"] = sum(variants[source].values())
+        if variants[source]:
+            dominant, count = variants[source].most_common(1)[0]
+            candidate["dominant_translation"] = dominant
+            candidate["dominant_confidence"] = count / max(1, candidate["frequency"])
+            candidate["mapping_coverage"] = candidate["verified_mapping_count"] / max(
+                1, candidate["frequency"]
+            )
+        if "person_name_pattern" in candidate["reasons"]:
+            candidate["proper_name_pattern_confidence"] = min(
+                1.0, candidate["frequency"] / max(3, len(candidate["occurrences"]))
+            )
+        inherited_terms = [
+            term for term in inherited
+            if source in [term.source, *term.aliases, *term.forms]
+        ]
+        candidate["inherited_agreement"] = bool(
+            inherited_terms
+            and candidate.get("dominant_translation")
+            and any(
+                normalized(term.forms.get(source, term.translation))
+                == normalized(candidate["dominant_translation"])
+                for term in inherited_terms
+            )
+        )
         candidate["representative_evidence"] = representative_evidence(candidate, units)
-    return {"units": units, "candidates": candidates, "rejected": rejected}
+    # Keep rejected/generic evidence separate from plausible resolver work.
+    # This makes the distinction survive checkpoints and gives the report/UI a
+    # useful audit trail without polluting the frozen enforceable namespace.
+    for source, record in report_only.items():
+        occurrences = []
+        for unit_id, unit in enumerate(units):
+            positions = [match.start() for match in re.finditer(re.escape(source), unit["raw"])]
+            if positions:
+                occurrences.append({"unit": unit_id, "positions": positions})
+        record["occurrences"] = occurrences
+        record["frequency"] = sum(len(item["positions"]) for item in occurrences)
+    return {
+        "units": units,
+        "candidates": candidates,
+        "rejected": rejected,
+        "report_only": report_only,
+        "metrics": {
+            "raw_candidates": len(candidates) + len(report_only),
+            "resolver_candidates": len(candidates),
+            "locally_rejected_generic": len(report_only),
+        },
+    }
 
 
-def local_resolution(candidate):
-    """Conservative stable full-name reading, provisional with no inferred alias/gender."""
+def local_resolution(candidate, policy=None):
+    """Confirm only a conservative stable full-name reading."""
     variants = candidate["vietphrase_variants"]
-    if (
-        candidate["reasons"] != ["person_name_pattern"]
-        or len(candidate["occurrences"]) < 3
-        or not variants
-    ):
+    min_contexts = getattr(policy, "min_contexts", 3) if policy else 3
+    min_dominance = getattr(policy, "min_dominance", 0.95) if policy else 0.95
+    min_coverage = getattr(policy, "min_coverage", 0.95) if policy else 0.95
+    if len(candidate["occurrences"]) < min_contexts or not variants:
         return None
     translation, count = max(variants.items(), key=lambda pair: pair[1])
-    readings = [
-        SURNAMES.get(candidate["source"][0]),
-        *[GIVEN_READINGS.get(c) for c in candidate["source"][1:]],
-    ]
+    readings = (
+        [SURNAMES.get(candidate["source"][0]), *[GIVEN_READINGS.get(c) for c in candidate["source"][1:]]]
+        if candidate["source"][0] in SURNAMES
+        else [GIVEN_READINGS.get(c) for c in candidate["source"]]
+    )
     if any(reading is None for reading in readings) or normalized(translation) != normalized(
         " ".join(readings)
     ):
@@ -349,18 +542,34 @@ def local_resolution(candidate):
     # Require distinct aligned contexts, a clear surname, one reading per unit,
     # and >=95% consensus. No numeric or character-offset RAW/VP matching.
     if (
-        count / total < 0.95
-        or count / len(candidate["occurrences"]) < 0.95
+        count / total < min_dominance
+        or candidate.get("mapping_coverage", 0) < min_coverage
         or len(translation.split()) != len(candidate["source"])
     ):
+        return None
+    is_person = "person_name_pattern" in candidate["reasons"]
+    if not is_person:
+        # A stable reading is useful evidence, but it does not establish that
+        # an ordinary phrase is a named term.  Keep it out of the runtime
+        # namespace until a complete confirmed decision exists.
         return None
     return Term(
         source=candidate["source"],
         translation=translation,
-        type="character",
-        status="provisional",
+        type="character" if is_person else "unknown",
+        # A deterministic full-name reading has already passed the local
+        # evidence gates.  It is confirmed for runtime; uncertain candidates
+        # return None and remain IGNORE diagnostics instead of provisional
+        # enforcement.
+        status="locked",
         gender="unknown",
-        evidence=f"Local full-name pattern and {count}/{total} VietPhrase consensus; identity/gender not inferred",
+        semantic_resolution="resolved",
+        needs_review=False,
+        resolution_reason=None,
+        enforceable=True,
+        confidence=count / max(1, total),
+        resolver_source="local_consensus",
+        evidence=f"Local reading and {count}/{total} VietPhrase consensus; identity/gender not inferred",
     )
 
 

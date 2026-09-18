@@ -168,6 +168,20 @@ class APITests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("id", logs[-1])
         self.assertNotIn("logs", (await self.client.get("/api/translation/jobs")).json()[0])
 
+    async def test_dictionary_report_is_visible_in_snapshot_and_endpoint(self):
+        store = Store(api.ROOT, {"raw": "第1章\n正文。", "vietphrase": "Chương 1\nVăn."})
+        report = {
+            "summary": {"locked_terms": 1, "provisional_terms": 2, "needs_review": 1, "unresolved_terms": 1, "fatal_conflicts": 0},
+            "entries": [{"source": "极光石", "translation": "Cực Quang Thạch", "severity": "WARNING"}],
+        }
+        store.write("dictionary-resolution-report.json", report)
+        snapshot = await self.client.get(f"/api/translation/jobs/{store.id}")
+        self.assertEqual(snapshot.json()["dictionary_report"], report["summary"])
+        self.assertEqual(snapshot.json()["dictionary_review"][0]["source"], "极光石")
+        response = await self.client.get(f"/api/translation/jobs/{store.id}/dictionary-report")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), report)
+
     async def test_legacy_failure_displays_same_task_model_chain(self):
         import json
 

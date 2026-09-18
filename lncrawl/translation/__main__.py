@@ -41,6 +41,7 @@ class ConsoleStore(Store):
                         "error",
                         "dictionary_hash",
                         "dictionary_frozen",
+                        "dictionary_summary",
                         "request_statistics",
                     )
                 },
@@ -93,6 +94,28 @@ def first_chapters(text, count, label):
     return "\n".join(text.splitlines()[: end - 1])
 
 
+def find_compatible_translation_job(root, inputs):
+    """Find an unfinished legacy dictionary-stage job for exact CLI resumption."""
+    if not root.exists():
+        return None
+    matches = []
+    for input_path in root.glob("*/inputs.json"):
+        try:
+            if json.loads(input_path.read_text(encoding="utf-8")) != inputs:
+                continue
+            job_path = input_path.parent
+            progress = json.loads((job_path / "progress.json").read_text(encoding="utf-8"))
+            if (
+                progress.get("status") != "done"
+                and not (job_path / "frozen-dictionary.json").exists()
+                and (job_path / "resolved-terms.json").exists()
+            ):
+                matches.append(job_path)
+        except (OSError, ValueError, TypeError):
+            continue
+    return max(matches, key=lambda path: path.stat().st_mtime).name if matches else None
+
+
 async def translate(arguments):
     raw = arguments.raw.read_text(encoding="utf-8-sig")
     vp = arguments.vietphrase.read_text(encoding="utf-8-sig")
@@ -120,19 +143,26 @@ async def translate(arguments):
     if not api_keys():
         raise ValueError("Set GOOGLE_AI_API_KEY in the project-root .env file")
     inputs = Inputs(raw=raw, vietphrase=vp, dictionary=dictionary)
-    store = ConsoleStore(APP_DIR / "translations", inputs=inputs.model_dump())
+    translation_root = APP_DIR / "translations"
+    input_data = inputs.model_dump()
+    legacy_job = find_compatible_translation_job(translation_root, input_data)
+    store = (
+        ConsoleStore(translation_root, job_id=legacy_job)
+        if legacy_job
+        else ConsoleStore(translation_root, inputs=input_data)
+    )
     store.write("parser-version.json", {"version": PARSER_VERSION})
     print(f"Checkpoint: {store.path}", flush=True)
     with store.execution():
         await run_owned(store, arguments.workers)
     arguments.output.mkdir(parents=True, exist_ok=True)
-    for name in ("translated.json", "dictionary.json"):
+    for name in ("translated.json", "translated.txt", "dictionary.json"):
         target = arguments.output / name
         if target.exists() and target.read_bytes() != (store.path / name).read_bytes():
             raise ValueError(
                 f"Output already exists with different content: {target}; choose another --output directory"
             )
-    for name in ("translated.json", "dictionary.json"):
+    for name in ("translated.json", "translated.txt", "dictionary.json"):
         shutil.copyfile(store.path / name, arguments.output / name)
     print(
         f"Completed: {arguments.output.resolve() / 'translated.json'} and {arguments.output.resolve() / 'dictionary.json'}",

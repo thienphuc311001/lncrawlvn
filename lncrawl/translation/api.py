@@ -42,6 +42,16 @@ def get_store(job_id):
 def snapshot(store, include_logs=True):
     progress = store.read("progress.json", {"job_id": store.id, "status": "pending"})
     progress["request_statistics"] = store.request_statistics()
+    report = store.read("dictionary-resolution-report.json")
+    if report:
+        progress["dictionary_report"] = report.get("summary", {})
+        progress["dictionary_review"] = [
+            entry
+            for entry in report.get("entries", [])
+            if entry.get("state") == "IGNORE"
+            or entry.get("severity") not in (None, "INFO")
+            or entry.get("resolution_status") not in (None, "locked")
+        ][:100]
     if include_logs:
         progress["logs"] = store.logs()
         # Older checkpoints saved only the final provider error. Recover the
@@ -88,8 +98,14 @@ async def run(store):
             stage="Input validation failed; resubmit corrected files",
         )
     except Exception as exc:
+        validation_failures = sorted((store.path / "validation-failures").glob("*.json"))
+        error_detail = (
+            store.read(str(validation_failures[-1].relative_to(store.path)))
+            if validation_failures
+            else None
+        )
         store.progress(
-            "failed", error=str(exc), error_detail=None, stage="Stopped; resume available"
+            "failed", error=str(exc), error_detail=error_detail, stage="Stopped; resume available"
         )
     finally:
         _tasks.pop(store.id, None)
@@ -185,11 +201,20 @@ async def cancel(job_id: str):
 @router.get("/jobs/{job_id}/outputs/{filename}")
 async def output(job_id: str, filename: str):
     store = get_store(job_id)
-    if filename not in ("translated.json", "dictionary.json"):
+    if filename not in ("translated.json", "translated.txt", "dictionary.json"):
         raise HTTPException(404, "Unknown output")
     if store.read("progress.json", {}).get("status") != "done":
         raise HTTPException(409, "Outputs are available after final validation")
-    return FileResponse(store.path / filename, media_type="application/json", filename=filename)
+    media_type = "text/plain" if filename.endswith(".txt") else "application/json"
+    return FileResponse(store.path / filename, media_type=media_type, filename=filename)
+
+
+@router.get("/jobs/{job_id}/dictionary-report")
+async def dictionary_report(job_id: str):
+    report = get_store(job_id).read("dictionary-resolution-report.json")
+    if report is None:
+        raise HTTPException(404, "Dictionary report is not available")
+    return report
 
 
 async def shutdown():

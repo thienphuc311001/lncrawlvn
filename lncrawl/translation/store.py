@@ -10,7 +10,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import prompts
-from .models import MODELS, PIPELINE_VERSION, BatchResolution, Repair, Term, Translation
+from .models import (
+    MODELS,
+    PIPELINE_VERSION,
+    BatchResolution,
+    Repair,
+    ResolutionPolicy,
+    Term,
+    Translation,
+)
 
 
 def digest(value):
@@ -19,13 +27,14 @@ def digest(value):
     ).hexdigest()
 
 
-def pipeline_identity(inputs):
+def pipeline_identity(inputs, policy=None):
     """One content identity for jobs and checkpoints, including semantic contracts."""
     return digest(
         {
             "inputs": inputs,
             "pipeline_version": PIPELINE_VERSION,
             "models": MODELS,
+            "resolution_policy": policy or ResolutionPolicy.from_environment().model_dump(),
             "prompts": [prompts.BATCH_RESOLVE, prompts.TRANSLATE, prompts.REPAIR],
             "schemas": [
                 model.model_json_schema() for model in (Term, BatchResolution, Translation, Repair)
@@ -49,10 +58,12 @@ def atomic_json(path, value):
 
 class Store:
     def __init__(self, root: Path, inputs=None, job_id=None):
-        self.id = job_id or pipeline_identity(inputs)
+        self.policy = ResolutionPolicy.from_environment()
+        self.id = job_id or pipeline_identity(inputs, self.policy.model_dump())
         self.path = root / self.id
         if inputs is not None:
             atomic_json(self.path / "inputs.json", inputs)
+            atomic_json(self.path / "resolution-policy.json", self.policy.model_dump())
         if not self.path.is_dir():
             raise FileNotFoundError("Translation job not found")
 

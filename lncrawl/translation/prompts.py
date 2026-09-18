@@ -42,10 +42,9 @@ RESOLVE = (
     + """Resolve ONE candidate using all occurrence evidence and summaries.
 Eligibility: complete semantic unit, named/novel-specific, consistency matters, evidence
 supports it. decision ACCEPT / REVIEW / REJECT. REJECT ordinary language, fragments,
-truncated/bad Vietnamese, misclassification or semantic mismatch. REVIEW only likely
-important but uncertain terms: status provisional. Lock only strong explicit evidence.
-Preserve valid inherited locked mappings and existing stored state. Refine provisional
-only with meaningful stronger new RAW evidence. A character must act/be a person-like
+truncated/bad Vietnamese, misclassification or semantic mismatch. REVIEW and every
+other uncertain term map to IGNORE for runtime. Lock only strong explicit evidence.
+Preserve valid inherited locked mappings and existing stored state. A character must act/be a person-like
 entity. Gender requires explicit RAW evidence. Confident aliases/title address forms
 attach to canonical entity; never invent Chinese keys from Vietnamese. If alias belongs
 to an existing entity return that canonical entity with merged aliases/forms. If uncertain
@@ -70,9 +69,9 @@ BATCH_RESOLVE = (
 Each source retains independent evidence and output. Frequency and VP consensus alone
 do not establish identity, type, gender or a semantic alias. Preserve valid locked
 inherited mappings. Related existing entities are reference only, not extra candidates.
-Handle semantic conflicts explicitly. Reject ordinary phrases, quantity modifiers and
+Handle duplicate source identities explicitly. Reject ordinary phrases, quantity modifiers and
 grammar fragments. Attach proved titles/aliases to the canonical actor with exact
-Chinese-keyed forms; uncertain identity stays provisional and separate. Eligibility
+Chinese-keyed forms; uncertain identity is IGNORE and never a provisional mapping. Eligibility
 booleans must reflect RAW evidence. Do not translate prose. When repairing a batch,
 correct only the candidates included in that request, preserving accepted decisions.
 Never return type=character_alias as a canonical term. A proved person address form
@@ -80,8 +79,7 @@ must return type=character with the attested canonical Chinese full name, merged
 aliases, and forms[original_source] preserving the address wording. For example, if
 RAW proves 秦科长 is 秦舒曼, return source=秦舒曼, type=character,
 translation=Tần Thư Mạn, forms={"秦科长":"Khoa trưởng Tần"}.
-If RAW does not establish the full identity, retain the exact address source as a
-provisional character without invented aliases, or a generic title if it is a role.
+If RAW does not establish the full identity, return IGNORE without invented aliases.
 validator_feedback describes a failed independent record; correct that defect in
 your new result. A plain string reason does not repair an invalid term record.
 """
@@ -96,18 +94,23 @@ or invent hidden facts. Keep under 6000 characters.
 )
 TRANSLATE = (
     AUTHORITY
-    + """Translate RAW TO TRANSLATE only. Return the translated chapter
+    + """SOURCE PRIORITY: (1) FROZEN CONFIRMED TERMINOLOGY is mandatory and
+overrides VietPhrase wording; (2) RAW Chinese is the authoritative source of meaning;
+(3) VietPhrase is only an auxiliary reading, segmentation and wording hint. Ignore
+VietPhrase when it conflicts with RAW or the frozen dictionary.
+
+Translate RAW TO TRANSLATE only. Return the translated chapter
 title and exactly one segment per RAW paragraph ID, in source order. PREVIOUS CONTEXT
 is CONTEXT ONLY: do not translate again or include it in output. No artificial separators.
 Every meaningful RAW statement needs a counterpart; every translated statement needs
 RAW support. Follow relevant dictionary forms tied to corresponding source occurrences.
-Use each canonical translation verbatim (capitalization may follow sentence grammar).
+Use each confirmed canonical translation verbatim (capitalization may follow sentence grammar).
 Do not paraphrase or substitute synonyms for dictionary entries. For a forms key use
 that key's mapped address form; prefer the longest matching Chinese source name.
-The dictionary is frozen for this entire batch. If a truly new important term requires
-an unresolved canonical/alias decision, report it in unresolved_terms with exact RAW
-evidence. Do not invent a mapping or rewrite the frozen dictionary. Otherwise return
-unresolved_terms=[]. Infer immediate scene/speaker context from the supplied RAW,
+The dictionary is frozen for this entire batch. Do not create new dictionary mappings.
+If a possible new term is uncertain, translate it naturally from RAW context and return
+unresolved_terms=[]; uncertainty is diagnostics, not a reason to mutate or block the
+frozen dictionary. Infer immediate scene/speaker context from the supplied RAW,
 chapter metadata and small previous finalized context; no separate analysis is needed.
 """
 )
@@ -129,8 +132,16 @@ Context and reference text are not translation output and must not be reported a
 )
 REPAIR = (
     AUTHORITY
-    + """Repair ONLY the requested affected segment IDs using corresponding
-RAW, aligned VP, dictionary and neighboring context. Return exactly those IDs, retaining
-all correct content. -1 denotes chapter title. Do not regenerate unaffected segments.
+    + """Fix ONLY the concrete validator findings listed in this request.
+The whole-batch CONFIRMED dictionary is already frozen. RAW remains the meaning source;
+VietPhrase is only a hint. For every enforceable frozen dictionary
+mapping listed below, use the required Vietnamese form exactly; do not synonymize,
+reinterpret, rename, create an alias, or modify the dictionary. Do not modify
+report-only, unresolved, or non-enforceable entries merely to satisfy terminology
+consistency. Preserve unrelated translated text unless a grammatical adjustment is
+necessary. The previous repair feedback is evidence about the exact findings that
+remained or regressed; do not repeat a no-progress wording. Return the complete repaired
+chunk for exactly the requested affected segment IDs only, with no explanations or
+patches. -1 denotes chapter title. Do not regenerate unaffected segments.
 """
 )

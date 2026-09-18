@@ -197,3 +197,13 @@ test('frozen dictionary, request reasons and local zero-request statistics are v
     assert.ok(html.includes(`${operation} (local)</td><td>0</td><td>0</td>`), operation);
   }
 });
+
+test('dictionary confirmed and ignored summary remains visible', () => {
+  const api = load({ job: {
+    job_id: 'test', status: 'done', dictionary_frozen: true,
+    dictionary_report: { locked_terms: 842, provisional_terms: 37, needs_review: 5, unresolved_terms: 2, fatal_conflicts: 0 },
+    dictionary_review: [{ source: '极光石', translation: 'Cực Quang Thạch', severity: 'WARNING', reason: 'item/material classification unresolved', confidence: 0.978, resolver_attempts: 3, fallback: 'provisional' }],
+  } });
+  const html = renderToStaticMarkup(React.createElement(api.TranslationWorkspace));
+  for (const text of ['Dictionary summary', '842 confirmed', '37 ignored', '极光石', 'Cực Quang Thạch', 'item/material classification unresolved', 'confidence 97.8%', 'fallback: provisional']) assert.ok(html.includes(text), text);
+});

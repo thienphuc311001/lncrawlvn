@@ -3,7 +3,7 @@
 import re
 from collections import Counter
 
-from .dictionary import terminology_gaps
+from .dictionary import terminology_findings
 from .models import Issue
 from .parsing import HAN, HEADING, chapter_number
 
@@ -121,12 +121,29 @@ def local_findings(payload, translation):
                     explanation="Literal placeholders/markup changed or added",
                 )
             )
-        for source, expected_form in terminology_gaps(payload.get("terminology", []), raw, text):
+        for finding in terminology_findings(
+            payload.get("terminology", []), raw, text, payload.get("location")
+        ):
             issues.append(
                 Issue(
                     segment_id=paragraph_id,
                     kind="terminology",
-                    explanation=f"RAW contains {source}; preserve frozen mapping {expected_form!r}",
+                    explanation=(
+                        f"RAW contains {finding['source']}; frozen mapping requires "
+                        f"{finding['required_translation']!r}, but the translated text "
+                        f"contains {finding['actual_text'] or 'no matching realization'!r} "
+                        f"({finding['reason']})"
+                    ),
+                    type=finding["type"],
+                    source=finding["source"],
+                    canonical_source=finding["canonical_source"],
+                    required_translation=finding["required_translation"],
+                    actual_text=finding["actual_text"],
+                    reason=finding["reason"],
+                    source_occurrences=finding["source_occurrences"],
+                    expected_occurrences=finding["expected_occurrences"],
+                    matched_occurrences=finding["matched_occurrences"],
+                    location=finding["location"],
                 )
             )
     # Equal RAW repetitions are legitimate; unrelated long paragraphs repeated

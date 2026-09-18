@@ -6,6 +6,10 @@ const API = 'http://127.0.0.1:8000/api/translation';
 type TranslationEvent = {
   id?: string; timestamp?: string; task?: string; model?: string; status: string;
   attempt?: number; key_slot?: number; retry_after?: number; category?: string; operation?: string; reason?: string; error?: string; message?: string;
+  source?: string; occurrences?: number; confidence?: number; resolver_attempts?: number;
+  fallback?: string; severity?: string; continue?: boolean;
+  findings?: Array<Record<string, unknown>>; resolved_findings?: Array<Record<string, unknown>>;
+  remaining_findings?: Array<Record<string, unknown>>; new_findings?: Array<Record<string, unknown>>;
 };
 type Job = {
   job_id: string; status: string; stage?: string; error?: string; error_detail?: unknown;
@@ -15,6 +19,17 @@ type Job = {
   active_chapters?: Record<string, { chunk: number; chunks: number }>;
   logs?: TranslationEvent[];
   dictionary_hash?: string; dictionary_frozen?: boolean;
+  dictionary_report?: {
+    confirmed_terms?: number; ignored_candidates?: number;
+    locked_terms?: number; provisional_terms?: number; needs_review?: number;
+    report_only_terms?: number; unresolved_terms: number; unresolved_plausible_terms?: number;
+    rejected_generic_candidates?: number; fatal_conflicts?: number;
+  };
+  dictionary_review?: Array<{
+    source: string; translation?: string | null; reason?: string; severity?: string;
+    resolution_status?: string; confidence?: number; resolver_attempts?: number;
+    fallback?: string; continue?: boolean;
+  }>;
   request_statistics?: {
     total_requests: number; requests: Record<string, number>; logical_operations: Record<string, number>;
     local_ai_requests: Record<string, number>; retry: number; model_fallback: number; cache_hits: number;
@@ -57,10 +72,13 @@ function ErrorNotice({ detail }: { detail: unknown }) {
 
 function translationLogText(event: TranslationEvent): string {
   const metadata = [
-    event.status.toUpperCase(), event.task, event.operation?.replaceAll('_', ' '), event.model,
+    event.status.toUpperCase(), event.task, event.operation?.replaceAll('_', ' '), event.source, event.model,
     event.key_slot !== undefined ? `Key slot ${event.key_slot}` : null,
     event.category, event.attempt !== undefined ? `Attempt ${event.attempt}/2` : null,
     event.retry_after !== undefined ? `Retry after ${event.retry_after}s` : null,
+    event.confidence !== undefined ? `Confidence ${(event.confidence * 100).toFixed(1)}%` : null,
+    event.fallback ? `Fallback ${event.fallback}` : null,
+    event.severity, event.continue === false ? 'Continue false' : null,
   ].filter(Boolean).join(' · ');
   const timestamp = event.timestamp ? `[${event.timestamp.replace('T', ' ').replace(/\.\d+/, '')}] ` : '';
   const message = event.error ?? event.message ?? event.reason;
@@ -245,12 +263,24 @@ export default function TranslationWorkspace() {
       <p>{job.status} · {job.completed_chapters ?? 0}/{job.total_chapters ?? '?'} chapters finalized</p>
       {job.aligned !== undefined && <p>Aligned chapters: {job.aligned}</p>}
       {job.dictionary_frozen && <p>Dictionary frozen for this batch · {job.dictionary_hash?.slice(0, 12)}</p>}
+      {job.dictionary_report && <details className="dictionary-report" open={(job.dictionary_report.ignored_candidates ?? job.dictionary_report.report_only_terms ?? job.dictionary_report.provisional_terms ?? 0) > 0 || (job.dictionary_report.fatal_conflicts ?? 0) > 0}>
+        <summary>Dictionary summary · {job.dictionary_report.confirmed_terms ?? job.dictionary_report.locked_terms ?? 0} confirmed · {job.dictionary_report.ignored_candidates ?? job.dictionary_report.report_only_terms ?? job.dictionary_report.provisional_terms ?? 0} ignored</summary>
+        <p>Confirmed: {job.dictionary_report.confirmed_terms ?? job.dictionary_report.locked_terms ?? 0} · Ignored candidates: {job.dictionary_report.ignored_candidates ?? job.dictionary_report.report_only_terms ?? job.dictionary_report.provisional_terms ?? 0} · Rejected generic: {job.dictionary_report.rejected_generic_candidates ?? 0} · Fatal conflicts: {job.dictionary_report.fatal_conflicts ?? 0}</p>
+        {(job.dictionary_review ?? []).map(entry => <article className="dictionary-review-entry" key={entry.source}>
+          <strong>{entry.source}</strong>{entry.translation && <span> → {entry.translation}</span>}
+          <span> · {entry.severity ?? 'REVIEW_REQUIRED'} · {entry.reason ?? entry.resolution_status ?? 'Review required'}</span>
+          {entry.confidence !== undefined && <span> · confidence {(entry.confidence * 100).toFixed(1)}%</span>}
+          {entry.resolver_attempts !== undefined && <span> · {entry.resolver_attempts} resolver attempt(s)</span>}
+          {entry.fallback && <span> · fallback: {entry.fallback}</span>}
+        </article>)}
+      </details>}
       {job.stage === 'Dictionary resolution' && job.candidate_count !== undefined && job.resolved_candidates !== undefined && <p>Terms reviewed: {job.resolved_candidates}/{job.candidate_count}{job.current_term ? ` · ${job.current_term}` : ''}</p>}
       {Object.entries(job.active_chapters ?? {}).map(([chapter, value]) => <p key={chapter}>{chapterLabel(chapter)} · Chunk {value.chunk}/{value.chunks}</p>)}
       <ErrorNotice detail={job.error_detail ?? job.error} />
       {active ? <button className="btn btn-ghost" disabled={busy} onClick={() => void action('cancel')}>Cancel</button>
         : job.status !== 'done' && <button className="btn btn-primary" disabled={busy} onClick={() => void action('resume')}>Resume batch</button>}
       {job.status === 'done' && <div className="translation-downloads">
+        <a className="btn btn-primary" href={`${API}/jobs/${job.job_id}/outputs/translated.txt`}>Vietnamese TXT</a>
         <a className="btn btn-primary" href={`${API}/jobs/${job.job_id}/outputs/translated.json`}>Translated Chapters</a>
         <a className="btn btn-primary" href={`${API}/jobs/${job.job_id}/outputs/dictionary.json`}>Updated Book Dictionary</a>
       </div>}

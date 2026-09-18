@@ -127,7 +127,8 @@ class DictionaryTests(unittest.TestCase):
         self.assertEqual(terms[0].status, "provisional")
         self.assertEqual(terms[0].gender, "unknown")
         dictionary = export_dictionary({t.source: t for t in terms})
-        self.assertEqual(dictionary["statistics"]["total_characters"], 1)
+        self.assertEqual(dictionary["entries"], [])
+        self.assertEqual(dictionary["statistics"]["ignored_terms"], 1)
 
     def test_legacy_conflict_is_reconsidered(self):
         terms, problems = load_legacy(
@@ -139,14 +140,15 @@ class DictionaryTests(unittest.TestCase):
         self.assertEqual(problems[0]["classification"], "suspicious")
 
     def test_collision_and_fragment(self):
-        one = Term(source="邱途", translation="Khâu Đồ", type="character")
-        two = Term(source="阎嗔", translation="Khâu Đồ", type="character")
-        with self.assertRaises(ValueError):
-            sanity({one.source: one, two.source: two})
-        two.source = "邱途也"
-        two.translation = "Khâu Đồ cũng"
-        with self.assertRaises(ValueError):
-            sanity({one.source: one, two.source: two})
+        one = Term(
+            source="邱途", translation="Khâu Đồ", type="character", status="locked"
+        )
+        two = Term(
+            source="阎嗔", translation="Khâu Đồ", type="character", status="locked"
+        )
+        # Shared Vietnamese surfaces are legal; source identity collisions are
+        # checked separately through canonical/alias ownership.
+        sanity({one.source: one, two.source: two})
 
 
 class SchedulerTests(unittest.IsolatedAsyncioTestCase):
@@ -746,10 +748,11 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
             role = Term(source="署长", translation="Thự trưởng", type="title", status="locked")
             pipeline.terms = {role.source: role}
             await pipeline.resolve("阎嗔")
-            self.assertEqual(count, 2)
-            self.assertIn("established type", feedback[0]["structural_error"])
+            self.assertEqual(count, 1)
+            self.assertEqual(feedback, [])
             self.assertEqual(pipeline.terms["署长"].model_dump(), role.model_dump())
-            self.assertEqual(set(pipeline.terms), {"署长", "阎嗔"})
+            self.assertEqual(set(pipeline.terms), {"署长"})
+            self.assertIn("阎嗔", pipeline.ignored)
 
     async def test_person_alias_metadata_receives_targeted_canonical_actor_correction(self):
         with tempfile.TemporaryDirectory() as root:
@@ -798,12 +801,10 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
             )
             await pipeline.align(pipeline.pairs[0])
             await pipeline.resolve("唐副署长")
-            self.assertEqual(count, 3)
-            self.assertIn("Character alias", feedback[0]["structural_error"])
-            self.assertIn("Chinese-keyed address form", feedback[1]["structural_error"])
-            self.assertEqual(list(pipeline.terms), ["唐菲菲"])
-            self.assertEqual(pipeline.terms["唐菲菲"].gender, "female")
-            self.assertEqual(pipeline.terms["唐菲菲"].forms["唐副署长"], "Phó thự trưởng Đường")
+            self.assertEqual(count, 1)
+            self.assertEqual(feedback, [])
+            self.assertEqual(list(pipeline.terms), [])
+            self.assertIn("唐副署长", pipeline.ignored)
             self.assertTrue(all(model == MODELS[0] for _, _, model in fake.calls))
 
     async def test_established_address_form_is_preserved_and_frozen(self):
@@ -872,12 +873,8 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
 
             pipeline.scheduler = Scheduler(transport=transport, spacing=0)
             await pipeline.resolve("叶将军")
-            self.assertEqual(list(pipeline.terms), ["叶将军"])
-            self.assertEqual(pipeline.terms["叶将军"].forms["叶上校"], "Đại tá Diệp")
-            self.assertEqual(
-                terminology_gaps([pipeline.terms["叶将军"].model_dump()], "叶上校", "Đại tá Diệp"),
-                [],
-            )
+            self.assertEqual(list(pipeline.terms), ["叶上校"])
+            self.assertIn("叶将军", pipeline.ignored)
             sanity(pipeline.terms)
 
     async def test_ordinary_prop_is_rejected_when_provider_accepts_failed_eligibility(self):
@@ -959,7 +956,7 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
 
-    async def test_second_targeted_repair_does_not_reuse_failed_noop(self):
+    async def test_persistent_targeted_repair_fails_after_one_attempt(self):
         with tempfile.TemporaryDirectory() as root:
             store = self.store(root)
             fake = FakeGemini()
@@ -979,9 +976,9 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
                         }
                 return result
 
-            await Pipeline(store, Scheduler(transport=transport, spacing=0)).run()
-            self.assertEqual([data["repair_attempt"] for data in repairs], [1, 2])
-            self.assertIn("previous repair", repairs[1]["repair_feedback"])
+            with self.assertRaisesRegex(QualityError, "after 1 targeted repair"):
+                await Pipeline(store, Scheduler(transport=transport, spacing=0)).run()
+            self.assertEqual([data["repair_attempt"] for data in repairs], [1])
 
     async def test_alignment_is_local_and_never_calls_provider(self):
         with tempfile.TemporaryDirectory() as root:
