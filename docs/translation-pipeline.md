@@ -82,6 +82,17 @@ ambiguous records become `IGNORE`. A resolver `REVIEW`, reject, malformed result
 uncertain alias is `IGNORE`, not a provisional runtime mapping. The resolver is only
 called for plausible RAW candidates that survive local filtering.
 
+Candidate confirmation is class-specific. The scan classifies a span as a character or
+character reference, location, named book/work, organization/faction, artifact,
+technique, honorific/official office, event, concept, generic phrase or malformed
+noise before resolution. Character references still require ownership evidence; named
+places, works and items use proper-name/stable-use evidence instead. Generic places such
+as `京城`, quantities and ordinary actions remain `IGNORE`, while historical reality by
+itself never promotes a term. Non-character confirmations retain structured
+`entity_evidence` such as title-marker/work context, location counts, organization
+stability, item-use context or technique-use context rather than borrowing character
+identity fields.
+
 The dictionary is sanity-checked before freeze for valid source/target text,
 duplicate canonical identities, alias ownership and contradictory mappings. The
 frozen artifact contains confirmed entries only. Its content hash is carried by

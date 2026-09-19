@@ -1200,6 +1200,8 @@ def export_dictionary(terms, include_ignored=False):
                 value.pop(field, None)
         if not value.get("form_kinds"):
             value.pop("form_kinds", None)
+        if not value.get("entity_evidence"):
+            value.pop("entity_evidence", None)
         if value.get("candidate_shape") is None:
             value.pop("candidate_shape", None)
         if not value.get("identity_evidence"):

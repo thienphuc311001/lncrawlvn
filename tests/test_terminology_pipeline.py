@@ -13,7 +13,7 @@ from lncrawl.translation.dictionary import (
 from lncrawl.translation.models import Inputs, Resolution, Segment, Term, Translation
 from lncrawl.translation.parsing import deterministic_alignment, validate_inputs
 from lncrawl.translation.pipeline import Pipeline
-from lncrawl.translation.preprocessing import build_index, local_resolution
+from lncrawl.translation.preprocessing import build_index, class_confirmation, local_resolution
 from lncrawl.translation.scheduler import Scheduler
 from lncrawl.translation.store import Store, digest
 from lncrawl.translation.validation import local_findings
@@ -159,6 +159,95 @@ class TerminologyPipelineRegressionTests(unittest.TestCase):
             [],
         )
         self.assertIn("张侍班", proven["candidates"])
+
+    def test_entity_classes_use_non_character_confirmation_policies(self):
+        pairs = validate_inputs(
+            "第1章\n进入乾清宫。\n《九章算术》记载算法。\n世宗实录被重新刊修。\n世宗实录再次记载。\n世子殿下来了。\n世子殿下又来了。\n施展了丁字回杀。\n京城来了。\n1000个铜钱。\n今先生说道。",
+            "Chương 1\nVào Càn Thanh cung.\n《Cửu Chương Toán Thuật》 ghi chép thuật toán.\nThế Tông thực lục được biên tu.\nThế Tông thực lục lại ghi.\nThế tử điện hạ đến.\nThế tử điện hạ lại đến.\nThi triển Đinh Tự Hồi Sát.\nKinh thành đến.\n1000 đồng tiền.\nKim tiên sinh nói.",
+        )
+        index = build_index(
+            pairs, {raw.key: deterministic_alignment(raw, vp) for raw, vp in pairs}, []
+        )
+        self.assertEqual(index["candidates"]["乾清宫"]["entity_class"], "location")
+        self.assertEqual(index["candidates"]["九章算术"]["entity_class"], "book_title")
+        self.assertEqual(index["candidates"]["世宗实录"]["entity_class"], "historical_work")
+        self.assertEqual(index["candidates"]["世子殿下"]["entity_class"], "honorific")
+        self.assertEqual(index["candidates"]["丁字回杀"]["entity_class"], "technique")
+        self.assertEqual(index["report_only"]["京城"]["entity_class"], "generic")
+        self.assertEqual(index["report_only"]["1000个铜钱"]["entity_class"], "generic")
+        self.assertEqual(index["report_only"]["今先生"]["entity_class"], "malformed")
+        self.assertTrue(
+            class_confirmation(index["candidates"]["乾清宫"])["confirmed"]
+        )
+
+    def test_character_reference_still_requires_an_owner(self):
+        weak_pairs = validate_inputs(
+            "第1章\n万尚书说道。",
+            "Chương 1\nVạn Thượng thư nói.",
+        )
+        weak = build_index(
+            weak_pairs,
+            {raw.key: deterministic_alignment(raw, vp) for raw, vp in weak_pairs},
+            [],
+        )
+        self.assertNotIn("万尚书", weak["candidates"])
+        self.assertEqual(weak["report_only"]["万尚书"]["entity_class"], "character_reference")
+
+        strong_pairs = validate_inputs(
+            "第1章\n万历任尚书。万尚书说道。",
+            "Chương 1\nVạn Lịch nhậm Thượng thư. Vạn Thượng thư nói.",
+        )
+        strong = build_index(
+            strong_pairs,
+            {raw.key: deterministic_alignment(raw, vp) for raw, vp in strong_pairs},
+            [],
+        )
+        self.assertEqual(strong["candidates"]["万尚书"]["entity_class"], "character_reference")
+
+    def test_non_character_resolution_does_not_use_character_identity_gate(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = Store(
+                Path(root),
+                Inputs(
+                    raw="第1章\n《九章算术》记载算法。",
+                    vietphrase="Chương 1\n《Cửu Chương Toán Thuật》 ghi chép thuật toán.",
+                ).model_dump(),
+            )
+            pipeline = Pipeline(store, Scheduler(concurrency=1, spacing=0))
+            pipeline.pairs = validate_inputs(
+                store.read("inputs.json")["raw"], store.read("inputs.json")["vietphrase"]
+            )
+            pipeline.index = build_index(
+                pipeline.pairs,
+                {
+                    raw.key: deterministic_alignment(raw, vp)
+                    for raw, vp in pipeline.pairs
+                },
+                [],
+            )
+            term = pipeline.apply_resolution(
+                "九章算术",
+                None,
+                Resolution.model_validate(
+                    {
+                        "decision": "ACCEPT",
+                        "eligibility": {
+                            "complete_semantic_unit": True,
+                            "named_or_novel_specific": True,
+                            "consistency_matters": True,
+                            "evidence_supports": True,
+                        },
+                        "term": {
+                            "source": "九章算术",
+                            "translation": "Cửu Chương Toán Thuật",
+                            "type": "book_title",
+                        },
+                        "reason": "explicit named work",
+                    }
+                ),
+            )
+            self.assertEqual(term.type, "book_title")
+            self.assertEqual(term.source, "九章算术")
 
     def test_generic_candidates_are_report_only_and_not_resolver_candidates(self):
         pairs = validate_inputs(

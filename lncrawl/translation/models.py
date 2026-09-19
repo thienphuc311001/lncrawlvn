@@ -9,8 +9,8 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 from .style import AUTO, MODERN, SINO_VIETNAMESE, configured_register
 
 MODELS = ("gemini-3.1-flash-lite", "gemini-3.5-flash-lite", "gemini-3.7-flash")
-PIPELINE_VERSION = 10
-DICTIONARY_VERSION = 6
+PIPELINE_VERSION = 11
+DICTIONARY_VERSION = 7
 PARSER_VERSION = 6
 CONFIRMED = "CONFIRMED"
 IGNORE = "IGNORE"
@@ -147,9 +147,14 @@ class Term(StrictModel):
         "character_form",
         "character_alias",
         "title",
+        "honorific",
+        "official_title",
+        "historical_office",
         "occupation",
         "faction",
         "organization",
+        "book_title",
+        "historical_work",
         "location",
         "realm",
         "technique",
@@ -158,6 +163,7 @@ class Term(StrictModel):
         "race",
         "creature",
         "concept",
+        "event",
         "other_term",
         "unknown",
         "proper_noun",
@@ -192,6 +198,10 @@ class Term(StrictModel):
     identity_evidence: List[IdentityEvidence] = Field(default_factory=list)
     evidence_types: List[Literal[IDENTITY_EVIDENCE_TYPES]] = Field(default_factory=list)
     competing_identities: List[str] = Field(default_factory=list)
+    # Evidence for non-character entity classes.  Character ownership remains
+    # in the structured identity fields above; these fields prevent places,
+    # works and named items from being forced through that identity gate.
+    entity_evidence: Dict[str, object] = Field(default_factory=dict)
     # This is intentionally explicit.  A Vietnamese suggestion is not, by
     # itself, a frozen terminology constraint.  Missing legacy values are
     # migrated conservatively by the validator below.
@@ -265,6 +275,7 @@ class ResolverTerm(StrictModel):
     identity_evidence: List[IdentityEvidence] = Field(default_factory=list)
     evidence_types: List[Literal[IDENTITY_EVIDENCE_TYPES]] = Field(default_factory=list)
     competing_identities: List[str] = Field(default_factory=list)
+    entity_evidence: Dict[str, object] = Field(default_factory=dict)
 
     @model_validator(mode="before")
     @classmethod
@@ -322,6 +333,7 @@ class Resolution(StrictModel):
     identity_evidence: List[IdentityEvidence] = Field(default_factory=list)
     evidence_types: List[Literal[IDENTITY_EVIDENCE_TYPES]] = Field(default_factory=list)
     competing_identities: List[str] = Field(default_factory=list)
+    entity_evidence: Dict[str, object] = Field(default_factory=dict)
 
 
 class CandidateResolution(Resolution):

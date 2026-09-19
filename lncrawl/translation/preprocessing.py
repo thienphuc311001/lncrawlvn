@@ -68,7 +68,7 @@ SURNAMES = dict(
         "朱:Chu 高:Cao 林:Lâm 何:Hà 郭:Quách 马:Mã 罗:La 梁:Lương 宋:Tống 郑:Trịnh "
         "谢:Tạ 韩:Hàn 曹:Tào 许:Hứa 沈:Thẩm 袁:Viên 冯:Phùng 苏:Tô 吕:Lữ 丁:Đinh "
         "任:Nhậm 姚:Diêu 傅:Phó 石:Thạch 陆:Lục 白:Bạch 魏:Ngụy 江:Giang 萧:Tiêu "
-        "顾:Cố 方:Phương 杜:Đỗ 孟:Mạnh 齐:Tề 宁:Ninh 温:Ôn 祝:Chúc 龙:Long 蓝:Lam"
+        "顾:Cố 方:Phương 杜:Đỗ 孟:Mạnh 齐:Tề 宁:Ninh 温:Ôn 祝:Chúc 龙:Long 蓝:Lam 万:Vạn"
     ).split()
 )
 GRAMMAR = set(
@@ -113,6 +113,14 @@ SUFFIXES = (
     "功法",
     "宗",
     "派",
+    "卫",
+    "部",
+    "司",
+    "局",
+    "院",
+    "党",
+    "营",
+    "军",
     "城",
     "市",
     "宫",
@@ -123,6 +131,10 @@ SUFFIXES = (
     "石",
     "剑",
     "刀",
+    "枪",
+    "印",
+    "令",
+    "符",
 )
 
 # These are classification signals, not a blanket stop-list.  A phrase that
@@ -138,6 +150,10 @@ GENERIC_COMMON_PHRASES = {
     "方式",
     "感情",
     "基石",
+    "京城",
+    "上殿",
+    "三千石",
+    "两块陨石",
 }
 DESCRIPTIVE_MARKERS = {
     "方式",
@@ -186,66 +202,264 @@ TITLE_PATTERN = re.compile(
     + r")$"
 )
 
+# Candidate classes are deliberately explicit.  They are used both by local
+# filtering and by the resolver prompt; character ownership is only one of
+# these policies, never the default for every Chinese span.
+ENTITY_CLASS_POLICIES = {
+    "character": {"term_type": "character", "needs_identity_proof": True},
+    "character_reference": {"term_type": "character", "needs_identity_proof": True},
+    "location": {"term_type": "location", "needs_named_entity_proof": True},
+    "book_title": {"term_type": "book_title", "needs_named_work_proof": True},
+    "historical_work": {"term_type": "historical_work", "needs_named_work_proof": True},
+    "organization": {"term_type": "organization", "needs_stable_name_proof": True},
+    "artifact": {"term_type": "artifact", "needs_named_item_proof": True},
+    "technique": {"term_type": "technique", "needs_named_technique_proof": True},
+    "honorific": {"term_type": "honorific", "needs_stable_name_proof": True},
+    "official_title": {"term_type": "official_title", "needs_stable_name_proof": True},
+    "historical_office": {"term_type": "historical_office", "needs_stable_name_proof": True},
+    "event": {"term_type": "event", "needs_named_event_proof": True},
+    "concept": {"term_type": "concept", "needs_named_concept_proof": True},
+    "proper_noun": {"term_type": "proper_noun", "needs_named_entity_proof": True},
+    "generic": {"term_type": "generic_phrase", "ignore": True},
+    "malformed": {"term_type": "unknown", "ignore": True},
+}
 
-def classify_candidate(source, reasons, contexts, frequency=0, inherited=False):
-    """Classify obvious ordinary-language candidates before resolver work.
+LOCATION_SUFFIXES = ("宫", "城", "府", "殿", "台", "楼", "关", "门", "陵", "寺", "观", "园", "苑", "堂", "阁")
+WORK_SUFFIXES = ("实录", "会计录", "算术", "算法大全", "演义", "括囊", "志", "录", "书", "图", "经", "传", "集")
+ORGANIZATION_SUFFIXES = ("卫", "部", "署", "司", "局", "院", "会", "教", "门", "党", "派", "营", "军")
+ARTIFACT_SUFFIXES = ("丹", "剑", "刀", "枪", "印", "令", "符", "琴", "鼎", "珠", "石", "杖", "弓", "甲")
+TECHNIQUE_SUFFIXES = ("诀", "功法", "剑法", "刀法", "掌", "拳", "阵", "式", "杀", "术")
+KNOWN_OFFICE_TERMS = frozenset({"大司徒", "尚书", "侍班", "缇帅", "大伴", "帅"})
+GENERIC_PLACE_TERMS = frozenset({"京城", "三大殿", "上殿", "城中", "宫中", "府中", "殿内"})
+GENERIC_GROUP_TERMS = frozenset({"主战派", "两派", "七派"})
+LOCATION_CUE = re.compile(r"(?:在|到|往|从|入|进|驻|居|经过|位于|离开|宫中|城中|府中|殿内|殿中)")
+WORK_CUE = re.compile(r"(?:编|著|作|读|刊|修|载|录入|成书|撰|校)")
+ORGANIZATION_CUE = re.compile(r"(?:隶属|所属|加入|统领|统辖|率领|官|衙门|组织|党羽|一派)")
+ITEM_CUE = re.compile(r"(?:一枚|一颗|一柄|一把|一件|服下|吞下|炼制|祭出|佩戴|取出|收起|名为|称为)")
+TECHNIQUE_CUE = re.compile(r"(?:使出|施展|发动|运转|练习|修炼|施放|一招|招式|绝招|功法)")
+EVENT_CUE = re.compile(r"(?:起兵|攻打|围城|逼宫|之乱|之变|战役|大战|战事|叛乱)")
+CONCEPT_CUE = re.compile(r"(?:制度|学说|理论|法则|体系|思想|主义|制度)")
+MALFORMED_PREFIXES = ("且", "今日", "今", "书")
 
-    The classifier deliberately returns ``None`` for uncertain material.  A
-    positive classification is only used for conservative local rejection or
-    report-only bookkeeping; it never promotes a candidate into a dictionary
-    entry.
-    """
+
+def _has_marker(source, contexts, left="《", right="》"):
+    return any(f"{left}{source}{right}" in context for context in contexts)
+
+
+def _character_reference_proven(source, contexts):
+    """Small local gate used only for references to a person."""
+    identity = re.compile(
+        re.escape(source) + r".{0,18}(?:就是|是|名为|叫做|称为|即|乃)[\u3400-\u9fff]{2,8}"
+    )
+    reverse = re.compile(
+        r"[\u3400-\u9fff]{2,8}.{0,18}(?:就是|是|名为|叫做|称为|即|乃)" + re.escape(source)
+    )
+    if any(identity.search(context) or reverse.search(context) for context in contexts):
+        return True
+    address = style.address_spec(source, contexts=contexts)
+    if not address:
+        return False
+    if address.get("prefix_reference") and len(address.get("person_source", "")) >= 3:
+        return True
+    suffix = address.get("suffix")
+    surname = address.get("surname")
+    role = re.compile(
+        r"[\u3400-\u9fff]{2,8}(?:担任|官至|升为|晋升为|改任|任职|任|成为)"
+        r"[\u3400-\u9fff]{0,8}"
+        + re.escape(suffix or "")
+    )
+    return bool(
+        suffix
+        and surname
+        and any(
+            surname in context and role.search(context)
+            for context in contexts
+        )
+    )
+
+
+def classify_entity(source, reasons, contexts, frequency=0, inherited=False):
+    """Classify before confirmation; each class gets its own evidence policy."""
     if inherited:
-        return None
+        return "unknown", "inherited confirmed terminology"
+    contexts = [context for context in contexts or () if context]
     named_signals = {
         "explicit_named_marker",
         "explicit_naming_context",
         "possible_person_alias",
     }
-    if named_signals.intersection(reasons):
-        return None
-    if source in GENERIC_VERB_PHRASES:
-        return "verb_phrase", "ordinary verb phrase"
-    if source in GENERIC_COMMON_PHRASES:
-        return "common_noun", "ordinary compositional noun phrase"
-    if re.match(r"^\d+(?:[-–~～]\d+)?(?:种|类|个|名|件|种)", source):
-        return "descriptive_phrase", "numeric descriptive phrase"
-    if any(marker in source for marker in DESCRIPTIVE_MARKERS) and not TITLE_PATTERN.search(source):
-        return "descriptive_phrase", "compositional descriptive phrase"
-    if TITLE_PATTERN.search(source) or style.address_spec(source):
-        # A title/address remains a plausible candidate when RAW proves an
-        # identity relationship.  Otherwise it is audit-only, never a new
-        # canonical character identity.
-        identity = re.compile(
-            re.escape(source) + r".{0,18}(?:就是|是|名为|叫做|称为|即|乃)[\u3400-\u9fff]{2,8}"
-        )
-        reverse = re.compile(
-            r"[\u3400-\u9fff]{2,8}.{0,18}(?:就是|是|名为|叫做|称为|即|乃)" + re.escape(source)
-        )
-        direct = any(identity.search(context) or reverse.search(context) for context in contexts)
-        address = style.address_spec(source)
-        suffix = address.get("suffix") if address else ""
+    named_candidate = bool(named_signals.intersection(reasons))
+    if source in GENERIC_VERB_PHRASES and not named_candidate:
+        return "generic", "ordinary verb phrase"
+    if (
+        source in GENERIC_COMMON_PHRASES
+        or source in GENERIC_PLACE_TERMS
+        or source in GENERIC_GROUP_TERMS
+    ) and not named_candidate:
+        return "generic", "ordinary or generic compositional phrase"
+    if re.match(r"^\d+(?:[-–~～]\d+)?(?:种|类|个|名|件|队|位|块|颗|枚)", source) and not named_candidate:
+        return "generic", "quantity or numeric descriptive phrase"
+    if (
+        any(marker in source for marker in DESCRIPTIVE_MARKERS)
+        and not TITLE_PATTERN.search(source)
+        and not named_candidate
+    ):
+        return "generic", "compositional descriptive phrase"
+    if source.startswith(MALFORMED_PREFIXES) and len(source) > 2:
+        if source.startswith(("且", "今", "今日")) and (style.address_spec(source) or source[-1:] in {"伯", "生"}):
+            return "malformed", "leading contextual residue"
+        if source.startswith("书") and len(source) <= 4:
+            return "malformed", "contained fragment"
+    if source.startswith("了") and len(source) > 3 and any(source.endswith(suffix) for suffix in TECHNIQUE_SUFFIXES):
+        return "malformed", "leading aspect residue"
+
+    if source in KNOWN_OFFICE_TERMS:
+        return "official_title", "historical office/title vocabulary"
+
+    address = style.address_spec(source, contexts=contexts)
+    if address or TITLE_PATTERN.search(source):
+        if address and address.get("prefix_reference"):
+            return "character_reference", "title prefix reference"
         surname = address.get("surname") if address else ""
-        prefix_reference = bool(address and address.get("prefix_reference"))
-        complete_prefix_name = bool(
-            prefix_reference
-            and len(address.get("person_source", "")) >= 3
-        )
-        role_context = bool(
-            suffix
-            and surname
-            and any(
-                (anchor := re.search(surname + r"(?P<person>[\u3400-\u9fff]{2})", context))
-                and anchor.group("person") != suffix[:2]
-                and suffix in context
-                and re.search(r"(?:任|担任|官至|升为|晋升为|改任|成为|任职|为)", context)
+        suffix = address.get("suffix") if address else ""
+        if surname and surname[:1] in SURNAMES:
+            return "character_reference", "surname plus title/reference"
+        if source in KNOWN_OFFICE_TERMS or suffix in {"尚书", "侍班", "缇帅", "大伴", "帅"}:
+            if frequency >= 2 or _has_marker(source, contexts) or any(
+                re.search(r"(?:任|担任|官至|升为|改任|任职|属于|称为)", context)
                 for context in contexts
-            )
+            ):
+                return "official_title", "stable historical office/title usage"
+            return "official_title", "historical office/title requires confirmation"
+        # A standalone expression such as 世子殿下 can be stable terminology;
+        # it is not automatically a person identity.
+        if len(source) >= 3 and (frequency >= 2 or named_signals.intersection(reasons)):
+            return "honorific", "stable standalone honorific"
+        return "character_reference", "title/reference identity requires proof"
+
+    if "person_name_pattern" in reasons:
+        return "character", "person-name morphology"
+
+    if _has_marker(source, contexts, "《", "》"):
+        return "book_title", "explicit named work marker"
+    if "explicit_named_marker" in reasons and source.endswith(WORK_SUFFIXES):
+        return "book_title", "named work marker"
+    if any(source.endswith(suffix) for suffix in WORK_SUFFIXES) and any(
+        WORK_CUE.search(context) or source in context for context in contexts
+    ):
+        return "historical_work", "named work context"
+
+    if source.endswith(LOCATION_SUFFIXES) and len(source) >= 3 and source not in GENERIC_PLACE_TERMS:
+        if "explicit_named_marker" in reasons or any(LOCATION_CUE.search(context) for context in contexts) or frequency >= 2:
+            return "location", "proper place morphology and location context"
+    if source.endswith(ORGANIZATION_SUFFIXES) and len(source) >= 3:
+        if "explicit_named_marker" in reasons or any(ORGANIZATION_CUE.search(context) for context in contexts) or frequency >= 2:
+            return "organization", "stable organization/faction context"
+    if source.endswith(TECHNIQUE_SUFFIXES) and len(source) >= 3:
+        if "explicit_named_marker" in reasons or any(TECHNIQUE_CUE.search(context) for context in contexts) or frequency >= 2:
+            return "technique", "named technique/ability context"
+    if source.endswith(ARTIFACT_SUFFIXES) and len(source) >= 3:
+        if "explicit_named_marker" in reasons or any(ITEM_CUE.search(context) for context in contexts) or frequency >= 2:
+            return "artifact", "named item context"
+    if any(EVENT_CUE.search(context) for context in contexts) and frequency >= 1:
+        return "event", "named event context"
+    if any(CONCEPT_CUE.search(context) for context in contexts) and frequency >= 2:
+        return "concept", "stable named concept context"
+    if named_signals.intersection(reasons) or "repeated_entity_or_genre_suffix" in reasons:
+        return "proper_noun", "explicit or repeated named-entity signal"
+    return "unknown", "classification remains uncertain"
+
+
+def class_confirmation(candidate, entity_class=None):
+    """Apply class-specific deterministic evidence, never identity rules globally."""
+    entity_class = entity_class or candidate.get("entity_class", "unknown")
+    contexts = [item.get("raw", "") for item in candidate.get("representative_evidence", [])]
+    source = candidate.get("source", "")
+    reasons = set(candidate.get("reasons", []))
+    frequency = candidate.get("frequency", 0)
+    if entity_class in {"generic", "malformed"}:
+        return {"confirmed": False, "reason": "generic_or_malformed_candidate", "evidence": {}}
+    if entity_class in {"character", "character_reference"}:
+        return {
+            "confirmed": entity_class == "character" or _character_reference_proven(source, contexts),
+            "reason": "character_identity_requires_owner_proof",
+            "evidence": {"identity_evidence": contexts[:3]},
+        }
+    explicit = "explicit_named_marker" in reasons
+    repeated = frequency >= 2
+    if entity_class in {"location", "proper_noun"}:
+        positive = explicit or repeated or any(LOCATION_CUE.search(context) for context in contexts)
+        return {"confirmed": positive, "reason": "stable_proper_location_or_entity", "evidence": {
+            "proper_name_evidence": explicit or "proper_name_pattern" in reasons,
+            "location_context_count": sum(bool(LOCATION_CUE.search(context)) for context in contexts),
+            "repeated_occurrences": frequency,
+        }}
+    if entity_class in {"book_title", "historical_work"}:
+        positive = explicit or any(WORK_CUE.search(context) for context in contexts) or repeated
+        return {"confirmed": positive, "reason": "specific_named_work", "evidence": {
+            "title_marker_evidence": explicit,
+            "work_context": [context for context in contexts if WORK_CUE.search(context)][:3],
+            "repeated_occurrences": frequency,
+        }}
+    if entity_class == "organization":
+        positive = explicit or repeated or any(ORGANIZATION_CUE.search(context) for context in contexts)
+        return {"confirmed": positive, "reason": "stable_named_organization", "evidence": {
+            "organization_context": [context for context in contexts if ORGANIZATION_CUE.search(context)][:3],
+            "stable_reference_count": frequency,
+        }}
+    if entity_class == "artifact":
+        positive = explicit or repeated or any(ITEM_CUE.search(context) for context in contexts)
+        return {"confirmed": positive, "reason": "specific_named_item", "evidence": {
+            "named_item_context": [context for context in contexts if ITEM_CUE.search(context)][:3],
+            "repeat_count": frequency,
+        }}
+    if entity_class == "technique":
+        positive = explicit or repeated or any(TECHNIQUE_CUE.search(context) for context in contexts)
+        return {"confirmed": positive, "reason": "named_technique_or_ability", "evidence": {
+            "use_context": [context for context in contexts if TECHNIQUE_CUE.search(context)][:3],
+            "repeat_count": frequency,
+        }}
+    if entity_class in {"honorific", "official_title", "historical_office"}:
+        positive = repeated or explicit or any(
+            re.search(r"(?:任|担任|官至|升为|改任|任职|属于|称为)", context)
+            for context in contexts
         )
-        if not direct and not role_context and not complete_prefix_name:
-            return "character_form", "title/reference identity is not proven locally"
-    # A suffix by itself is not enough evidence.  Keep uncertain novel terms
-    # for the resolver; this is what protects short fictional concepts.
+        return {"confirmed": positive, "reason": "stable_title_or_honorific", "evidence": {
+            "title_context": contexts[:3],
+            "repeated_occurrences": frequency,
+        }}
+    if entity_class in {"event", "concept"}:
+        positive = explicit or repeated
+        return {"confirmed": positive, "reason": f"named_{entity_class}", "evidence": {
+            "repeat_count": frequency,
+            "context": contexts[:3],
+        }}
+    return {"confirmed": explicit or repeated, "reason": "stable_named_entity", "evidence": {
+        "repeat_count": frequency,
+        "context": contexts[:3],
+    }}
+
+
+def classify_candidate(source, reasons, contexts, frequency=0, inherited=False):
+    """Compatibility wrapper returning only local rejection classifications."""
+    if inherited:
+        return None
+    entity_class, reason = classify_entity(source, reasons, contexts, frequency, inherited)
+    if entity_class == "generic":
+        if source in GENERIC_VERB_PHRASES:
+            return "verb_phrase", reason
+        if re.match(r"^\d", source):
+            return "descriptive_phrase", reason
+        return "common_noun", reason
+    if entity_class == "malformed":
+        return "malformed", reason
+    if entity_class == "character_reference" and not _character_reference_proven(source, contexts):
+        return "character_form", reason
+    if entity_class in {"official_title", "historical_office"} and frequency < 2 and not any(
+        re.search(r"(?:任|担任|官至|升为|改任|任职|属于|称为)", context)
+        for context in contexts
+    ) and not any(f"《{source}》" in context or f"【{source}】" in context for context in contexts):
+        return "official_title", "standalone title is not stable terminology"
     return None
 
 
@@ -421,6 +635,60 @@ def build_index(pairs, alignments, inherited):
                 # attached predicate/action character to a named reference.
                 if match.group()[-1] not in "来去入出上下再曾笑接站":
                     reasons[match.group()].add("named_title_or_address_form")
+        # Capture standalone titles/roles and malformed title-shaped spans so
+        # they can be audited without pretending they are character names.
+        for run in HAN_RUN.findall(text):
+            for suffix in sorted(style.ADDRESS_SPECS, key=len, reverse=True):
+                if run.endswith(suffix) and 1 <= len(run) - len(suffix) <= 4:
+                    reasons[run].add("named_title_or_address_form")
+            if run.startswith("了") and len(run) > 3 and run.endswith(TECHNIQUE_SUFFIXES):
+                reasons[run].add("malformed_noise_shape")
+                reasons[run[1:]].add("named_technique_context")
+        # Location evidence is often carried by a local preposition rather
+        # than 《...》 markers (进入乾清宫, 在紫禁城, 位于文华殿).
+        for match in re.finditer(
+            r"(?:在|到|往|从|入|进|驻|居|经过|位于|离开)([\u3400-\u9fff]{2,12})(?:中|内|上)?",
+            text,
+        ):
+            value = match.group(1)
+            value = value.lstrip("在到往从入进驻居经过离开")
+            value = value.rstrip("中内上")
+            if value.endswith(LOCATION_SUFFIXES) and len(value) >= 3:
+                reasons[value].add("named_location_context")
+        # Named works, items and techniques can be explicit without title
+        # punctuation; the cue-based spans are still bounded to Han text.
+        for match in re.finditer(
+            r"(?:编|著|读|刊|修|载|撰|校|记录)[了过着的 ]*([\u3400-\u9fff]{2,16})",
+            text,
+        ):
+            value = match.group(1)
+            if value.endswith(WORK_SUFFIXES):
+                reasons[value].add("named_work_context")
+        for match in re.finditer(
+            r"([\u3400-\u9fff]{2,16}(?:"
+            + "|".join(map(re.escape, sorted(WORK_SUFFIXES, key=len, reverse=True)))
+            + r"))",
+            text,
+        ):
+            reasons[match.group(1)].add("named_work_context")
+        for match in re.finditer(
+            r"(?:使出|施展|发动|运转|练习|修炼|施放|一招|招式|绝招|功法)[了过着的 ]*([\u3400-\u9fff]{2,16})",
+            text,
+        ):
+            value = match.group(1).lstrip("了")
+            if value and len(value) >= 3:
+                reasons[value].add("named_technique_context")
+        for match in re.finditer(
+            r"(?:炼制|祭出|佩戴|取出|收起|服下|吞下)[了过着的 ]*([\u3400-\u9fff]{2,12})",
+            text,
+        ):
+            value = match.group(1).lstrip("了")
+            if value and value.endswith(ARTIFACT_SUFFIXES) and len(value) >= 3:
+                reasons[value].add("named_item_context")
+        if text.startswith("书"):
+            for run in HAN_RUN.findall(text):
+                if run.startswith("书") and 2 <= len(run) <= 4:
+                    reasons[run].add("malformed_noise_shape")
         for match in re.finditer("(?:老|小|阿)[" + "".join(SURNAMES) + "]", text):
             reasons[match.group()].add("possible_person_alias")
         for match in re.finditer(
@@ -436,6 +704,9 @@ def build_index(pairs, alignments, inherited):
         for phrase in GENERIC_VERB_PHRASES | GENERIC_COMMON_PHRASES:
             if phrase in text:
                 reasons[phrase].add("local_generic_phrase")
+        for office in KNOWN_OFFICE_TERMS:
+            if office in text:
+                reasons[office].add("historical_office_context")
         for match in re.finditer(
             r"(?:任意|任何)[\u3400-\u9fff]{1,12}(?:抓捕|派遣|调动|处理)[\u3400-\u9fff]{0,8}", text
         ):
@@ -468,19 +739,28 @@ def build_index(pairs, alignments, inherited):
                 source in [term.source, *term.aliases, *term.forms] for term in inherited
             ),
         )
+        inherited_source = any(
+            source in [term.source, *term.aliases, *term.forms] for term in inherited
+        )
+        entity_class, entity_reason = classify_entity(
+            source,
+            reasons[source],
+            contexts,
+            counts[source],
+            inherited=inherited_source,
+        )
         if issue or classification or (
             reasons[source] == {"person_name_pattern"} and counts[source] < 2
         ):
             reason = issue or (
                 classification[1] if classification else "unconfirmed single person-name pattern"
             )
-            category = classification[0] if classification else (
-                "common_noun" if issue == "ordinary vocabulary" else "unknown"
-            )
+            category = classification[0] if classification else entity_class
             rejected[source] = reason
             report_only[source] = {
                 "source": source,
                 "classification": category,
+                "entity_class": entity_class,
                 "shape": reference_shape(source),
                 "status": "report_only",
                 "state": "IGNORE",
@@ -489,6 +769,7 @@ def build_index(pairs, alignments, inherited):
                 "reasons": sorted(reasons[source]),
                 "frequency": 0,
                 "occurrences": [],
+                "entity_reason": entity_reason,
             }
             continue
         candidates[source] = {
@@ -498,14 +779,8 @@ def build_index(pairs, alignments, inherited):
                 "character_name"
                 if "person_name_pattern" in reasons[source]
                 else "character_form"
-                if "named_title_or_address_form" in reasons[source]
-                else "proper_noun"
-                if {
-                    "explicit_named_marker",
-                    "explicit_naming_context",
-                    "repeated_entity_or_genre_suffix",
-                }.intersection(reasons[source])
-                else "unknown"
+                if entity_class == "character_reference"
+                else entity_class
             ),
             "shape": reference_shape(source),
             "frequency": 0,
@@ -518,6 +793,8 @@ def build_index(pairs, alignments, inherited):
             "proper_name_pattern_confidence": 0.0,
             "inherited_agreement": False,
             "source_conflicts": [],
+            "entity_class": entity_class,
+            "entity_reason": entity_reason,
         }
     # Remove lexical suffix fragments only when a longer candidate has exactly
     # the same whole-novel occurrence frequency. Preserve independently used names.
@@ -534,6 +811,7 @@ def build_index(pairs, alignments, inherited):
         report_only[source] = {
             "source": source,
             "classification": "common_noun",
+            "entity_class": "generic",
             "shape": reference_shape(source),
             "status": "report_only",
             "state": "IGNORE",
@@ -542,6 +820,7 @@ def build_index(pairs, alignments, inherited):
             "reasons": candidates[source]["reasons"],
             "frequency": 0,
             "occurrences": [],
+            "entity_reason": rejected[source],
         }
         del candidates[source]
     variants = {source: Counter() for source in candidates}
@@ -629,6 +908,7 @@ def build_index(pairs, alignments, inherited):
             )
         )
         candidate["representative_evidence"] = representative_evidence(candidate, units)
+        candidate["class_evidence"] = class_confirmation(candidate)
     # Keep rejected/generic evidence separate from plausible resolver work.
     # This makes the distinction survive checkpoints and gives the report/UI a
     # useful audit trail without polluting the frozen enforceable namespace.
@@ -654,14 +934,45 @@ def build_index(pairs, alignments, inherited):
 
 
 def local_resolution(candidate, policy=None):
-    """Confirm only a conservative stable full-name reading."""
+    """Confirm only class-specific deterministic evidence with a stable reading."""
     variants = candidate["vietphrase_variants"]
     min_contexts = getattr(policy, "min_contexts", 3) if policy else 3
     min_dominance = getattr(policy, "min_dominance", 0.95) if policy else 0.95
     min_coverage = getattr(policy, "min_coverage", 0.95) if policy else 0.95
-    if len(candidate["occurrences"]) < min_contexts or not variants:
+    entity_class = candidate.get("entity_class", "character")
+    if not variants:
         return None
     translation, count = max(variants.items(), key=lambda pair: pair[1])
+    class_evidence = candidate.get("class_evidence") or class_confirmation(candidate)
+    if entity_class not in {"character", "character_reference"}:
+        # Explicitly marked works and strongly evidenced places can be locked
+        # locally when VietPhrase supplies one stable rendering.  Other named
+        # items still go through the class-aware resolver, preserving existing
+        # resolver review behavior for ambiguous artifacts/techniques.
+        if entity_class not in {"book_title", "historical_work", "location"}:
+            return None
+        minimum_occurrences = 1 if "explicit_named_marker" in candidate.get("reasons", []) else min_contexts
+        if len(candidate["occurrences"]) < minimum_occurrences or not class_evidence.get("confirmed"):
+            return None
+        total = sum(variants.values())
+        if count / max(1, total) < min_dominance or candidate.get("mapping_coverage", 0) < min_coverage:
+            return None
+        return Term(
+            source=candidate["source"],
+            translation=translation,
+            type=ENTITY_CLASS_POLICIES[entity_class]["term_type"],
+            status="locked",
+            gender="unknown",
+            semantic_resolution="resolved",
+            needs_review=False,
+            enforceable=True,
+            confidence=count / max(1, total),
+            resolver_source="local_class_consensus",
+            evidence=class_evidence.get("reason", "class-specific local evidence"),
+            entity_evidence=class_evidence.get("evidence", {}),
+        )
+    if len(candidate["occurrences"]) < min_contexts:
+        return None
     readings = (
         [SURNAMES.get(candidate["source"][0]), *[GIVEN_READINGS.get(c) for c in candidate["source"][1:]]]
         if candidate["source"][0] in SURNAMES
@@ -680,7 +991,7 @@ def local_resolution(candidate, policy=None):
         or len(translation.split()) != len(candidate["source"])
     ):
         return None
-    is_person = "person_name_pattern" in candidate["reasons"]
+    is_person = entity_class == "character" and "person_name_pattern" in candidate["reasons"]
     if not is_person:
         # A stable reading is useful evidence, but it does not establish that
         # an ordinary phrase is a named term.  Keep it out of the runtime

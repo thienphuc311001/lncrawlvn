@@ -75,11 +75,23 @@ reference such as 张侍班 refers to the full person, return IGNORE.
 """
 RESOLVE = (
     AUTHORITY
-    + """Resolve ONE candidate using all occurrence evidence and summaries.
+    + """Resolve ONE candidate using all occurrence evidence and summaries. Classify the
+candidate before applying evidence rules; the supplied entity_class and entity_policy
+are the starting class, not a request to treat every candidate as a character.
+Character/character_reference candidates require ownership evidence linking a reference
+to the full person and must remain IGNORE when ownership is uncertain. Locations require
+stable proper-place evidence, books/works require specific named-work evidence,
+organizations/factions require stable named-group evidence, artifacts require a
+specific named-item use, techniques require named ability/use evidence, and events or
+concepts require stable named usage. Standalone honorifics and official titles may be
+confirmed as terminology when their exact wording is stable and consistency matters;
+they must not become character identities merely because they are historical.
+Generic/common/quantity phrases and malformed/noise candidates are IGNORE.
 Eligibility: complete semantic unit, named/novel-specific, consistency matters, evidence
-supports it. decision ACCEPT / REVIEW / REJECT. REJECT ordinary language, fragments,
-truncated/bad Vietnamese, misclassification or semantic mismatch. REVIEW and every
-other uncertain term map to IGNORE for runtime. Lock only strong explicit evidence.
+supports it according to the candidate class. decision ACCEPT / REVIEW / REJECT.
+REJECT ordinary language, fragments, truncated/bad Vietnamese, misclassification or
+semantic mismatch. REVIEW and every other uncertain term map to IGNORE for runtime.
+Lock only when the class-specific evidence is sufficient.
 Preserve valid inherited locked mappings and existing stored state. A character must act/be a person-like
 entity. Gender requires explicit RAW evidence. Confident aliases/title address forms
 attach to canonical entity; never invent Chinese keys from Vietnamese. If alias belongs
@@ -94,6 +106,11 @@ or supernatural item. A formal title/address or named technique can qualify when
 consistent wording matters to the book. ACCEPT requires all eligibility checks true;
 REVIEW requires a complete named/novel-specific unit whose consistency matters, with
 uncertain evidence. Never save generic vocabulary as a cumulative Book Dictionary.
+For non-character confirmations, return entity_evidence with concrete fields such as
+proper_name_evidence/location_context_count/repeated_occurrences,
+title_marker_evidence/work_context, organization_context/stable_reference_count,
+named_item_context/use_context/repeat_count, or named event/concept context. Do not
+use an untyped confidence score as a substitute for evidence.
 """
     + ADDRESS_STYLE
 )
@@ -107,7 +124,10 @@ Each source retains independent evidence and output. Frequency and VP consensus 
 do not establish identity, type, gender or a semantic alias. Preserve valid locked
 inherited mappings. Related existing entities are reference only, not extra candidates.
 Handle duplicate source identities explicitly. Reject ordinary phrases, quantity modifiers and
-grammar fragments. Attach proved titles/aliases to the canonical actor with exact
+grammar fragments. Apply the supplied entity_class independently for every source:
+locations, named works, organizations/factions, artifacts, techniques, honorifics,
+offices, events and concepts do not need character identity proof; they need their own
+named/stable-use evidence. Attach proved titles/aliases to the canonical actor with exact
 Chinese-keyed forms; uncertain identity is IGNORE and never a provisional mapping. Eligibility
 booleans must reflect RAW evidence. Do not translate prose. When repairing a batch,
 correct only the candidates included in that request, preserving accepted decisions.
@@ -130,6 +150,9 @@ INDIRECT_ROLE_CONTINUITY, INDIRECT_LOCAL_COREFERENCE, INDIRECT_VIETPHRASE_SUPPOR
 and include an exact RAW excerpt supplied in the request. VietPhrase support is
 never sufficient by itself. A CONFIRMED/ACCEPT form without inspectible RAW evidence
 will be downgraded locally to IGNORE; do not cite inferred or invented context.
+For non-character candidates, return entity_evidence with the concrete class-specific
+signals used for confirmation. Historical reality alone is not sufficient: generic
+common nouns, generic places, quantity phrases and ordinary actions remain IGNORE.
 validator_feedback describes a failed independent record; correct that defect in
 your new result. A plain string reason does not repair an invalid term record.
 """

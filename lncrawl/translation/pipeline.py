@@ -41,7 +41,13 @@ from .models import (
     Translation,
 )
 from .parsing import deterministic_alignment, make_chunks, validate_inputs
-from .preprocessing import batches, build_index, local_resolution
+from .preprocessing import (
+    ENTITY_CLASS_POLICIES,
+    batches,
+    build_index,
+    class_confirmation,
+    local_resolution,
+)
 from .store import digest, pipeline_identity
 from .validation import local_findings, validate_findings
 
@@ -254,11 +260,18 @@ class Pipeline:
         )
         payload = {
             "source": source,
+            "entity_class": candidate.get("entity_class", "unknown"),
+            "entity_policy": ENTITY_CLASS_POLICIES.get(
+                candidate.get("entity_class", "unknown"), {}
+            ),
             "candidate_shape": candidate.get("shape"),
             "frequency": candidate.get("frequency", 0),
             "signals": candidate.get("reasons", []),
             "vietphrase_evidence": candidate.get("vietphrase_variants", {}),
             "representative_evidence": candidate.get("representative_evidence", []),
+            "class_evidence": candidate.get(
+                "class_evidence", class_confirmation(candidate)
+            ),
             "inherited_confirmed": inherited.model_dump() if inherited else None,
         }
         # A title/kinship/address shape is not a character identity: tell the
@@ -312,6 +325,10 @@ class Pipeline:
             "report_only", {}
         ).get(source, {})
         extra.setdefault("raw_occurrences", candidate.get("frequency", 0))
+        extra.setdefault(
+            "entity_class",
+            candidate.get("entity_class", candidate.get("classification", "unknown")),
+        )
         record = {"source": source, "state": "IGNORE", "reason": reason, **extra}
         self.ignored[source] = record
         if extra.get("candidate_shape") or extra.get("evidence_types") or extra.get(
@@ -447,6 +464,87 @@ class Pipeline:
         except (ValueError, TypeError) as exc:
             raise QualityError(f"Invalid resolver metadata: {exc}") from exc
 
+        candidate = self.index.get("candidates", {}).get(source, {})
+        entity_class = candidate.get("entity_class", "unknown")
+        raw_texts = self.raw_contexts()
+
+        def attested_entity_evidence(value):
+            if isinstance(value, dict):
+                return any(attested_entity_evidence(item) for item in value.values())
+            if isinstance(value, (list, tuple)):
+                return any(attested_entity_evidence(item) for item in value)
+            return (
+                isinstance(value, str)
+                and len(value) >= 2
+                and source in value
+                and any(value in text for text in raw_texts)
+            )
+
+        character_like = term.type in {"character", "character_form"} or entity_class in {
+            "character",
+            "character_reference",
+        }
+        if entity_class in {"generic", "malformed"}:
+            self.ignore(
+                source,
+                "generic_or_malformed_candidate",
+                entity_class=entity_class,
+            )
+            return None
+        if entity_class not in {"character", "character_reference", "unknown", "proper_noun"} and term.type in {
+            "character",
+            "character_form",
+        }:
+            self.ignore(
+                source,
+                "resolver class contradicts local non-character classification",
+                entity_class=entity_class,
+                returned_type=term.type,
+            )
+            return None
+        if entity_class in {"character", "character_reference"} and term.type not in {
+            "character",
+            "character_form",
+        }:
+            self.ignore(
+                source,
+                "resolver returned a non-character class for a character candidate",
+                entity_class=entity_class,
+                returned_type=term.type,
+            )
+            return None
+        if not character_like:
+            term.entity_evidence = {
+                **result.entity_evidence,
+                **term.entity_evidence,
+            }
+            evidence = candidate.get("class_evidence") or class_confirmation(
+                candidate, entity_class
+            )
+            if not evidence.get("confirmed") and attested_entity_evidence(
+                term.entity_evidence
+            ):
+                evidence = {
+                    "confirmed": True,
+                    "reason": "resolver_class_evidence_attested_in_raw",
+                    "evidence": term.entity_evidence,
+                }
+            if not evidence.get("confirmed"):
+                self.ignore(
+                    source,
+                    evidence.get("reason", "insufficient class-specific evidence"),
+                    entity_class=entity_class,
+                    entity_evidence=evidence.get("evidence", {}),
+                )
+                return None
+            expected_type = ENTITY_CLASS_POLICIES.get(entity_class, {}).get("term_type")
+            if expected_type and term.type in {"unknown", "proper_noun", "other_term"}:
+                term.type = expected_type
+            term.entity_evidence = {
+                **term.entity_evidence,
+                **evidence.get("evidence", {}),
+            }
+
         term.status = "locked"
         term.enforceable = True
         term.semantic_resolution = "resolved"
@@ -476,14 +574,14 @@ class Pipeline:
         original_translation = term.translation
         original_form_translation = term.forms.get(original_source, original_translation)
         term.forms.pop(term.source, None)
-        raw_texts = self.raw_contexts()
-
         def raw_attested(name):
             return any(name in text for text in raw_texts)
 
-        prefix_spec = style.address_spec(original_source)
-        original_prefix_parts = style.title_prefix_parts(original_source)
-        if original_prefix_parts and term.source == original_source:
+        prefix_spec = style.address_spec(original_source) if character_like else None
+        original_prefix_parts = (
+            style.title_prefix_parts(original_source) if character_like else None
+        )
+        if character_like and original_prefix_parts and term.source == original_source:
             prefix, person = original_prefix_parts
             if any(
                 reference.startswith(prefix + person)
@@ -494,7 +592,7 @@ class Pipeline:
                 raise QualityError(
                     f"truncated title-prefixed canonical extraction {original_source}"
                 )
-        if prefix_spec and prefix_spec.get("prefix_reference") and term.source == source:
+        if character_like and prefix_spec and prefix_spec.get("prefix_reference") and term.source == source:
             prefix_parts = original_prefix_parts
             raw_proven = raw_attested(original_source)
             if not prefix_parts or not raw_proven:
@@ -515,7 +613,7 @@ class Pipeline:
             term.source = prefix_parts[1]
             term.translation = canonical_translation
             term.forms[original_source] = original_form_translation
-        elif original_prefix_parts and term.source == original_prefix_parts[1]:
+        elif character_like and original_prefix_parts and term.source == original_prefix_parts[1]:
             # The resolver may return the correct canonical identity directly
             # instead of echoing the title-prefixed candidate as ``term.source``.
             if not raw_attested(original_source):
@@ -533,7 +631,7 @@ class Pipeline:
                 or original_form_translation,
             )
         migrated_title_source = False
-        title_parts = style.title_prefix_parts(source)
+        title_parts = style.title_prefix_parts(source) if character_like else None
         if title_parts:
             prefix, partial_person = title_parts
             longer_reference = any(
@@ -587,13 +685,13 @@ class Pipeline:
         # person: 唐姐 must be attached to 唐菲菲, not created as its own
         # character.  Bare nicknames (老秦) and bare titles stay eligible
         # because they can be the only attested way a character is named.
-        spec = style.address_spec(source)
-        if spec and spec["surname"] and term.source == source:
+        spec = style.address_spec(source) if character_like else None
+        if character_like and spec and spec["surname"] and term.source == source:
             raise QualityError(
                 f"address form {source} cannot be a canonical identity; "
                 "attach it to the proven full name"
             )
-        if (
+        if character_like and (
             spec
             and spec.get("suffix")
             and not spec.get("surname")
@@ -798,8 +896,16 @@ class Pipeline:
             f"term:{source}:resolve",
             prompts.RESOLVE,
             {
-                "source": source,
-                "representative_evidence": self.occurrences(source)[:6],
+                **(
+                    self.resolver_payload(source)
+                    if source in self.index.get("candidates", {})
+                    else {
+                        "source": source,
+                        "entity_class": "unknown",
+                        "entity_policy": {},
+                        "representative_evidence": self.occurrences(source)[:6],
+                    }
+                ),
                 "inherited_confirmed": inherited.model_dump() if inherited else None,
             },
             Resolution,
@@ -880,6 +986,11 @@ class Pipeline:
                     self.outcomes[source] = {
                         "source": source,
                         "state": "IGNORE",
+                        "entity_class": (
+                            self.index.get("candidates", {}).get(source, {}).get(
+                                "entity_class", "unknown"
+                            )
+                        ),
                         "reason": item.reason if item else "resolver omitted or malformed candidate",
                     }
                 else:
@@ -887,6 +998,8 @@ class Pipeline:
                     self.outcomes[source] = {
                         "source": source,
                         "state": "CONFIRMED",
+                        "entity_class": term.type,
+                        "type": term.type,
                         "translation": term.translation,
                         "reason": item.reason if item else "confirmed",
                     }
@@ -928,7 +1041,7 @@ class Pipeline:
                     key: value for key, value in response.items() if key != "source"
                 }
                 result = Resolution.model_validate(normalized)
-                if result.decision != "ACCEPT" or result.term is None:
+                if result.decision not in {"ACCEPT", "CONFIRMED"} or result.term is None:
                     continue
                 term = self.apply_resolution(source, None, result)
             except (QualityError, ValueError, TypeError):
@@ -948,6 +1061,12 @@ class Pipeline:
         entries = sorted(self.outcomes.values(), key=lambda item: item.get("source", ""))
         confirmed = len(self.terms)
         ignored = len(self.ignored)
+        confirmed_types = Counter(term.type for term in self.terms.values())
+        ignored_classes = Counter(
+            item.get("entity_class", item.get("classification", "unknown"))
+            for item in self.ignored.values()
+        )
+        ignored_reasons = Counter(item.get("reason", "unknown") for item in self.ignored.values())
         removed_forms = sum(
             len(item.get("removed_forms", [])) for item in self.form_cleanup
         )
@@ -984,7 +1103,38 @@ class Pipeline:
         return {
             "summary": {
                 "confirmed_terms": confirmed,
+                "confirmed_characters": confirmed_types["character"],
+                "confirmed_character_forms": sum(
+                    1
+                    for term in self.terms.values()
+                    for _name in term.forms
+                    if term.type in {"character", "character_form"}
+                ),
+                "confirmed_locations": confirmed_types["location"],
+                "confirmed_books": confirmed_types["book_title"] + confirmed_types["historical_work"],
+                "confirmed_organizations": confirmed_types["organization"] + confirmed_types["faction"],
+                "confirmed_artifacts": confirmed_types["artifact"] + confirmed_types["weapon"],
+                "confirmed_techniques": confirmed_types["technique"],
+                "confirmed_titles": (
+                    confirmed_types["honorific"]
+                    + confirmed_types["official_title"]
+                    + confirmed_types["historical_office"]
+                    + confirmed_types["title"]
+                ),
                 "ignored_candidates": ignored,
+                "ignored_generic": ignored_classes["generic"] + ignored_classes["common_noun"],
+                "ignored_quantity": ignored_reasons["quantity modifier is not a canonical entity name"]
+                + ignored_reasons["quantity or numeric descriptive phrase"],
+                "ignored_malformed": ignored_classes["malformed"],
+                "ignored_unproven_character_reference": ignored_reasons[
+                    "character_identity_requires_owner_proof"
+                ]
+                + ignored_reasons["insufficient_identity_evidence"],
+                "ignored_ambiguous_entity": ignored_reasons["competing_identity"]
+                + ignored_reasons["insufficient class-specific evidence"],
+                "ignored_contextual_residue": ignored_reasons["contextual_residue"]
+                + ignored_reasons["leading contextual residue"]
+                + ignored_reasons["leading aspect residue"],
                 "locked_terms": confirmed,
                 "provisional_terms": 0,
                 "needs_review": 0,
@@ -1138,6 +1288,7 @@ class Pipeline:
             self.outcomes[source] = {
                 "source": source,
                 "state": "IGNORE",
+                "entity_class": record.get("entity_class", record.get("classification", "unknown")),
                 "classification": record.get("classification", "ignored"),
                 "reason": record.get("reason", "locally rejected candidate"),
             }
@@ -1183,6 +1334,8 @@ class Pipeline:
                 self.outcomes[source] = {
                     "source": source,
                     "state": "CONFIRMED",
+                    "entity_class": local_term.type,
+                    "type": local_term.type,
                     "translation": local_term.translation,
                     "reason": "local RAW/VietPhrase consensus",
                 }
