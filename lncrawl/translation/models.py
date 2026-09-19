@@ -9,11 +9,27 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 from .style import AUTO, MODERN, SINO_VIETNAMESE, configured_register
 
 MODELS = ("gemini-3.1-flash-lite", "gemini-3.5-flash-lite", "gemini-3.7-flash")
-PIPELINE_VERSION = 8
-DICTIONARY_VERSION = 4
-PARSER_VERSION = 5
+PIPELINE_VERSION = 10
+DICTIONARY_VERSION = 6
+PARSER_VERSION = 6
 CONFIRMED = "CONFIRMED"
 IGNORE = "IGNORE"
+
+IDENTITY_EVIDENCE_TYPES = (
+    "DIRECT_EXPLICIT_LINK",
+    "DIRECT_FULL_NAME_WITH_TITLE",
+    "DIRECT_ALIAS_DECLARATION",
+    "INDIRECT_REPEATED_CONTEXT",
+    "INDIRECT_UNIQUE_SURNAME_TITLE",
+    "INDIRECT_ROLE_CONTINUITY",
+    "INDIRECT_LOCAL_COREFERENCE",
+    "INDIRECT_VIETPHRASE_SUPPORT",
+    "NEGATIVE_COMPETING_IDENTITY",
+    "NEGATIVE_TRUNCATED_IDENTITY",
+    "NEGATIVE_CONTEXTUAL_RESIDUE",
+    "NEGATIVE_ROLE_ONLY_AMBIGUOUS",
+    "NEGATIVE_MULTIPLE_POSSIBLE_OWNERS",
+)
 
 
 class StrictModel(BaseModel):
@@ -86,6 +102,39 @@ class Candidate(StrictModel):
     evidence: str
 
 
+class IdentityEvidence(StrictModel):
+    """Inspectible RAW evidence for a character reference relationship."""
+
+    type: Literal[IDENTITY_EVIDENCE_TYPES]
+    raw_excerpt: str = ""
+    detail: str = ""
+
+
+def _normalize_identity_evidence(value):
+    """Accept the resolver's structured evidence while keeping old checkpoints."""
+    if not isinstance(value, dict):
+        return value
+    value = dict(value)
+    evidence = value.get("evidence")
+    if isinstance(evidence, list):
+        records = []
+        excerpts = []
+        for item in evidence:
+            if not isinstance(item, dict):
+                continue
+            record = {
+                "type": item.get("type", "INDIRECT_VIETPHRASE_SUPPORT"),
+                "raw_excerpt": item.get("raw_excerpt", item.get("excerpt", "")),
+                "detail": item.get("detail", ""),
+            }
+            records.append(record)
+            if record["raw_excerpt"]:
+                excerpts.append(record["raw_excerpt"])
+        value["identity_evidence"] = records
+        value["evidence"] = "\n".join(excerpts)
+    return value
+
+
 class Candidates(StrictModel):
     candidates: List[Candidate]
 
@@ -139,6 +188,10 @@ class Term(StrictModel):
     confidence: Optional[float] = None
     resolver_source: Optional[str] = None
     fallback: Optional[str] = None
+    candidate_shape: Optional[str] = None
+    identity_evidence: List[IdentityEvidence] = Field(default_factory=list)
+    evidence_types: List[Literal[IDENTITY_EVIDENCE_TYPES]] = Field(default_factory=list)
+    competing_identities: List[str] = Field(default_factory=list)
     # This is intentionally explicit.  A Vietnamese suggestion is not, by
     # itself, a frozen terminology constraint.  Missing legacy values are
     # migrated conservatively by the validator below.
@@ -153,7 +206,7 @@ class Term(StrictModel):
     def migrate_enforceability(cls, value):
         if not isinstance(value, dict):
             return value
-        value = dict(value)
+        value = _normalize_identity_evidence(value)
         if value.get("status") in {"confirmed", "CONFIRMED"}:
             value["status"] = "locked"
             value["enforceable"] = True
@@ -170,6 +223,15 @@ class Term(StrictModel):
 
     @model_validator(mode="after")
     def normalize_enforceability(self):
+        self.evidence_types = sorted(
+            set(self.evidence_types) | {record.type for record in self.identity_evidence}
+        )
+        if not self.evidence and self.identity_evidence:
+            self.evidence = "\n".join(
+                record.raw_excerpt
+                for record in self.identity_evidence
+                if record.raw_excerpt
+            )
         if self.status == "locked":
             self.enforceable = True
         elif self.status in {"report_only", "needs_review", "unresolved"}:
@@ -199,13 +261,17 @@ class ResolverTerm(StrictModel):
     confidence: Optional[float] = None
     resolver_source: Optional[str] = None
     fallback: Optional[str] = None
+    candidate_shape: Optional[str] = None
+    identity_evidence: List[IdentityEvidence] = Field(default_factory=list)
+    evidence_types: List[Literal[IDENTITY_EVIDENCE_TYPES]] = Field(default_factory=list)
+    competing_identities: List[str] = Field(default_factory=list)
 
     @model_validator(mode="before")
     @classmethod
     def normalize_uncertain_metadata(cls, value):
         if not isinstance(value, dict):
             return value
-        value = dict(value)
+        value = _normalize_identity_evidence(value)
         if str(value.get("status", "")).casefold() == "confirmed":
             value["status"] = "locked"
         elif str(value.get("status", "")).casefold() == "ignore":
@@ -245,10 +311,17 @@ class Eligibility(StrictModel):
 
 
 class Resolution(StrictModel):
-    decision: Literal["ACCEPT", "REVIEW", "REJECT"]
+    decision: Literal["ACCEPT", "REVIEW", "REJECT", "CONFIRMED", "IGNORE"]
     eligibility: Eligibility
     term: Optional[ResolverTerm] = None
     reason: str
+    # ``evidence`` is the compact resolver-facing spelling.  The normalized
+    # ``identity_evidence`` field below is retained in checkpoints and terms.
+    evidence: List[IdentityEvidence] = Field(default_factory=list)
+    candidate_shape: Optional[str] = None
+    identity_evidence: List[IdentityEvidence] = Field(default_factory=list)
+    evidence_types: List[Literal[IDENTITY_EVIDENCE_TYPES]] = Field(default_factory=list)
+    competing_identities: List[str] = Field(default_factory=list)
 
 
 class CandidateResolution(Resolution):
@@ -333,6 +406,17 @@ class Issue(StrictModel):
     # Structured validator data is optional for non-terminology findings so
     # old checkpoints and callers remain valid.
     type: Optional[str] = None
+    severity: Literal["INFO", "WARNING", "ERROR", "FATAL"] = "FATAL"
+    validator: Optional[str] = None
+    chapter_number: Optional[int] = None
+    chunk_index: Optional[int] = None
+    source_segment_id: Optional[str] = None
+    source_line: Optional[int] = None
+    source_excerpt: Optional[str] = None
+    expected: Optional[str] = None
+    actual: Optional[str] = None
+    translated_excerpt: Optional[str] = None
+    details: Optional[Dict[str, object]] = None
     source: Optional[str] = None
     matched_source: Optional[str] = None
     canonical_source: Optional[str] = None
@@ -353,8 +437,54 @@ class Issue(StrictModel):
     @model_validator(mode="after")
     def normalize_type(self):
         if self.type is None:
-            self.type = self.kind
+            self.type = {
+                "missing": "content_missing",
+                "order": "ordering",
+                "duplicate": "duplicate_content",
+                "number": "chapter_heading",
+                "invented": "format",
+                "name": "format",
+            }.get(self.kind, self.kind)
+        if self.validator is None:
+            self.validator = {
+                "terminology": "terminology",
+                "content_missing": "content_coverage",
+                "content_coverage": "content_coverage",
+                "untranslated_chinese": "untranslated_chinese",
+                "ordering": "structure",
+                "duplicate_content": "duplicate_content",
+                "chapter_heading": "chapter_heading",
+                "format": "format",
+            }.get(self.type, self.type)
+        if self.reason is None:
+            self.reason = {
+                "content_missing": "missing_source_segment_translation",
+                "content_coverage": "content_coverage_anomaly",
+                "untranslated_chinese": "untranslated_chinese_residue",
+                "ordering": "source_order_mismatch",
+                "duplicate_content": "duplicate_translated_content",
+                "chapter_heading": "chapter_heading_mismatch",
+                "format": "invalid_output_format",
+            }.get(self.type, self.kind)
+        if self.actual is None and self.actual_text is not None:
+            self.actual = self.actual_text
+        if self.expected is None and self.required_translation is not None:
+            self.expected = self.required_translation
+        if self.source_segment_id is None:
+            self.source_segment_id = f"s{self.segment_id}"
+        if self.location:
+            self.chapter_number = self.chapter_number or self.location.get("chapter")
+            self.chunk_index = (
+                self.chunk_index
+                if self.chunk_index is not None
+                else self.location.get("chunk")
+            )
         return self
+
+
+# Public name used by diagnostics/reporting integrations.  ``Issue`` remains
+# the backwards-compatible model name used by the translation validator.
+ValidationFinding = Issue
 
 
 class Validation(StrictModel):

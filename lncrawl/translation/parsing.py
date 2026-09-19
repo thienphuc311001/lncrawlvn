@@ -926,10 +926,23 @@ def make_chunks(alignment, raw, vp):
     if groups:
         chunks.append(groups)
     result = []
-    for groups in chunks:
+    for chunk_index, groups in enumerate(chunks):
         result.append(
             {
-                "raw": [{"id": i, "text": raw.paragraphs[i]} for g in groups for i in g.raw],
+                "raw": [
+                    {
+                        "id": i,
+                        "text": raw.paragraphs[i],
+                        "source_segment_id": f"c{raw.number}-k{chunk_index}-s{i}",
+                        "source_line": (
+                            raw.paragraph_lines[i]
+                            if i < len(raw.paragraph_lines)
+                            else None
+                        ),
+                    }
+                    for g in groups
+                    for i in g.raw
+                ],
                 "vp": [{"id": i, "text": vp.paragraphs[i]} for g in groups for i in g.vp],
             }
         )

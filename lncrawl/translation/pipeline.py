@@ -15,6 +15,7 @@ from . import prompts, style
 from .dictionary import (
     AUDIT_ONLY_CLASSIFICATIONS,
     clean_identity_forms,
+    evaluate_reference_evidence,
     export_dictionary,
     load_legacy,
     normalize_term_register,
@@ -23,6 +24,7 @@ from .dictionary import (
     sanity,
     source_problem,
     term_problem,
+    vet_confirmed_reference_forms,
 )
 from .models import (
     MODELS,
@@ -41,7 +43,7 @@ from .models import (
 from .parsing import deterministic_alignment, make_chunks, validate_inputs
 from .preprocessing import batches, build_index, local_resolution
 from .store import digest, pipeline_identity
-from .validation import local_findings
+from .validation import local_findings, validate_findings
 
 
 class QualityError(RuntimeError):
@@ -67,6 +69,7 @@ class Pipeline:
         self.cache_keys = {}
         self.decisions = {}
         self.ignored = {}
+        self.reference_audit = []
         self.form_cleanup = []
         self._raw_contexts = None
         self.register_cleanup = []
@@ -251,6 +254,7 @@ class Pipeline:
         )
         payload = {
             "source": source,
+            "candidate_shape": candidate.get("shape"),
             "frequency": candidate.get("frequency", 0),
             "signals": candidate.get("reasons", []),
             "vietphrase_evidence": candidate.get("vietphrase_variants", {}),
@@ -279,9 +283,57 @@ class Pipeline:
             if item.get("raw")
         ]
 
+    def competing_identities(self, candidate, canonical):
+        """Find other confirmed/person-shaped owners for a surname reference."""
+        spec = style.address_spec(candidate)
+        surname = spec.get("surname") if spec else ""
+        if not surname:
+            return []
+        possible = set()
+        for term in self.terms.values():
+            if (
+                term.source != canonical
+                and term.type in {"character", "character_form"}
+                and term.source.startswith(surname)
+            ):
+                possible.add(term.source)
+        for source, record in self.index.get("candidates", {}).items():
+            if (
+                source != canonical
+                and source != candidate
+                and source.startswith(surname)
+                and "person_name_pattern" in record.get("reasons", [])
+            ):
+                possible.add(source)
+        return sorted(possible)
+
     def ignore(self, source, reason, **extra):
+        candidate = self.index.get("candidates", {}).get(source) or self.index.get(
+            "report_only", {}
+        ).get(source, {})
+        extra.setdefault("raw_occurrences", candidate.get("frequency", 0))
         record = {"source": source, "state": "IGNORE", "reason": reason, **extra}
         self.ignored[source] = record
+        if extra.get("candidate_shape") or extra.get("evidence_types") or extra.get(
+            "competing_identities"
+        ):
+            key = (
+                source,
+                extra.get("candidate_shape", ""),
+                reason,
+                tuple(extra.get("competing_identities", ())),
+            )
+            if not any(item.get("_key") == key for item in self.reference_audit):
+                self.reference_audit.append({**record, "_key": key})
+                self.store.write(
+                    "character-reference-audit.json",
+                    {
+                        "entries": [
+                            {key: value for key, value in item.items() if key != "_key"}
+                            for item in self.reference_audit
+                        ]
+                    },
+                )
         self.store.write(f"term-audit/{digest(source)}.json", record)
 
     def raw_contexts(self):
@@ -380,7 +432,7 @@ class Pipeline:
         if self.frozen_hash is not None:
             raise QualityError("Cannot mutate the frozen batch dictionary")
         self.store.write(f"resolution/{digest(source)}.json", result.model_dump())
-        if result.decision != "ACCEPT" or result.term is None:
+        if result.decision in {"IGNORE", "REVIEW", "REJECT"} or result.term is None:
             return None
         failed = [
             name for name, passed in result.eligibility.model_dump().items() if not passed
@@ -401,9 +453,135 @@ class Pipeline:
         term.needs_review = False
         term.resolution_reason = None
         term.runtime_state = "CONFIRMED"
+        result_evidence = [*result.identity_evidence, *result.evidence]
+        term.identity_evidence = list(
+            {record.model_dump_json(): record for record in [*term.identity_evidence, *result_evidence]}.values()
+        )
+        term.evidence_types = sorted(
+            set(term.evidence_types)
+            | set(result.evidence_types)
+            | {record.type for record in term.identity_evidence}
+        )
+        term.competing_identities = sorted(
+            set(term.competing_identities) | set(result.competing_identities)
+        )
+        if not term.evidence and term.identity_evidence:
+            term.evidence = "\n".join(
+                record.raw_excerpt
+                for record in term.identity_evidence
+                if record.raw_excerpt
+            )
         term.aliases = sorted(set(alias for alias in term.aliases if alias != term.source))
+        original_source = term.source
+        original_translation = term.translation
+        original_form_translation = term.forms.get(original_source, original_translation)
         term.forms.pop(term.source, None)
-        if term.source != source and source not in [*term.aliases, *term.forms]:
+        raw_texts = self.raw_contexts()
+
+        def raw_attested(name):
+            return any(name in text for text in raw_texts)
+
+        prefix_spec = style.address_spec(original_source)
+        original_prefix_parts = style.title_prefix_parts(original_source)
+        if original_prefix_parts and term.source == original_source:
+            prefix, person = original_prefix_parts
+            if any(
+                reference.startswith(prefix + person)
+                and len(reference) > len(original_source)
+                and raw_attested(reference)
+                for reference in self.index.get("candidates", {})
+            ):
+                raise QualityError(
+                    f"truncated title-prefixed canonical extraction {original_source}"
+                )
+        if prefix_spec and prefix_spec.get("prefix_reference") and term.source == source:
+            prefix_parts = original_prefix_parts
+            raw_proven = raw_attested(original_source)
+            if not prefix_parts or not raw_proven:
+                raise QualityError(
+                    f"title-prefixed reference {original_source} lacks RAW identity evidence"
+                )
+            prefix_words = prefix_spec["honorific"].casefold().split()
+            translated_words = original_translation.split()
+            if [word.casefold() for word in translated_words[: len(prefix_words)]] != prefix_words:
+                raise QualityError(
+                    f"cannot derive canonical translation from title-prefixed source {original_source}"
+                )
+            canonical_translation = " ".join(translated_words[len(prefix_words) :]).strip()
+            if not canonical_translation:
+                raise QualityError(
+                    f"title-prefixed source {original_source} has no full personal translation"
+                )
+            term.source = prefix_parts[1]
+            term.translation = canonical_translation
+            term.forms[original_source] = original_form_translation
+        elif original_prefix_parts and term.source == original_prefix_parts[1]:
+            # The resolver may return the correct canonical identity directly
+            # instead of echoing the title-prefixed candidate as ``term.source``.
+            if not raw_attested(original_source):
+                raise QualityError(
+                    f"title-prefixed reference {original_source} lacks RAW identity evidence"
+                )
+            term.forms.setdefault(
+                original_source,
+                style.preferred_form(
+                    original_source,
+                    term.source,
+                    term.translation,
+                    prefix_spec,
+                )
+                or original_form_translation,
+            )
+        migrated_title_source = False
+        title_parts = style.title_prefix_parts(source)
+        if title_parts:
+            prefix, partial_person = title_parts
+            longer_reference = any(
+                reference.startswith(prefix + partial_person)
+                and len(reference) > len(source)
+                and raw_attested(reference)
+                for reference in self.index.get("candidates", {})
+            )
+            if term.source == partial_person and longer_reference:
+                raise QualityError(
+                    f"truncated title-prefixed canonical extraction {source}"
+                )
+            if term.source == partial_person and raw_attested(source):
+                term.forms.setdefault(
+                    source,
+                    style.preferred_form(
+                        source,
+                        term.source,
+                        term.translation,
+                        style.address_spec(source, term.source),
+                    )
+                    or original_form_translation,
+                )
+                migrated_title_source = True
+            elif term.source.startswith(partial_person) and len(term.source) > len(partial_person):
+                full_form = prefix + term.source
+                raw_proven = raw_attested(full_form)
+                proven = raw_proven
+                if not proven:
+                    raise QualityError(
+                        f"unproven title-prefixed canonical extraction {source}"
+                    )
+                term.forms.setdefault(
+                    full_form,
+                    style.preferred_form(
+                        full_form,
+                        term.source,
+                        term.translation,
+                        style.address_spec(full_form, term.source),
+                    )
+                    or term.translation,
+                )
+                migrated_title_source = True
+        if (
+            term.source != source
+            and source not in [*term.aliases, *term.forms]
+            and not migrated_title_source
+        ):
             raise QualityError(f"Resolver lost source term {source}")
         # A surname-prefixed address form is a reference to a person, never a
         # person: 唐姐 must be attached to 唐菲菲, not created as its own
@@ -415,15 +593,118 @@ class Pipeline:
                 f"address form {source} cannot be a canonical identity; "
                 "attach it to the proven full name"
             )
+        if (
+            spec
+            and spec.get("suffix")
+            and not spec.get("surname")
+            and term.source == source
+        ):
+            raise QualityError(
+                f"role-only reference {source} cannot be a canonical identity"
+            )
 
         inherited_names = (
             [inherited.source, *inherited.aliases, *inherited.forms] if inherited else []
         )
 
+        # Vet every resolver-proposed reference before it can enter the
+        # confirmed namespace.  Unknown or weakly supported candidates are
+        # report-only; only contradictions among already-confirmed mappings
+        # remain fatal.
+        reference_audit = []
+        if term.type in {"character", "character_form"}:
+            if source != term.source:
+                evidence_candidate = source
+                source_parts = style.title_prefix_parts(source)
+                if (
+                    source_parts
+                    and term.source.startswith(source_parts[1])
+                    and len(term.source) > len(source_parts[1])
+                ):
+                    # The resolver repaired a title-prefix truncation.  Vet
+                    # the complete RAW expression, never the malformed key.
+                    evidence_candidate = source_parts[0] + term.source
+                competing = sorted(
+                    set(term.competing_identities)
+                    | set(self.competing_identities(source, term.source))
+                )
+                decision = evaluate_reference_evidence(
+                    evidence_candidate,
+                    term.source,
+                    raw_texts,
+                    term.identity_evidence,
+                    term.evidence_types,
+                    competing,
+                )
+                if not decision["confirmed"]:
+                    self.ignore(
+                        source,
+                        decision["reason"],
+                        proposed_canonical=term.source,
+                        candidate_shape=decision["shape"],
+                        evidence_types=decision["evidence_types"],
+                        competing_identities=decision["competing_identities"],
+                    )
+                    return None
+                term.candidate_shape = decision["shape"]
+                term.identity_evidence = list(
+                    {record.model_dump_json(): record for record in [*term.identity_evidence, *decision["evidence"]]}.values()
+                )
+                term.evidence_types = sorted(
+                    set(term.evidence_types) | set(decision["evidence_types"])
+                )
+                term.competing_identities = decision["competing_identities"]
+                if not term.evidence:
+                    term.evidence = "\n".join(
+                        record.raw_excerpt
+                        for record in term.identity_evidence
+                        if record.raw_excerpt
+                    )
+            for name in list(term.forms):
+                competing = sorted(
+                    set(term.competing_identities)
+                    | set(self.competing_identities(name, term.source))
+                )
+                decision = evaluate_reference_evidence(
+                    name,
+                    term.source,
+                    raw_texts,
+                    term.identity_evidence,
+                    term.evidence_types,
+                    competing,
+                )
+                if not decision["confirmed"]:
+                    reference_audit.append(
+                        {
+                            "source": name,
+                            "reason": decision["reason"],
+                            "candidate_shape": decision["shape"],
+                            "evidence_types": decision["evidence_types"],
+                        }
+                    )
+                    term.forms.pop(name, None)
+                else:
+                    spec = style.address_spec(name, term.source, raw_texts)
+                    if spec:
+                        term.form_kinds[name] = spec["kind"]
+        if reference_audit:
+            self.store.write(
+                f"term-audit/{digest(term.source)}-forms.json",
+                {"source": term.source, "state": "CONFIRMED", "removed_forms": reference_audit},
+            )
+
         removed, preserved = clean_identity_forms(
             term,
-            self.raw_contexts(),
+            raw_texts,
             require_evidence=True,
+        )
+        removed.extend(
+            {
+                "source": item["source"],
+                "reason": item["reason"],
+                "field": "forms",
+            }
+            for item in reference_audit
         )
         if removed:
             self.record_form_cleanup(
@@ -439,8 +720,17 @@ class Pipeline:
             )
 
         def attested(name):
-            return not source_problem(name) and (
-                name in inherited_names or bool(self.occurrences(name))
+            if source_problem(name):
+                return False
+            if name in inherited_names or raw_attested(name):
+                return True
+            # A full title-prefix reference proves the trailing canonical
+            # person even when the bare name never appears independently.
+            return any(
+                style.title_prefix_parts(reference)
+                and style.title_prefix_parts(reference)[1] == name
+                and raw_attested(reference)
+                for reference in term.forms
             )
 
         term.aliases = [alias for alias in term.aliases if attested(alias)]
@@ -469,6 +759,7 @@ class Pipeline:
             term.gender = existing.gender
             term.aliases = sorted(set(existing.aliases + term.aliases))
             term.forms = {**term.forms, **existing.forms}
+            term.aliases = sorted(set(term.aliases) - set(term.forms))
             term.form_kinds = {**term.form_kinds, **existing.form_kinds}
 
         # Address/title forms must keep the batch register: rewrite them to the
@@ -663,6 +954,33 @@ class Pipeline:
         preserved_forms = sum(
             len(item.get("preserved_forms", [])) for item in self.form_cleanup
         )
+        reference_forms = [
+            (term, name)
+            for term in self.terms.values()
+            for name in term.forms
+            if term.type in {"character", "character_form"}
+        ]
+        direct_confirmations = sum(
+            bool(
+                set(term.evidence_types).intersection(
+                    {"DIRECT_EXPLICIT_LINK", "DIRECT_FULL_NAME_WITH_TITLE", "DIRECT_ALIAS_DECLARATION"}
+                )
+            )
+            for term, _name in reference_forms
+        )
+        indirect_confirmations = sum(
+            bool(
+                set(term.evidence_types).intersection(
+                    {
+                        "INDIRECT_REPEATED_CONTEXT",
+                        "INDIRECT_UNIQUE_SURNAME_TITLE",
+                        "INDIRECT_ROLE_CONTINUITY",
+                        "INDIRECT_LOCAL_COREFERENCE",
+                    }
+                )
+            )
+            for term, _name in reference_forms
+        )
         return {
             "summary": {
                 "confirmed_terms": confirmed,
@@ -693,10 +1011,52 @@ class Pipeline:
                 "register_normalizations": sum(
                     len(item.get("normalizations", [])) for item in self.register_cleanup
                 ),
+                "character_reference_candidates": sum(
+                    1
+                    for record in [
+                        *self.index.get("candidates", {}).values(),
+                        *self.index.get("report_only", {}).values(),
+                    ]
+                    if record.get("shape")
+                    and record.get("shape") != "full_name"
+                ),
+                "character_reference_confirmed": len(reference_forms),
+                "character_reference_ignored": len(self.reference_audit),
+                "direct_evidence_confirmations": direct_confirmations,
+                "indirect_evidence_confirmations": indirect_confirmations,
+                "ignored_insufficient_evidence": sum(
+                    item.get("reason") == "insufficient_identity_evidence"
+                    for item in self.reference_audit
+                ),
+                "ignored_competing_identity": sum(
+                    item.get("reason") == "competing_identity"
+                    for item in self.reference_audit
+                ),
+                "ignored_contextual_residue": sum(
+                    item.get("reason") == "contextual_residue"
+                    for item in self.reference_audit
+                ),
+                "ignored_truncated_identity": sum(
+                    item.get("reason") == "truncated_identity"
+                    for item in self.reference_audit
+                ),
+                "ignored_unknown_reference": sum(
+                    item.get("candidate_shape") in {"unknown", "alias"}
+                    for item in self.reference_audit
+                ),
+                "ignored_role_only_ambiguous": sum(
+                    item.get("candidate_shape") == "role_only"
+                    or "NEGATIVE_ROLE_ONLY_AMBIGUOUS" in item.get("evidence_types", [])
+                    for item in self.reference_audit
+                ),
             },
             "entries": entries,
             "form_cleanup": self.form_cleanup,
             "register_cleanup": self.register_cleanup,
+            "character_reference_audit": [
+                {key: value for key, value in item.items() if key != "_key"}
+                for item in self.reference_audit
+            ],
             "style_profile": self.style_profile,
             "policy": self.policy.model_dump(),
             "metrics": dict(self.metrics),
@@ -705,6 +1065,7 @@ class Pipeline:
     async def prepare_dictionary(self, inputs):
         """Parse candidates from RAW, use VP as evidence, then freeze once."""
         inherited, problems = load_legacy(inputs.get("dictionary"))
+        vet_confirmed_reference_forms(inherited, self.raw_contexts(), problems)
         self.record_form_cleanup(problems)
         self.record_register_cleanup(problems)
         self.store.write("legacy-audit.json", problems)
@@ -780,6 +1141,16 @@ class Pipeline:
                 "classification": record.get("classification", "ignored"),
                 "reason": record.get("reason", "locally rejected candidate"),
             }
+            if record.get("shape") and record.get("shape") != "full_name":
+                key = (source, record.get("shape"), record.get("reason", ""), ())
+                if not any(item.get("_key") == key for item in self.reference_audit):
+                    self.reference_audit.append(
+                        {
+                            **record,
+                            "candidate_shape": record.get("shape"),
+                            "_key": key,
+                        }
+                    )
 
         conflicts = self.dictionary_conflicts()
         if conflicts:
@@ -840,6 +1211,11 @@ class Pipeline:
                 "ignored": sorted(
                     self.ignored.values(), key=lambda item: item.get("source", "")
                 ),
+                "character_reference_audit": [
+                    {key: value for key, value in item.items() if key != "_key"}
+                    for item in self.reference_audit
+                ],
+                "metrics": self.dictionary_report()["summary"],
             },
         )
         self.freeze(dictionary)
@@ -855,6 +1231,7 @@ class Pipeline:
 
     def freeze(self, dictionary):
         terms, invalid = load_legacy(dictionary)
+        vet_confirmed_reference_forms(terms, self.raw_contexts(), invalid)
         self.record_form_cleanup(invalid)
         self.record_register_cleanup(invalid)
         invalid = [
@@ -901,6 +1278,7 @@ class Pipeline:
 
     @staticmethod
     def finding_data(issues):
+        validate_findings(issues)
         return [issue.model_dump(exclude_none=True) for issue in issues]
 
     def persist_validation_failure(self, task, issues, attempts):
@@ -921,17 +1299,38 @@ class Pipeline:
 
     @staticmethod
     def validation_failure_text(task, issues, attempts):
+        validate_findings(issues)
         lines = [
             f"{task}: local validation still fails after {attempts} targeted repair(s)"
         ]
         for index, issue in enumerate(issues, 1):
             data = issue.model_dump(exclude_none=True)
-            lines.append(
-                f"{index}. source: {data.get('source', 'n/a')}; "
-                f"required: {data.get('required_translation', 'n/a')}; "
-                f"actual: {data.get('actual_text', 'n/a')}; "
-                f"reason: {data.get('reason', data.get('kind', 'unknown'))}"
-            )
+            lines.append(f"{index}. Type: {issue.type}; Validator: {issue.validator}")
+            lines.append(f"   Reason: {issue.reason}")
+            if issue.chapter_number is not None:
+                lines.append(f"   Chapter: {issue.chapter_number}")
+            if issue.chunk_index is not None:
+                lines.append(f"   Chunk: {issue.chunk_index}")
+            if issue.source_segment_id:
+                lines.append(f"   Source segment: {issue.source_segment_id}")
+            if issue.source_line is not None:
+                lines.append(f"   RAW line: {issue.source_line}")
+            if issue.source_excerpt:
+                lines.append(f"   RAW excerpt: {issue.source_excerpt}")
+            if issue.translated_excerpt is not None:
+                lines.append(f"   Translated excerpt: {issue.translated_excerpt}")
+            if issue.source:
+                lines.append(f"   Source: {issue.source}")
+            if issue.required_translation:
+                lines.append(f"   Required: {issue.required_translation}")
+            if issue.expected is not None:
+                lines.append(f"   Expected: {issue.expected}")
+            if issue.actual is not None:
+                lines.append(f"   Actual: {issue.actual}")
+            if issue.details:
+                for key, value in issue.details.items():
+                    lines.append(f"   {key.replace('_', ' ').title()}: {value}")
+            lines.append(f"   Explanation: {issue.explanation}")
         return "\n".join(lines)
 
     async def validate_and_repair(self, task, payload, translation, allow_repair=True):
@@ -985,6 +1384,67 @@ class Pipeline:
             [payload.get("raw_title", "") if -1 in selected else ""]
             + [paragraph["text"] for paragraph in payload["raw"] if paragraph["id"] in selected]
         )
+
+        raw_by_id = {paragraph["id"]: paragraph for paragraph in payload["raw"]}
+        translated_by_id = {segment.id: segment for segment in translation.segments}
+        location = payload.get("location") or {}
+
+        def raw_context_entry(paragraph_id):
+            paragraph = raw_by_id.get(paragraph_id)
+            if paragraph is None and paragraph_id == -1:
+                paragraph = {
+                    "id": -1,
+                    "text": payload.get("raw_title", ""),
+                    "source_segment_id": (
+                        f"c{location.get('chapter')}-s-1"
+                        if location.get("chapter") is not None
+                        else "s-1"
+                    ),
+                }
+            return paragraph
+
+        ordered_ids = [-1, *ids]
+
+        def surrounding(source_id):
+            try:
+                position = ordered_ids.index(source_id)
+            except ValueError:
+                position = 0
+            neighbor_ids = ordered_ids[max(0, position - 1) : position + 2]
+            return [
+                raw_context_entry(value)
+                for value in neighbor_ids
+                if raw_context_entry(value) is not None
+            ]
+
+        source_context = [
+            {
+                "affected_id": source_id,
+                "segments": surrounding(source_id),
+            }
+            for source_id in affected
+        ]
+        translated_context = [
+            {
+                "affected_id": source_id,
+                "segments": [
+                    {
+                        "id": value,
+                        "source_segment_id": (
+                            raw_context_entry(value) or {}
+                        ).get("source_segment_id"),
+                        "text": (
+                            translation.title
+                            if value == -1
+                            else translated_by_id[value].text
+                        ),
+                    }
+                    for value in ordered_ids[max(0, ordered_ids.index(source_id) - 1) : ordered_ids.index(source_id) + 2]
+                    if value in translated_by_id or value == -1
+                ],
+            }
+            for source_id in affected
+        ]
         repair_payload = {
             "raw_title": payload.get("raw_title", ""),
             "vp_title": payload.get("vp_title", ""),
@@ -996,6 +1456,8 @@ class Pipeline:
             "affected_ids": affected,
             "issues": self.finding_data(issues),
             "validator_findings": self.finding_data(issues),
+            "source_context": source_context,
+            "translated_context": translated_context,
             "translation": {
                 "title": translation.title,
                 "segments": [
@@ -1053,7 +1515,19 @@ class Pipeline:
             "raw_title": raw.title,
             "vp_title": vp.title,
             "location": {"chapter": raw.number, "chunk": None},
-            "raw": [{"id": index, "text": text} for index, text in enumerate(raw.paragraphs)],
+            "raw": [
+                {
+                    "id": index,
+                    "text": text,
+                    "source_segment_id": f"c{raw.number}-s{index}",
+                    "source_line": (
+                        raw.paragraph_lines[index]
+                        if index < len(raw.paragraph_lines)
+                        else None
+                    ),
+                }
+                for index, text in enumerate(raw.paragraphs)
+            ],
             "vp": [{"id": index, "text": text} for index, text in enumerate(vp.paragraphs)],
             "terminology": relevant(self.terms, raw.title + "\n" + "\n".join(raw.paragraphs)),
         }

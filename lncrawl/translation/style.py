@@ -88,6 +88,11 @@ ADDRESS_SPECS: Dict[str, AddressSpec] = {
     "大人": AddressSpec("social_honorific", "đại nhân", "ngài"),
     "阁下": AddressSpec("social_honorific", "các hạ", "ngài"),
     "殿下": AddressSpec("social_honorific", "điện hạ", "ngài"),
+    # Historical forms of address and office references.  These are kept as
+    # Sino-Vietnamese readings rather than modern paraphrases because the
+    # configured register is part of the frozen dictionary contract.
+    "大伴": AddressSpec("social_honorific", "Đại bạn", "attendant"),
+    "尚书": AddressSpec("official_title", "Thượng thư", "minister"),
     # Official titles and offices.
     "将军": AddressSpec("official_title", "tướng quân", "tướng"),
     "科长": AddressSpec("official_title", "khoa trưởng", "trưởng khoa"),
@@ -96,6 +101,9 @@ ADDRESS_SPECS: Dict[str, AddressSpec] = {
     "部长": AddressSpec("official_title", "bộ trưởng", "trưởng ban"),
     "长官": AddressSpec("official_title", "trưởng quan", "sếp", title_first=True),
     # Ranks, roles and standing references.
+    "帅": AddressSpec("rank", "soái", "marshal"),
+    "缇帅": AddressSpec("role_reference", "Đề soái", "commander"),
+    "侍班": AddressSpec("role_reference", "Thị ban", "attendant"),
     "上校": AddressSpec("rank", "thượng tá", "thượng tá"),
     "中校": AddressSpec("rank", "trung tá", "trung tá"),
     "少校": AddressSpec("rank", "thiếu tá", "thiếu tá"),
@@ -107,6 +115,14 @@ ADDRESS_SPECS: Dict[str, AddressSpec] = {
     "医生": AddressSpec("role_reference", "y sư", "bác sĩ"),
     "老师": AddressSpec("role_reference", "lão sư", "thầy giáo"),
 }
+
+# Prefix titles are parsed separately from suffix titles because the person
+# name follows the office: 大司徒王国光.  The trailing person must be a complete
+# canonical identity; a shorter substring is never a valid canonical source.
+TITLE_PREFIX_SPECS: Dict[str, AddressSpec] = {
+    "大司徒": AddressSpec("official_title", "Đại Tư đồ", "grand minister", title_first=True),
+}
+HISTORICAL_REFERENCE_SUFFIXES = frozenset({"大伴", "尚书", "帅", "缇帅", "侍班"})
 
 # Longest suffix first so 副署长/少爷/师姐 are matched before 署长/爷/姐.
 ADDRESS_SUFFIX = re.compile(
@@ -222,6 +238,12 @@ SINO_MARKERS = frozenset(
         "thái tử",
         "phò mã",
         "công công",
+        "đại bạn",
+        "thượng thư",
+        "soái",
+        "đề soái",
+        "thị ban",
+        "đại tư đồ",
     }
 )
 MODERN_MARKERS = frozenset(
@@ -335,6 +357,27 @@ def address_spec(form, canonical="", contexts=()):
             literal=False,
             title_prefix="",
         )
+    for prefix in sorted(TITLE_PREFIX_SPECS, key=len, reverse=True):
+        if not form.startswith(prefix):
+            continue
+        person = form[len(prefix) :]
+        if len(person) < 2 or not re.fullmatch(r"[\u3400-\u9fff]+", person):
+            return None
+        spec = TITLE_PREFIX_SPECS[prefix]
+        result = _spec(
+            spec,
+            honorific=spec.honorific,
+            suffix="",
+            surname="",
+            literal=literal,
+            title_prefix="",
+        )
+        result.update(
+            prefix_reference=True,
+            title_prefix_han=prefix,
+            person_source=person,
+        )
+        return result
     suffix, title_prefix = None, ""
     for candidate in sorted(ADDRESS_SPECS, key=len, reverse=True):
         if form.endswith("副" + candidate):
@@ -375,7 +418,20 @@ def _spec(spec, honorific, suffix, surname, literal, title_prefix=None):
         "title_prefix": title_prefix if title_prefix is not None else "",
         "title_first": spec.title_first or bool(title_prefix),
         "literal_kinship_hint": bool(literal and spec.kinship),
+        "prefix_reference": False,
+        "title_prefix_han": "",
+        "person_source": "",
     }
+
+
+def title_prefix_parts(form):
+    """Return ``(prefix, trailing_person)`` for a known title prefix."""
+    for prefix in sorted(TITLE_PREFIX_SPECS, key=len, reverse=True):
+        if form.startswith(prefix):
+            person = form[len(prefix) :]
+            if len(person) >= 2 and re.fullmatch(r"[\u3400-\u9fff]+", person):
+                return prefix, person
+    return None
 
 
 def person_token(han, canonical_source, canonical_translation, allow_suffix=False):
@@ -404,6 +460,11 @@ def preferred_form(form, canonical_source, canonical_translation, spec):
     honorific = spec["honorific"]
     if not honorific:
         return None
+    if spec.get("prefix_reference"):
+        if spec.get("person_source") != canonical_source:
+            return None
+        text = f"{honorific} {canonical_translation}"
+        return text[:1].upper() + text[1:]
     person = None
     if not spec["suffix"] and form and form[0] in NICKNAME_SPECS:
         person = person_token(
@@ -461,13 +522,23 @@ def normalize_forms(term, register, contexts=()):
             continue
         kinds[name] = declared.get(name, spec["kind"])
         reason = conflict(spec, value, register)
-        if reason is None:
+        historical = bool(
+            register == SINO_VIETNAMESE
+            and (
+                spec.get("suffix") in HISTORICAL_REFERENCE_SUFFIXES
+                or spec.get("prefix_reference")
+                and spec.get("title_prefix_han") in TITLE_PREFIX_SPECS
+            )
+        )
+        if reason is None and not historical:
             continue
         replacement = preferred_form(name, source, term.translation, spec)
+        if replacement == value:
+            continue
         if (
             replacement
             and replacement != value
-            and register_of(replacement) == register
+            and (historical or register_of(replacement) == register)
         ):
             term.forms[name] = replacement
             normalizations.append(
@@ -476,7 +547,7 @@ def normalize_forms(term, register, contexts=()):
                     "from": value,
                     "to": replacement,
                     "kind": spec["kind"],
-                    "reason": reason,
+                    "reason": reason or "deterministic historical reference rendering",
                 }
             )
             continue

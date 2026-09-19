@@ -54,6 +54,21 @@ share one identity with Chinese-keyed address forms. Different Chinese identitie
 may share the same Vietnamese target; only one source identity having contradictory
 targets is a conflict.
 
+Character-reference confirmation is an explicit pre-freeze gate:
+
+```text
+direct RAW link → CONFIRMED
+two independent strong RAW signals, with no competing owner → CONFIRMED
+otherwise → IGNORE + audit
+```
+
+Resolver evidence is structured (`DIRECT_*`, `INDIRECT_*` and `NEGATIVE_*`) and every
+cited excerpt is checked against RAW locally. VietPhrase may support an interpretation
+but can never prove ownership. Sanity runs only on the resulting confirmed namespace;
+uncertain titles, role-only references and unknown historical forms reduce coverage
+instead of stopping the batch. A form has one owner, and audit/terminology output is
+deduplicated by `(canonical, form)`.
+
 Runtime terminology has exactly two decisions:
 
 ```text
@@ -81,6 +96,16 @@ form must be independently attested in RAW and have a reference shape or explici
 co-reference evidence; a context window or VietPhrase phrase cannot become a form.
 Legacy frozen dictionaries and resolved-term checkpoints go through the same cleanup.
 Cleanup writes a concise audit and produces a new dictionary hash.
+
+Historical references such as `冯大伴`, `张尚书`, `李帅`, `赵缇帅` and `张侍班`
+are recognized as identity forms when RAW proves the referenced person. They retain
+the configured Sino-Vietnamese register (`Đại bạn`, `Thượng thư`, `soái`, `Đề soái`
+and `Thị ban`) and are never separate canonical identities. A known title prefix such
+as `大司徒` may precede a complete personal name (`大司徒王国光`), but a prefix plus a
+partial name (`大司徒王国`) is a truncated extraction and is migrated to or quarantined
+under the full identity rather than entering the strict namespace. Reference ownership
+is deduplicated across aliases and forms so one canonical/form pair is inserted and
+reported only once.
 
 ## Translation style and address register
 
@@ -158,6 +183,15 @@ Local validation is small and deterministic:
 - chapter/title shape, placeholders and proven length/order checks already supported
   by the application.
 
+Every fatal local finding is a typed `ValidationFinding` with a validator origin,
+reason, chapter/chunk location, stable source-segment ID, RAW excerpt and the
+expected/actual evidence relevant to that finding type. Content coverage findings
+distinguish a genuinely missing source ID from an aligned VietPhrase region that is
+fully visible in a neighboring output segment (a conservative merged-output case).
+The failure renderer is type-specific and never fills unrelated terminology fields
+with `n/a`. A finding without actionable evidence is an internal validation error,
+not a reportable fatal finding.
+
 Differences from VietPhrase wording alone never fail validation. Terminology findings
 use exact confirmed canonical/alias/form keys only. Each occurrence preserves `start`,
 `end`, `matched_source`, and separate left/right context; the invariant
@@ -167,7 +201,8 @@ punctuation, ASCII or numbers. Required Vietnamese text comes only from the froz
 mapping. Findings include the exact RAW source, required Vietnamese wording, actual
 realization, reason and location. A failed translation chunk receives at most one
 targeted repair containing only the failed RAW IDs, their aligned VietPhrase region,
-findings and relevant confirmed mappings. The same deterministic validator runs once
+typed findings and relevant confirmed mappings, plus narrowly bounded previous/current/
+next source and translated context for the affected IDs. The same deterministic validator runs once
 after repair. A persistent failure stops with the exact findings; there is no recursive
 repair or repair-time dictionary mutation. On resume, serialized findings are never
 trusted: the current RAW, frozen dictionary and translation recompute local findings

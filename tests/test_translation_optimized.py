@@ -7,13 +7,13 @@ from pathlib import Path
 from unittest.mock import patch
 
 from lncrawl.translation import prompts
-from lncrawl.translation.models import Inputs, Translation
+from lncrawl.translation.models import Inputs, Issue, Translation
 from lncrawl.translation.parsing import deterministic_alignment, validate_inputs
 from lncrawl.translation.pipeline import Pipeline, QualityError
 from lncrawl.translation.preprocessing import build_index, local_resolution
 from lncrawl.translation.scheduler import ProviderError, Scheduler
 from lncrawl.translation.store import Store, digest, pipeline_identity
-from lncrawl.translation.validation import local_findings
+from lncrawl.translation.validation import local_findings, validate_findings
 
 
 class BookProvider:
@@ -492,6 +492,70 @@ class OptimizedPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             any(issue.kind == "number" and issue.segment_id == -1 for issue in title_issues)
         )
+
+    def test_local_validator_uses_typed_findings_with_source_evidence(self):
+        payload = {
+            "location": {"chapter": 175, "chunk": 2},
+            "raw": [
+                {
+                    "id": 0,
+                    "text": "第一段。",
+                    "source_segment_id": "c175-k2-s0",
+                    "source_line": 18,
+                },
+                {
+                    "id": 1,
+                    "text": "第二段。",
+                    "source_segment_id": "c175-k2-s1",
+                    "source_line": 20,
+                },
+            ],
+            "vp": [],
+            "terminology": [],
+        }
+        issues = local_findings(
+            payload,
+            Translation.model_validate(
+                {"title": "Chương 175", "segments": [{"id": 0, "text": "Đoạn một."}]}
+            ),
+        )
+        self.assertEqual(len(issues), 1)
+        issue = issues[0]
+        self.assertEqual(issue.type, "content_missing")
+        self.assertEqual(issue.validator, "content_coverage")
+        self.assertEqual(issue.source_segment_id, "c175-k2-s1")
+        self.assertEqual(issue.source_excerpt, "第二段。")
+        self.assertEqual(issue.source_line, 20)
+        report = Pipeline.validation_failure_text("chapter:175:chunk:2", issues, 1)
+        self.assertIn("Type: content_missing", report)
+        self.assertIn("RAW excerpt: 第二段。", report)
+        self.assertNotIn("n/a", report)
+
+    def test_merged_output_is_not_reported_as_missing_when_complete_vp_is_visible(self):
+        payload = {
+            "raw": [
+                {"id": 0, "text": "第一段。"},
+                {"id": 1, "text": "第二段。"},
+            ],
+            "vp": [
+                {"id": 0, "text": "Alpha"},
+                {"id": 1, "text": "Beta Gamma"},
+            ],
+            "terminology": [],
+        }
+        merged = local_findings(
+            payload,
+            Translation.model_validate(
+                {"title": "Chương 1", "segments": [{"id": 0, "text": "Alpha Beta Gamma"}]}
+            ),
+        )
+        self.assertEqual(merged, [])
+
+    def test_fatal_findings_cannot_be_anonymous(self):
+        with self.assertRaisesRegex(ValueError, "no actionable evidence"):
+            validate_findings(
+                [Issue(segment_id=4, kind="missing", explanation="missing")]
+            )
 
     async def test_success_causes_no_ai_review_or_repair(self):
         with tempfile.TemporaryDirectory() as root:

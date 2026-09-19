@@ -65,6 +65,13 @@ address form: 唐姐 stays forms["唐姐"] of 唐菲菲. Keep exactly one prefer
 Vietnamese rendering per confirmed Chinese reference form; never add a second
 rendering as an alias. Set form_kinds for every form you return, and use the
 translation_style and address_form fields of the request as authoritative context.
+Historical forms use the established Sino-Vietnamese register: 大伴->Đại bạn,
+尚书->Thượng thư, 帅->soái, 缇帅->Đề soái, 侍班->Thị ban, and
+大司徒王国光->Đại Tư đồ Vương Quốc Quang. A title prefix followed by a full
+personal name is a form of that person; a title prefix followed by only a
+substring of the personal name is a malformed/truncated extraction and must
+never become the canonical source. If RAW does not prove a historical role
+reference such as 张侍班 refers to the full person, return IGNORE.
 """
 RESOLVE = (
     AUTHORITY
@@ -115,6 +122,14 @@ aliases, and forms[original_source] preserving the address wording. For example,
 RAW proves 秦科长 is 秦舒曼, return source=秦舒曼, type=character,
 translation=Tần Thư Mạn, forms={"秦科长":"Khoa trưởng Tần"}.
 If RAW does not establish the full identity, return IGNORE without invented aliases.
+For every character reference form, return candidate_shape, identity_evidence and
+competing_identities. Each identity_evidence item must use one of the explicit
+evidence types (DIRECT_EXPLICIT_LINK, DIRECT_FULL_NAME_WITH_TITLE,
+DIRECT_ALIAS_DECLARATION, INDIRECT_REPEATED_CONTEXT, INDIRECT_UNIQUE_SURNAME_TITLE,
+INDIRECT_ROLE_CONTINUITY, INDIRECT_LOCAL_COREFERENCE, INDIRECT_VIETPHRASE_SUPPORT)
+and include an exact RAW excerpt supplied in the request. VietPhrase support is
+never sufficient by itself. A CONFIRMED/ACCEPT form without inspectible RAW evidence
+will be downgraded locally to IGNORE; do not cite inferred or invented context.
 validator_feedback describes a failed independent record; correct that defect in
 your new result. A plain string reason does not repair an invalid term record.
 """
@@ -173,7 +188,7 @@ Context and reference text are not translation output and must not be reported a
 )
 REPAIR = (
     AUTHORITY
-    + """Fix ONLY the concrete validator findings listed in this request.
+    + """Fix ONLY the concrete typed validator findings listed in this request.
 The whole-batch CONFIRMED dictionary is already frozen. RAW remains the meaning source;
 VietPhrase is only a hint. For every enforceable frozen dictionary
 mapping listed below, use the required Vietnamese form exactly; do not synonymize,
@@ -185,7 +200,10 @@ remained or regressed; do not repeat a no-progress wording. Return the complete 
 chunk for exactly the requested affected segment IDs only, with no explanations or
 patches. Terminology findings contain an exact confirmed source and required mapping;
 context, left_context, right_context and offsets are diagnostics only and must never be
-copied into the terminology source. -1 denotes chapter title. Do not regenerate
-unaffected segments.
+copied into the terminology source. For content_missing, content_coverage, or
+untranslated_chinese findings, use the source_segment_id, RAW excerpt, expected value,
+and the supplied source/translated context to restore only the missing or incomplete
+content. A missing output ID is not permission to renumber, merge, or regenerate
+unaffected segments. -1 denotes chapter title. Do not regenerate unaffected segments.
 """
 )

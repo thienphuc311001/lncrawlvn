@@ -5,7 +5,14 @@ import unicodedata
 from collections import Counter, defaultdict
 
 from . import style
-from .models import CONFIRMED, DICTIONARY_VERSION, IGNORE, Term
+from .models import (
+    CONFIRMED,
+    DICTIONARY_VERSION,
+    IGNORE,
+    IDENTITY_EVIDENCE_TYPES,
+    IdentityEvidence,
+    Term,
+)
 from .parsing import HAN
 
 ORDINARY = set(
@@ -42,6 +49,11 @@ REFERENCE_SUFFIXES = (
     "师弟",
     "师妹",
     "掌门",
+    "大伴",
+    "尚书",
+    "帅",
+    "缇帅",
+    "侍班",
 )
 REFERENCE_SUFFIX = re.compile(
     r"(?:" + "|".join(map(re.escape, REFERENCE_SUFFIXES)) + r")$"
@@ -49,10 +61,38 @@ REFERENCE_SUFFIX = re.compile(
 NICKNAME = re.compile(r"^(?:老|小|阿)[\u3400-\u9fff]{1,3}$")
 # Non-enforceable audit records: they document local cleanup instead of
 # rejecting a checkpoint.
-AUDIT_ONLY_CLASSIFICATIONS = frozenset({"form_cleanup", "register_form_cleanup"})
+AUDIT_ONLY_CLASSIFICATIONS = frozenset(
+    {"form_cleanup", "register_form_cleanup", "canonical_cleanup"}
+)
 IDENTITY_CUE = re.compile(
     r"(?:就是|是|名为|名字是|叫做|称为|原名|又名|也叫|被称为|"
-    r"升为|晋升为|改称|改任|成为)"
+    r"升为|晋升为|改称|改任|成为|即|乃)"
+)
+HISTORICAL_EVIDENCE_REQUIRED = frozenset({"侍班"})
+
+DIRECT_EVIDENCE = frozenset(
+    {
+        "DIRECT_EXPLICIT_LINK",
+        "DIRECT_FULL_NAME_WITH_TITLE",
+        "DIRECT_ALIAS_DECLARATION",
+    }
+)
+INDIRECT_EVIDENCE = frozenset(
+    {
+        "INDIRECT_REPEATED_CONTEXT",
+        "INDIRECT_UNIQUE_SURNAME_TITLE",
+        "INDIRECT_ROLE_CONTINUITY",
+        "INDIRECT_LOCAL_COREFERENCE",
+    }
+)
+NEGATIVE_EVIDENCE = frozenset(
+    {
+        "NEGATIVE_COMPETING_IDENTITY",
+        "NEGATIVE_TRUNCATED_IDENTITY",
+        "NEGATIVE_CONTEXTUAL_RESIDUE",
+        "NEGATIVE_ROLE_ONLY_AMBIGUOUS",
+        "NEGATIVE_MULTIPLE_POSSIBLE_OWNERS",
+    }
 )
 
 
@@ -144,6 +184,250 @@ def _identity_evidence(name, canonical, contexts=(), evidence=""):
     return any(pair.search(value) for value in values if value)
 
 
+def reference_shape(name, canonical=""):
+    """Classify a possible character reference before identity evaluation."""
+    if not name:
+        return "unknown"
+    if name == canonical and canonical:
+        return "full_name"
+    parts = style.title_prefix_parts(name)
+    if parts:
+        _prefix, person = parts
+        if canonical and person == canonical:
+            return "title_prefix_plus_full_name"
+        if canonical and canonical.startswith(person):
+            return "truncated_name"
+        return "title_prefix_plus_partial_name"
+    if canonical and name.startswith(canonical):
+        suffix = name[len(canonical) :]
+        if suffix and REFERENCE_SUFFIX.search(suffix):
+            return "full_name_plus_title_suffix"
+        if suffix:
+            return "contextual_extension"
+    spec = style.address_spec(name, canonical)
+    if spec:
+        if spec.get("surname"):
+            if canonical and name[0] == canonical[0]:
+                return "surname_plus_title"
+            return "surname_plus_title"
+        if spec.get("suffix") or name in style.ADDRESS_SPECS:
+            return "role_only"
+        if name.startswith(("老", "小", "阿")):
+            return "nickname"
+    if canonical and canonical.startswith(name) and len(name) < len(canonical):
+        return "truncated_name"
+    return "alias" if canonical else "unknown"
+
+
+def _evidence_records(term_or_records=(), extra=()):
+    records = []
+    values = []
+    if term_or_records is not None:
+        if isinstance(term_or_records, str):
+            values.append(term_or_records)
+        else:
+            values.extend(term_or_records or ())
+    values.extend(extra or ())
+    for item in values:
+        if isinstance(item, IdentityEvidence):
+            records.append(item)
+        elif isinstance(item, dict):
+            try:
+                records.append(IdentityEvidence.model_validate(item))
+            except (ValueError, TypeError):
+                continue
+    return records
+
+
+def _record_is_attested(record, contexts, candidate, canonical):
+    excerpt = record.raw_excerpt.strip()
+    if not excerpt or not any(excerpt in context for context in contexts):
+        return False
+    if candidate not in excerpt:
+        return False
+    if record.type in DIRECT_EVIDENCE and canonical not in excerpt:
+        return False
+    return True
+
+
+def _link_excerpt(candidate, canonical, contexts):
+    cue = r"(?:就是|也就是|即|乃|是|名为|名字是|叫做|称为|原名|又名|被称为|人称)"
+    patterns = (
+        re.compile(re.escape(candidate) + r".{0,24}" + cue + r".{0,24}" + re.escape(canonical)),
+        re.compile(re.escape(canonical) + r".{0,24}" + cue + r".{0,24}" + re.escape(candidate)),
+    )
+    for context in contexts:
+        for pattern in patterns:
+            match = pattern.search(context)
+            if match:
+                return match.group(0)
+    return ""
+
+
+def _role_excerpt(candidate, canonical, contexts):
+    spec = style.address_spec(candidate, canonical)
+    suffix = spec.get("suffix") if spec else ""
+    if not suffix and spec and spec.get("prefix_reference"):
+        suffix = spec.get("title_prefix_han", "")
+    if not suffix:
+        return ""
+    role = r"(?:任|担任|官至|升为|晋升为|改任|成为|负责|任职|充任|为)"
+    pattern = re.compile(
+        re.escape(canonical) + r".{0,20}" + role + r".{0,12}" + re.escape(suffix)
+    )
+    for context in contexts:
+        match = pattern.search(context)
+        if match:
+            return match.group(0)
+    return ""
+
+
+def evaluate_reference_evidence(
+    candidate,
+    canonical,
+    contexts=(),
+    evidence=(),
+    evidence_types=(),
+    competing_identities=(),
+):
+    """Return a deterministic confirmation decision for one character form.
+
+    RAW excerpts are the only source of identity.  Resolver-provided evidence
+    types are accepted only after their exact excerpts are found in RAW.
+    """
+    contexts = [context for context in contexts or () if context]
+    shape = reference_shape(candidate, canonical)
+    records = _evidence_records(evidence)
+    supplied_types = set(evidence_types or ())
+    valid_records = [
+        record
+        for record in records
+        if record.type in IDENTITY_EVIDENCE_TYPES
+        and _record_is_attested(record, contexts, candidate, canonical)
+    ]
+    valid_types = {record.type for record in valid_records}
+    negative = set(competing_identities or ())
+    negative_types = set()
+    if competing_identities:
+        negative_types.add("NEGATIVE_COMPETING_IDENTITY")
+    if shape in {"truncated_name", "title_prefix_plus_partial_name", "contextual_extension"}:
+        negative_types.add(
+            "NEGATIVE_TRUNCATED_IDENTITY"
+            if shape != "contextual_extension"
+            else "NEGATIVE_CONTEXTUAL_RESIDUE"
+        )
+    if shape == "role_only" and len(competing_identities or ()) > 1:
+        negative_types.add("NEGATIVE_ROLE_ONLY_AMBIGUOUS")
+    explicit_excerpt = _link_excerpt(candidate, canonical, contexts)
+    role_excerpt = _role_excerpt(candidate, canonical, contexts)
+    if explicit_excerpt:
+        valid_types.add("DIRECT_EXPLICIT_LINK")
+        valid_records.append(
+            IdentityEvidence(type="DIRECT_EXPLICIT_LINK", raw_excerpt=explicit_excerpt)
+        )
+    # A complete canonical name plus a recognized title is direct structural
+    # evidence.  A surname/title or role-only form still needs RAW proof.
+    if (
+        shape in {"title_prefix_plus_full_name", "full_name_plus_title_suffix"}
+        and any(candidate in text for text in contexts)
+    ):
+        valid_types.add("DIRECT_FULL_NAME_WITH_TITLE")
+        valid_records.append(
+            IdentityEvidence(
+                type="DIRECT_FULL_NAME_WITH_TITLE",
+                raw_excerpt=next((text for text in contexts if candidate in text), candidate),
+            )
+        )
+    if role_excerpt:
+        valid_types.add("INDIRECT_ROLE_CONTINUITY")
+        valid_records.append(
+            IdentityEvidence(type="INDIRECT_ROLE_CONTINUITY", raw_excerpt=role_excerpt)
+        )
+    occurrences = sum(context.count(candidate) for context in contexts)
+    if occurrences >= 2:
+        valid_types.add("INDIRECT_REPEATED_CONTEXT")
+        valid_records.append(
+            IdentityEvidence(
+                type="INDIRECT_REPEATED_CONTEXT",
+                raw_excerpt=next((text for text in contexts if candidate in text), candidate),
+            )
+        )
+    if (
+        shape == "surname_plus_title"
+        and canonical
+        and candidate[:1] == canonical[:1]
+        and not competing_identities
+        and role_excerpt
+    ):
+        valid_types.add("INDIRECT_UNIQUE_SURNAME_TITLE")
+        valid_records.append(
+            IdentityEvidence(type="INDIRECT_UNIQUE_SURNAME_TITLE", raw_excerpt=role_excerpt)
+        )
+    # The resolver may have supplied a type without a valid excerpt.  Preserve
+    # it for audit visibility, but never let it confirm the relationship.
+    unverified_types = supplied_types - valid_types
+    structural_negative = negative_types - {
+        "NEGATIVE_COMPETING_IDENTITY",
+        "NEGATIVE_MULTIPLE_POSSIBLE_OWNERS",
+    }
+    hard_negative = bool(structural_negative) or bool(
+        valid_types.intersection(
+            NEGATIVE_EVIDENCE
+            - {"NEGATIVE_COMPETING_IDENTITY", "NEGATIVE_MULTIPLE_POSSIBLE_OWNERS"}
+        )
+    )
+    direct = bool(valid_types.intersection(DIRECT_EVIDENCE))
+    indirect = valid_types.intersection(INDIRECT_EVIDENCE)
+    confirmed = not hard_negative and (
+        direct
+        or (
+            len(indirect) >= 2
+            and not competing_identities
+        )
+    )
+    if shape == "role_only" and not direct and len(indirect) < 2:
+        confirmed = False
+        if competing_identities:
+            negative_types.add("NEGATIVE_ROLE_ONLY_AMBIGUOUS")
+    if shape in {"truncated_name", "title_prefix_plus_partial_name", "contextual_extension"}:
+        confirmed = False
+    reason = (
+        "direct_evidence"
+        if direct and confirmed
+        else "strong_indirect_evidence"
+        if confirmed
+        else "competing_identity"
+        if competing_identities
+        else "truncated_identity"
+        if shape in {"truncated_name", "title_prefix_plus_partial_name"}
+        else "contextual_residue"
+        if shape == "contextual_extension"
+        else "insufficient_identity_evidence"
+    )
+    return {
+        "confirmed": confirmed,
+        "shape": shape,
+        "reason": reason,
+        "evidence_types": sorted(valid_types | negative_types),
+        "evidence": valid_records,
+        "unverified_evidence_types": sorted(unverified_types),
+        "competing_identities": sorted(negative),
+    }
+
+
+def _title_prefix_problem(name, canonical):
+    """Reject title-prefix references whose trailing name is incomplete."""
+    parts = style.title_prefix_parts(name)
+    if not parts:
+        return None
+    _prefix, person = parts
+    if person == canonical:
+        return None
+    if canonical.startswith(person) and len(canonical) > len(person):
+        return "truncated title-prefixed canonical reference"
+    return "title-prefixed reference does not match canonical identity"
+
+
 def identity_form_problem(term, name, contexts=(), require_evidence=False):
     """Reject contextual sentence extensions from character aliases/forms.
 
@@ -156,13 +440,40 @@ def identity_form_problem(term, name, contexts=(), require_evidence=False):
     if source_problem(name):
         return "invalid alias/form"
     evidence = _identity_evidence(name, term.source, contexts, term.evidence)
+    # Structured evidence has already been locally checked before a term is
+    # frozen.  Keep its compact excerpt in ``term.evidence`` for old sanity
+    # callers, while accepting the structured fields as an audit-preserving
+    # confirmation source too.
+    if (
+        term.identity_evidence
+        and term.evidence_types
+        and any(record.raw_excerpt for record in term.identity_evidence)
+    ):
+        evidence = evidence or bool(
+            set(term.evidence_types).intersection(DIRECT_EVIDENCE | INDIRECT_EVIDENCE)
+        )
+    title_problem = _title_prefix_problem(name, term.source)
+    if title_problem:
+        return title_problem
+    spec = style.address_spec(name, term.source, contexts)
+    if spec and spec.get("prefix_reference"):
+        if spec.get("person_source") != term.source:
+            return "title-prefixed reference does not match canonical identity"
+        if spec.get("person_source") in HISTORICAL_EVIDENCE_REQUIRED and not evidence:
+            return "character reference identity is not independently proven"
+        return None
     suffix = name[len(term.source) :] if name.startswith(term.source) else ""
     if suffix:
         if REFERENCE_SUFFIX.search(suffix) or evidence:
+            if suffix in HISTORICAL_EVIDENCE_REQUIRED and not evidence:
+                return "character reference identity is not independently proven"
             return None
         return "canonical character plus contextual residue"
-    if style.ADDRESS_SUFFIX.search(name) or NICKNAME.fullmatch(name):
-        if require_evidence and not evidence:
+    if spec or style.ADDRESS_SUFFIX.search(name) or NICKNAME.fullmatch(name):
+        if (
+            require_evidence
+            or (spec and spec.get("suffix") in HISTORICAL_EVIDENCE_REQUIRED)
+        ) and not evidence:
             return "character reference identity is not independently proven"
         return None
     if evidence:
@@ -177,14 +488,6 @@ def clean_identity_forms(term, contexts=(), require_evidence=False):
     if term.type not in CHARACTER_TYPES:
         return [], []
     removed, preserved = [], []
-    aliases = []
-    for name in term.aliases:
-        problem = identity_form_problem(term, name, contexts, require_evidence)
-        if problem:
-            removed.append({"source": name, "reason": problem, "field": "aliases"})
-        else:
-            aliases.append(name)
-            preserved.append(name)
     forms = {}
     for name, translation in term.forms.items():
         problem = identity_form_problem(term, name, contexts, require_evidence)
@@ -193,9 +496,165 @@ def clean_identity_forms(term, contexts=(), require_evidence=False):
         else:
             forms[name] = translation
             preserved.append(name)
+    aliases = []
+    for name in term.aliases:
+        # A form carries the required Vietnamese rendering, so it owns the
+        # key when a resolver or legacy record also emitted it as an alias.
+        if name in forms:
+            continue
+        problem = identity_form_problem(term, name, contexts, require_evidence)
+        if problem:
+            removed.append({"source": name, "reason": problem, "field": "aliases"})
+        else:
+            aliases.append(name)
+            preserved.append(name)
     term.aliases = sorted(set(aliases))
     term.forms = forms
     return removed, sorted(set(preserved))
+
+
+def canonical_source_problem(source):
+    """Title-prefixed references are forms, never canonical identities."""
+    if style.title_prefix_parts(source):
+        return "title-prefixed reference must be stored as a form of the full identity"
+    return None
+
+
+def _title_reference_candidates(source, terms):
+    parts = style.title_prefix_parts(source)
+    if not parts:
+        return []
+    prefix, fragment = parts
+    candidates = set()
+    for name, term in terms.items():
+        if name == source or not term.enforceable or term.type not in CHARACTER_TYPES:
+            continue
+        if name.startswith(fragment) and len(name) > len(fragment):
+            candidates.add(name)
+        for reference in [*term.aliases, *term.forms]:
+            ref_parts = style.title_prefix_parts(reference)
+            if ref_parts and ref_parts[0] == prefix:
+                person = ref_parts[1]
+                if person.startswith(fragment) and len(person) > len(fragment):
+                    candidates.add(name)
+    return sorted(candidates, key=lambda value: (-len(value), value))
+
+
+def migrate_title_prefixed_identities(terms, problems):
+    """Merge malformed title-prefixed canonical records into full identities."""
+    for source, malformed in list(terms.items()):
+        if not style.title_prefix_parts(source):
+            continue
+        candidates = _title_reference_candidates(source, terms)
+        if candidates:
+            target_source = candidates[0]
+            target = terms[target_source]
+            prefix = style.title_prefix_parts(source)[0]
+            full_form = prefix + target_source
+            target.forms.setdefault(
+                full_form,
+                style.preferred_form(
+                    full_form,
+                    target_source,
+                    target.translation,
+                    style.address_spec(full_form, target_source),
+                )
+                or malformed.forms.get(full_form, malformed.translation),
+            )
+            for name, value in malformed.forms.items():
+                if name == full_form or (
+                    style.title_prefix_parts(name)
+                    and style.title_prefix_parts(name)[1] == target_source
+                ):
+                    target.forms.setdefault(name, value)
+            target.aliases = sorted(
+                set(target.aliases + [name for name in malformed.aliases if name != full_form])
+                - set(target.forms)
+            )
+            terms.pop(source)
+            problems.append(
+                {
+                    "classification": "canonical_cleanup",
+                    "source": source,
+                    "target": target_source,
+                    "migrated_forms": [full_form],
+                    "reason": "migrated truncated title-prefixed canonical extraction",
+                }
+            )
+            continue
+        malformed.status = "report_only"
+        malformed.enforceable = False
+        malformed.runtime_state = IGNORE
+        problems.append(
+            {
+                "classification": "canonical_cleanup",
+                "source": source,
+                "reason": "title-prefixed reference has no proven full canonical identity",
+            }
+        )
+
+
+def vet_confirmed_reference_forms(terms, contexts, problems):
+    """Re-check legacy frozen forms against the current RAW evidence.
+
+    Legacy canonical translations remain reusable, but an old form is not
+    allowed to regain enforcement merely because it was once serialized.  A
+    form that cannot be proven is removed and retained only in the audit trail.
+    """
+    contexts = [context for context in contexts or () if context]
+    for term in terms:
+        if not term.enforceable or term.type not in CHARACTER_TYPES:
+            continue
+        removed = []
+        for name in list(term.forms):
+            decision = evaluate_reference_evidence(
+                name,
+                term.source,
+                [*contexts, term.evidence] if term.evidence else contexts,
+                term.identity_evidence,
+                term.evidence_types,
+                term.competing_identities,
+            )
+            if decision["confirmed"]:
+                term.candidate_shape = term.candidate_shape or decision["shape"]
+                term.evidence_types = sorted(
+                    set(term.evidence_types) | set(decision["evidence_types"])
+                )
+                continue
+            # Pre-v5 locked dictionaries treated recognized address mappings as
+            # user-confirmed terminology.  Preserve that compatibility for
+            # ordinary known forms during reload; historically evidence-gated
+            # roles such as 侍班 still require current RAW proof.
+            legacy_spec = style.address_spec(name, term.source)
+            if (
+                legacy_spec
+                and legacy_spec.get("suffix") not in HISTORICAL_EVIDENCE_REQUIRED
+                and decision["shape"] not in {"truncated_name", "contextual_extension"}
+            ):
+                continue
+            removed.append(
+                {
+                    "source": name,
+                    "reason": decision["reason"],
+                    "field": "forms",
+                    "evidence_types": decision["evidence_types"],
+                }
+            )
+            term.forms.pop(name, None)
+            term.form_kinds.pop(name, None)
+        if removed:
+            term.aliases = sorted(set(term.aliases) - set(term.forms))
+            problems.append(
+                {
+                    "classification": "form_cleanup",
+                    "source": term.source,
+                    "removed_forms": removed,
+                    "preserved_forms": sorted(term.forms),
+                    "reason": "removed legacy forms without current identity evidence",
+                }
+            )
+
+
 def normalize_term_register(term, register, contexts=()):
     """Apply the batch address/title register to one confirmed term.
 
@@ -222,6 +681,9 @@ def term_problem(term, known=()):
             return "invalid report-only source span"
         return None
     problem = source_problem(term.source, known)
+    if problem:
+        return problem
+    problem = canonical_source_problem(term.source)
     if problem:
         return problem
     if (
@@ -313,7 +775,12 @@ def load_legacy(data):
             term.forms = {
                 name: value for name, value in term.forms.items() if name != term.source
             }
-            removed, preserved = clean_identity_forms(term)
+            # Keep title-prefixed references intact until the canonical
+            # migration pass can attach their complete form to the real person.
+            if canonical_source_problem(term.source):
+                removed, preserved = [], sorted(term.forms)
+            else:
+                removed, preserved = clean_identity_forms(term)
             if removed:
                 problems.append(
                     {
@@ -326,7 +793,19 @@ def load_legacy(data):
                 )
             problem = term_problem(term)
             if problem:
-                raise ValueError(problem)
+                if canonical_source_problem(term.source):
+                    term.status = "report_only"
+                    term.enforceable = False
+                    term.runtime_state = IGNORE
+                    problems.append(
+                        {
+                            "classification": "canonical_cleanup",
+                            "source": term.source,
+                            "reason": problem,
+                        }
+                    )
+                else:
+                    raise ValueError(problem)
             existing = terms.get(term.source)
             if existing and (
                 existing.translation != term.translation
@@ -374,6 +853,7 @@ def load_legacy(data):
             elif existing:
                 existing.aliases = sorted(set(existing.aliases + term.aliases))
                 existing.forms.update(term.forms)
+                existing.aliases = sorted(set(existing.aliases) - set(existing.forms))
                 if term.status == "locked":
                     existing.status = "locked"
                 problems.append(
@@ -395,6 +875,7 @@ def load_legacy(data):
             )
     for source in conflicts:
         terms[source].status = "provisional"
+    migrate_title_prefixed_identities(terms, problems)
     register = style.stored_register(data, terms.values())
     if register is None:
         register, _source = style.effective_register(
@@ -419,7 +900,13 @@ def load_legacy(data):
 
 
 def sanity(terms, allow_shared_translations=True):
-    errors, owners = [], {}
+    errors, owners, error_keys = [], {}, set()
+
+    def add_error(message):
+        if message not in error_keys:
+            error_keys.add(message)
+            errors.append(message)
+
     register, _source = style.effective_register(
         style.configured_register(),
         style.profile(term for term in terms.values() if term.enforceable),
@@ -430,20 +917,20 @@ def sanity(terms, allow_shared_translations=True):
     for source, term in strict.items():
         problem = term_problem(term, terms)
         if problem:
-            errors.append(f"{source}: {problem}")
+            add_error(f"{source}: {problem}")
         if term.type in CHARACTER_TYPES:
-            for name in [*term.aliases, *term.forms]:
+            for name in dict.fromkeys([*term.aliases, *term.forms]):
                 form_problem = identity_form_problem(term, name)
                 if form_problem:
-                    errors.append(f"{source}.{name}: {form_problem}")
+                    add_error(f"{source}.{name}: {form_problem}")
             for name, value in term.forms.items():
                 spec = style.address_spec(name, source)
                 register_problem = style.conflict(spec, value, register)
                 if register_problem:
-                    errors.append(f"{source}.{name}: {register_problem}")
+                    add_error(f"{source}.{name}: {register_problem}")
         for name in [source, *term.aliases, *term.forms]:
             if name in owners and owners[name] != source:
-                errors.append(f"{name}: alias/canonical collision")
+                add_error(f"{name}: alias/canonical collision")
             owners[name] = source
     if errors:
         raise ValueError("Dictionary sanity failed: " + "; ".join(errors[:20]))
@@ -488,7 +975,7 @@ def _mapping_entries(terms):
     """Yield source-aware frozen mappings, excluding non-enforceable metadata."""
     if isinstance(terms, dict):
         terms = terms.values()
-    result = []
+    result, seen = [], set()
     for term in terms:
         if not term_is_enforceable(term):
             continue
@@ -496,7 +983,11 @@ def _mapping_entries(terms):
         translation = _term_value(term, "translation", "")
         forms = _term_value(term, "forms", {}) or {}
         aliases = _term_value(term, "aliases", []) or []
-        for name in [source, *aliases, *forms]:
+        for name in [source, *forms, *[alias for alias in aliases if alias not in forms]]:
+            key = (source, name, forms.get(name, translation))
+            if key in seen:
+                continue
+            seen.add(key)
             result.append(
                 {
                     "source": name,
@@ -690,6 +1181,11 @@ def export_dictionary(terms, include_ignored=False):
 
     def exported(term):
         value = term.model_dump()
+        # Forms carry their required rendering; do not export the same Chinese
+        # key again as a bare alias.
+        value["aliases"] = [
+            alias for alias in value.get("aliases", []) if alias not in value.get("forms", {})
+        ]
         value["runtime_state"] = CONFIRMED if term.enforceable else IGNORE
         if value.get("status") == "locked" and value.get("enforceable") is True:
             value.pop("enforceable", None)
@@ -704,6 +1200,14 @@ def export_dictionary(terms, include_ignored=False):
                 value.pop(field, None)
         if not value.get("form_kinds"):
             value.pop("form_kinds", None)
+        if value.get("candidate_shape") is None:
+            value.pop("candidate_shape", None)
+        if not value.get("identity_evidence"):
+            value.pop("identity_evidence", None)
+        if not value.get("evidence_types"):
+            value.pop("evidence_types", None)
+        if not value.get("competing_identities"):
+            value.pop("competing_identities", None)
         if value.get("address_register") is None:
             value.pop("address_register", None)
         return value

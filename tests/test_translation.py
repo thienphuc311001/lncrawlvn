@@ -1100,6 +1100,10 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
             repairs = [data for instruction, data, _ in fake.calls if instruction == prompts.REPAIR]
             self.assertEqual([item["affected_ids"] for item in repairs], [[1]])
             self.assertEqual([p["id"] for p in repairs[0]["raw"]], [1])
+            self.assertEqual(repairs[0]["issues"][0]["type"], "content_missing")
+            self.assertEqual(repairs[0]["issues"][0]["source_segment_id"], "c1-k0-s1")
+            self.assertEqual(repairs[0]["source_context"][0]["affected_id"], 1)
+            self.assertEqual(repairs[0]["translated_context"][0]["affected_id"], 1)
             count = len(fake.calls)
             await Pipeline(store, Scheduler(transport=fake, spacing=0)).run()
             self.assertEqual(len(fake.calls), count)

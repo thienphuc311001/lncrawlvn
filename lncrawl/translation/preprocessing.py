@@ -6,7 +6,13 @@ import unicodedata
 from collections import Counter, defaultdict
 
 from . import style
-from .dictionary import REFERENCE_SUFFIX, quantity_source_problem, source_name, source_problem
+from .dictionary import (
+    REFERENCE_SUFFIX,
+    reference_shape,
+    quantity_source_problem,
+    source_name,
+    source_problem,
+)
 from .models import Term
 
 HAN_RUN = re.compile(r"[\u3400-\u9fff]+")
@@ -86,6 +92,11 @@ SUFFIXES = (
     "科长",
     "处长",
     "将军",
+    "大伴",
+    "尚书",
+    "帅",
+    "缇帅",
+    "侍班",
     "上校",
     "队长",
     "长官",
@@ -165,6 +176,7 @@ TITLE_PATTERN = re.compile(
                 "大人",
                 "阁下",
                 "殿下",
+                *style.ADDRESS_SPECS,
                 *style.KINSHIP_SUFFIXES,
             },
             key=len,
@@ -200,17 +212,37 @@ def classify_candidate(source, reasons, contexts, frequency=0, inherited=False):
         return "descriptive_phrase", "numeric descriptive phrase"
     if any(marker in source for marker in DESCRIPTIVE_MARKERS) and not TITLE_PATTERN.search(source):
         return "descriptive_phrase", "compositional descriptive phrase"
-    if TITLE_PATTERN.search(source):
+    if TITLE_PATTERN.search(source) or style.address_spec(source):
         # A title/address remains a plausible candidate when RAW proves an
         # identity relationship.  Otherwise it is audit-only, never a new
         # canonical character identity.
         identity = re.compile(
-            re.escape(source) + r".{0,18}(?:就是|是|名为|叫做|称为)[\u3400-\u9fff]{2,8}"
+            re.escape(source) + r".{0,18}(?:就是|是|名为|叫做|称为|即|乃)[\u3400-\u9fff]{2,8}"
         )
         reverse = re.compile(
-            r"[\u3400-\u9fff]{2,8}.{0,18}(?:就是|是|名为|叫做|称为)" + re.escape(source)
+            r"[\u3400-\u9fff]{2,8}.{0,18}(?:就是|是|名为|叫做|称为|即|乃)" + re.escape(source)
         )
-        if not any(identity.search(context) or reverse.search(context) for context in contexts):
+        direct = any(identity.search(context) or reverse.search(context) for context in contexts)
+        address = style.address_spec(source)
+        suffix = address.get("suffix") if address else ""
+        surname = address.get("surname") if address else ""
+        prefix_reference = bool(address and address.get("prefix_reference"))
+        complete_prefix_name = bool(
+            prefix_reference
+            and len(address.get("person_source", "")) >= 3
+        )
+        role_context = bool(
+            suffix
+            and surname
+            and any(
+                (anchor := re.search(surname + r"(?P<person>[\u3400-\u9fff]{2})", context))
+                and anchor.group("person") != suffix[:2]
+                and suffix in context
+                and re.search(r"(?:任|担任|官至|升为|晋升为|改任|成为|任职|为)", context)
+                for context in contexts
+            )
+        )
+        if not direct and not role_context and not complete_prefix_name:
             return "character_form", "title/reference identity is not proven locally"
     # A suffix by itself is not enough evidence.  Keep uncertain novel terms
     # for the resolver; this is what protects short fictional concepts.
@@ -265,7 +297,10 @@ def representative_evidence(candidate, units, budget=2200):
         (
             o
             for o in occurrences
-            if re.search(r"老|小|阿|科长|署长|将军|先生|小姐|叫做|名叫", units[o["unit"]]["raw"])
+            if re.search(
+                r"老|小|阿|科长|署长|将军|先生|小姐|大伴|尚书|帅|缇帅|侍班|大司徒|叫做|名叫",
+                units[o["unit"]]["raw"],
+            )
         ),
         None,
     )
@@ -348,10 +383,44 @@ def build_index(pairs, alignments, inherited):
         for match in re.finditer(
             "["
             + "".join(SURNAMES)
-            + r"](?:副)?(?:署长|科长|处长|将军|上校|队长|长官|先生|小姐|掌门)",
+            + r"](?:副)?(?:"
+            + "|".join(
+                re.escape(suffix)
+                for suffix in sorted(style.ADDRESS_SPECS, key=len, reverse=True)
+            )
+            + r")",
             text,
         ):
             reasons[match.group()].add("named_title_or_address_form")
+        # Historical offices can be compound role references rather than
+        # surname+title strings (for example 东宫侍班).  Discover their exact
+        # RAW span for evidence/audit, but let the classifier decide whether
+        # the role is actually attributable to a person.
+        for suffix in sorted(style.ADDRESS_SPECS, key=len, reverse=True):
+            for match in re.finditer(
+                r"[\u3400-\u9fff]{1,3}" + re.escape(suffix),
+                text,
+            ):
+                prefix = match.group()[: -len(suffix)]
+                if prefix and not set(prefix).intersection(GRAMMAR):
+                    reasons[match.group()].add("named_title_or_address_form")
+        for prefix in sorted(style.TITLE_PREFIX_SPECS, key=len, reverse=True):
+            surname_class = "".join(SURNAMES)
+            for match in re.finditer(
+                re.escape(prefix)
+                + "["
+                + surname_class
+                # Historical personal names in this extractor are the same
+                # two/three Han-character shape used by person_name_pattern;
+                # stopping at two given-name characters prevents a following
+                # verb/adverb from being absorbed into the title form.
+                + r"][\u3400-\u9fff]{1,2}",
+                text,
+            ):
+                # Do not promote a title expression ending in an immediately
+                # attached predicate/action character to a named reference.
+                if match.group()[-1] not in "来去入出上下再曾笑接站":
+                    reasons[match.group()].add("named_title_or_address_form")
         for match in re.finditer("(?:老|小|阿)[" + "".join(SURNAMES) + "]", text):
             reasons[match.group()].add("possible_person_alias")
         for match in re.finditer(
@@ -412,6 +481,7 @@ def build_index(pairs, alignments, inherited):
             report_only[source] = {
                 "source": source,
                 "classification": category,
+                "shape": reference_shape(source),
                 "status": "report_only",
                 "state": "IGNORE",
                 "enforceable": False,
@@ -437,6 +507,7 @@ def build_index(pairs, alignments, inherited):
                 }.intersection(reasons[source])
                 else "unknown"
             ),
+            "shape": reference_shape(source),
             "frequency": 0,
             "occurrences": [],
             "vietphrase_variants": {},
@@ -463,6 +534,7 @@ def build_index(pairs, alignments, inherited):
         report_only[source] = {
             "source": source,
             "classification": "common_noun",
+            "shape": reference_shape(source),
             "status": "report_only",
             "state": "IGNORE",
             "enforceable": False,

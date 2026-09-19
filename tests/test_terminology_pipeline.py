@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 
 from lncrawl.translation.dictionary import (
+    evaluate_reference_evidence,
     export_dictionary,
     load_legacy,
     terminology_findings,
@@ -19,6 +20,146 @@ from lncrawl.translation.validation import local_findings
 
 
 class TerminologyPipelineRegressionTests(unittest.TestCase):
+    def test_reference_confirmation_requires_raw_evidence_and_rejects_structural_noise(self):
+        confirmed = evaluate_reference_evidence(
+            "张侍班",
+            "张四维",
+            [
+                "张四维任东宫侍班。",
+                "张侍班随后说道。",
+                "张侍班再次出现。",
+            ],
+        )
+        self.assertTrue(confirmed["confirmed"])
+        self.assertIn("INDIRECT_ROLE_CONTINUITY", confirmed["evidence_types"])
+        self.assertIn("INDIRECT_REPEATED_CONTEXT", confirmed["evidence_types"])
+
+        weak = evaluate_reference_evidence("张侍班", "张四维", ["张侍班说道。"])
+        self.assertFalse(weak["confirmed"])
+        self.assertEqual(weak["reason"], "insufficient_identity_evidence")
+
+        competing = evaluate_reference_evidence(
+            "张侍班",
+            "张四维",
+            ["张四维任东宫侍班。", "张侍班说道。", "张宏也在场。"],
+            competing_identities=["张宏"],
+        )
+        self.assertFalse(competing["confirmed"])
+        self.assertEqual(competing["reason"], "competing_identity")
+
+        truncated = evaluate_reference_evidence(
+            "大司徒王国",
+            "王国光",
+            ["大司徒王国光入殿。"],
+        )
+        self.assertFalse(truncated["confirmed"])
+        self.assertEqual(truncated["reason"], "truncated_identity")
+
+        residue = evaluate_reference_evidence("邱途来", "邱途", ["邱途来了。"])
+        self.assertFalse(residue["confirmed"])
+        self.assertEqual(residue["reason"], "contextual_residue")
+
+    def test_historical_forms_are_owned_by_canonical_identities_once(self):
+        entries = [
+            ("冯保", "Phùng Bảo", "冯大伴", "Phùng Đại bạn"),
+            ("张宏", "Trương Hoành", "张大伴", "Trương Đại bạn"),
+            ("张翰", "Trương Hãn", "张尚书", "Trương Thượng thư"),
+            ("李成梁", "Lý Thành Lương", "李帅", "Lý soái"),
+            ("赵梦祐", "Triệu Mộng Hựu", "赵缇帅", "Triệu Đề soái"),
+        ]
+        records = []
+        for canonical, translation, form, form_translation in entries:
+            records.append(
+                {
+                    "source": canonical,
+                    "translation": translation,
+                    "type": "character",
+                    "status": "locked",
+                    "forms": {form: form_translation},
+                }
+            )
+        # Reproduce the resolver duplication that previously caused 李帅 to be
+        # reported twice: the same key arrives as both alias and form.
+        records[-2]["aliases"] = ["李帅"]
+        terms, problems = load_legacy({"entries": records})
+        by_source = {term.source: term for term in terms}
+        self.assertEqual(by_source["李成梁"].aliases, [])
+        self.assertEqual(by_source["李成梁"].forms, {"李帅": "Lý soái"})
+        occurrences = terminology_occurrences(
+            [by_source["李成梁"].model_dump()], "李帅。"
+        )
+        self.assertEqual(len(occurrences), 1)
+        self.assertEqual(
+            [item for item in problems if item["classification"] == "form_cleanup"], []
+        )
+
+    def test_title_prefix_migrates_full_identity_and_quarantines_partial_identity(self):
+        migrated, problems = load_legacy(
+            {
+                "entries": [
+                    {
+                        "source": "大司徒王国",
+                        "translation": "Vương Quốc",
+                        "type": "character",
+                        "status": "locked",
+                        "forms": {"大司徒王国光": "Đại Tư đồ Vương Quốc Quang"},
+                    },
+                    {
+                        "source": "王国光",
+                        "translation": "Vương Quốc Quang",
+                        "type": "character",
+                        "status": "locked",
+                    },
+                ]
+            }
+        )
+        self.assertEqual([term.source for term in migrated], ["王国光"])
+        self.assertEqual(
+            migrated[0].forms, {"大司徒王国光": "Đại Tư đồ Vương Quốc Quang"}
+        )
+        self.assertTrue(
+            any(item["classification"] == "canonical_cleanup" for item in problems)
+        )
+
+        partial, _ = load_legacy(
+            {
+                "entries": [
+                    {
+                        "source": "大司徒王国",
+                        "translation": "Vương Quốc",
+                        "type": "character",
+                        "status": "locked",
+                    }
+                ]
+            }
+        )
+        self.assertEqual(partial[0].source, "大司徒王国")
+        self.assertFalse(partial[0].enforceable)
+
+    def test侍班_requires_raw_identity_evidence(self):
+        without_identity = validate_inputs(
+            "第1章\n张侍班来了。",
+            "Chương 1\nTrương Thị ban đến.",
+        )
+        index = build_index(
+            without_identity,
+            {raw.key: deterministic_alignment(raw, vp) for raw, vp in without_identity},
+            [],
+        )
+        self.assertNotIn("张侍班", index["candidates"])
+        self.assertEqual(index["report_only"]["张侍班"]["status"], "report_only")
+
+        with_identity = validate_inputs(
+            "第1章\n张侍班就是张四维。",
+            "Chương 1\nTrương Thị ban là Trương Tứ Duy.",
+        )
+        proven = build_index(
+            with_identity,
+            {raw.key: deterministic_alignment(raw, vp) for raw, vp in with_identity},
+            [],
+        )
+        self.assertIn("张侍班", proven["candidates"])
+
     def test_generic_candidates_are_report_only_and_not_resolver_candidates(self):
         pairs = validate_inputs(
             "第1章\n会派。\n108种增进感情的方式。\n世界基石。\n任队长。\n丁小七来了。\n丁小七走了。\n丁小七回来了。",
@@ -226,7 +367,8 @@ class TerminologyPipelineRegressionTests(unittest.TestCase):
         self.assertEqual(len(terms), 1)
         term = terms[0]
         self.assertEqual(set(term.forms), {"邱副科长", "邱探员", "邱科长"})
-        self.assertEqual(set(term.aliases), {"邱副科长", "邱探员", "邱科长"})
+        # A rendered form owns the key; the duplicate bare aliases are removed.
+        self.assertEqual(set(term.aliases), set())
         cleanup = [item for item in problems if item["classification"] == "form_cleanup"]
         self.assertEqual(
             {item["source"] for item in cleanup[0]["removed_forms"]},
@@ -276,7 +418,7 @@ class TerminologyPipelineRegressionTests(unittest.TestCase):
                 }
             )
             term = pipeline.apply_resolution("邱途", None, result)
-            self.assertEqual(term.aliases, ["邱科长"])
+            self.assertEqual(term.aliases, [])
             self.assertEqual(term.forms, {"邱科长": "Khâu khoa trưởng"})
             self.assertEqual(
                 {item["source"] for item in pipeline.form_cleanup[0]["removed_forms"]},

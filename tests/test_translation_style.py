@@ -69,6 +69,37 @@ class RegisterClassificationTests(unittest.TestCase):
             style.address_spec("唐姐", "", ["唐姐是她的亲姐。"])["literal_kinship_hint"]
         )
         self.assertFalse(style.address_spec("唐姐", "", ["唐姐来了。"])["literal_kinship_hint"])
+
+    def test_historical_reference_shapes_and_renderings(self):
+        cases = (
+            ("冯大伴", "冯保", "Phùng Bảo", "social_honorific", "Phùng Đại bạn"),
+            ("张大伴", "张宏", "Trương Hoành", "social_honorific", "Trương Đại bạn"),
+            ("张尚书", "张翰", "Trương Hãn", "official_title", "Trương Thượng thư"),
+            ("李帅", "李成梁", "Lý Thành Lương", "rank", "Lý soái"),
+            ("赵缇帅", "赵梦祐", "Triệu Mộng Hựu", "role_reference", "Triệu Đề soái"),
+            ("张侍班", "张四维", "Trương Tứ Duy", "role_reference", "Trương Thị ban"),
+            (
+                "大司徒王国光",
+                "王国光",
+                "Vương Quốc Quang",
+                "official_title",
+                "Đại Tư đồ Vương Quốc Quang",
+            ),
+        )
+        for form, canonical, translation, kind, expected in cases:
+            spec = style.address_spec(form, canonical)
+            self.assertEqual(spec["kind"], kind, form)
+            self.assertEqual(style.preferred_form(form, canonical, translation, spec), expected)
+
+        proven = Term(
+            source="张四维",
+            translation="Trương Tứ Duy",
+            type="character",
+            status="locked",
+            forms={"张侍班": "Trương Thị ban"},
+            evidence="张侍班就是张四维",
+        )
+        sanity({proven.source: proven})
 class RegisterProfileTests(unittest.TestCase):
     def terms(self, *forms):
         return [
@@ -464,4 +495,3 @@ class PipelineRegisterTests(unittest.IsolatedAsyncioTestCase):
                 store.read("dictionary-register-cleanup.json")["entries"],
                 pipeline.register_cleanup,
             )
-
