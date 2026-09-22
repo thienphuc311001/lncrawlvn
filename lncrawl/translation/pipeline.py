@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import Counter
+from datetime import datetime, timezone
 from types import MappingProxyType
 
 from . import prompts, style
@@ -28,6 +29,8 @@ from .dictionary import (
 )
 from .models import (
     MODELS,
+    DICTIONARY_VERSION,
+    IGNORED_DICTIONARY_VERSION,
     PARSER_VERSION,
     PIPELINE_VERSION,
     Alignment,
@@ -80,6 +83,7 @@ class Pipeline:
         self._raw_contexts = None
         self.register_cleanup = []
         self.style_profile = {}
+        self.ignored_source_available = True
         self.address_register = style.SINO_VIETNAMESE
         self.address_register_source = "configured"
         self.outcomes = {}
@@ -98,8 +102,236 @@ class Pipeline:
         self.policy = ResolutionPolicy.model_validate(policy_data)
 
     def progress(self, stage, **fields):
+        fields.setdefault("repairs_used", len(list((self.store.path / "repair-validation").glob("*.json"))))
+        if self.pairs:
+            finalized = sum(
+                self.store.read(f"chapters/{chapter.key}.json") is not None
+                for chapter, _ in self.pairs
+            )
+            fields.setdefault("total_chapters", len(self.pairs))
+            fields.setdefault("completed_chapters", finalized)
+            fields.setdefault("chapters_finalized", finalized)
+        if self.chunks:
+            total_chunks = sum(len(chunks) for chunks in self.chunks.values())
+            finalized_chunks = sum(
+                len(list(self.store.path.glob(f"chunks/{key}-*.json")))
+                for key in self.chunks
+            )
+            fields.setdefault("chunks_total", total_chunks)
+            fields.setdefault("chunks_finalized", finalized_chunks)
+        active = fields.get("active_chapters", self.activity)
+        if active:
+            key, value = sorted(active.items())[0]
+            fields.setdefault("current_chapter", key)
+            fields.setdefault("current_chunk", value.get("chunk"))
+            fields.setdefault("current_chunk_total", value.get("chunks"))
+        elif stage == "Translating":
+            fields.setdefault("current_chapter", None)
+            fields.setdefault("current_chunk", None)
+            fields.setdefault("current_chunk_total", None)
         self.store.progress(
             stage=stage, request_statistics=self.store.request_statistics(), **fields
+        )
+
+    @staticmethod
+    def _chapter_value(key):
+        if isinstance(key, int):
+            return key
+        if isinstance(key, str) and key.isdigit():
+            return int(key)
+        return key
+
+    @staticmethod
+    def _ignored_reason_code(record):
+        reason = str(record.get("reason", "")).casefold()
+        classification = str(
+            record.get("entity_class", record.get("classification", ""))
+        ).casefold()
+        if classification in {"generic", "common_noun", "generic_phrase", "verb_phrase", "descriptive_phrase"}:
+            return "generic"
+        if "quantity" in reason or "numeric" in reason:
+            return "quantity"
+        if "malformed" in reason or "leading aspect" in reason or classification == "malformed":
+            return "malformed"
+        if "contextual" in reason or "residue" in reason:
+            return "contextual_residue"
+        if "truncated" in reason:
+            return "truncated_identity"
+        if "competing" in reason:
+            return "competing_identity"
+        if "insufficient" in reason or "unproven" in reason or "owner proof" in reason:
+            return "insufficient_identity_evidence"
+        if "identity requires proof" in reason or "surname plus title" in reason or "title/reference" in reason:
+            return "insufficient_identity_evidence"
+        if "contained lexical" in reason:
+            return "contained_lexical_fragment"
+        if "register" in reason:
+            return "register_inconsistency"
+        if "unknown" in reason or "unrecognized" in reason:
+            return "unknown_reference_form"
+        if "unconfirmed" in reason or "class-specific" in reason:
+            return "unconfirmed_entity"
+        return "other"
+
+    def _ignored_evidence(self, source, record):
+        candidate = self.index.get("candidates", {}).get(source) or self.index.get(
+            "report_only", {}
+        ).get(source, {})
+        raw_items = record.get("evidence") or candidate.get("representative_evidence", [])
+        if not raw_items:
+            raw_items = []
+            units = self.index.get("units", [])
+            for occurrence in candidate.get("occurrences", []):
+                unit_id = occurrence.get("unit")
+                if not isinstance(unit_id, int) or not (0 <= unit_id < len(units)):
+                    continue
+                unit = units[unit_id]
+                positions = occurrence.get("positions") or [unit.get("raw", "").find(source)]
+                position = positions[0] if positions else 0
+                raw_text = unit.get("raw", "")
+                raw_items.append(
+                    {
+                        "chapter": unit.get("chapter_key"),
+                        "raw": raw_text[max(0, position - 120) : position + len(source) + 240],
+                    }
+                )
+        result, seen = [], set()
+        for item in raw_items if isinstance(raw_items, list) else []:
+            if not isinstance(item, dict):
+                continue
+            excerpt = item.get("raw_excerpt") or item.get("raw") or ""
+            if not excerpt:
+                continue
+            excerpt = str(excerpt)[:600]
+            chapter = item.get("chapter")
+            if chapter is None and item.get("unit") is not None:
+                units = self.index.get("units", [])
+                if 0 <= item["unit"] < len(units):
+                    chapter = units[item["unit"]].get("chapter_key")
+            key = (chapter, excerpt)
+            if key in seen:
+                continue
+            seen.add(key)
+            result.append(
+                {"chapter": self._chapter_value(chapter), "raw_excerpt": excerpt}
+            )
+            if len(result) >= 3:
+                break
+        return result
+
+    def ignored_dictionary(self, complete=False, batch_status=None):
+        inputs = self.store.read("inputs.json", {}) or {}
+        records = []
+        for source, raw_record in self.ignored.items():
+            record = dict(raw_record)
+            candidate = self.index.get("candidates", {}).get(source) or self.index.get(
+                "report_only", {}
+            ).get(source, {})
+            evidence = self._ignored_evidence(source, record)
+            chapters = sorted(
+                {
+                    item["chapter"]
+                    for item in evidence
+                    if item.get("chapter") is not None
+                },
+                key=lambda value: (isinstance(value, str), str(value)),
+            )
+            if not chapters:
+                units = self.index.get("units", [])
+                chapters = sorted(
+                    {
+                        self._chapter_value(units[item["unit"]].get("chapter_key"))
+                        for item in candidate.get("occurrences", [])
+                        if isinstance(item.get("unit"), int)
+                        and 0 <= item["unit"] < len(units)
+                    },
+                    key=lambda value: (isinstance(value, str), str(value)),
+                )
+            occurrences = record.get("raw_occurrences", candidate.get("frequency", 0))
+            proposed_translation = record.get("proposed_translation") or candidate.get(
+                "dominant_translation"
+            )
+            competing = sorted(set(record.get("competing_identities", [])))
+            records.append(
+                {
+                    "source": source,
+                    "decision": "IGNORED",
+                    "reason_code": self._ignored_reason_code(record),
+                    "reason": record.get("reason", "Candidate was not confirmed"),
+                    "candidate_type": record.get(
+                        "entity_class", record.get("classification", "unknown")
+                    ),
+                    "proposed_entity_type": record.get(
+                        "entity_class", record.get("classification", "unknown")
+                    ),
+                    "proposed_canonical": record.get("proposed_canonical"),
+                    "proposed_translation": proposed_translation,
+                    "occurrence_count": occurrences,
+                    "chapters": chapters,
+                    "evidence": evidence,
+                    "competing_identities": competing,
+                    "resolver_used": bool(
+                        record.get("resolver_used", source in self.index.get("candidates", {}))
+                    ),
+                    "manual_review": {
+                        "status": "unreviewed",
+                        "action": None,
+                        "notes": None,
+                    },
+                }
+            )
+        records.sort(key=lambda item: (item["candidate_type"], item["reason_code"], item["source"]))
+        counts = Counter(item["reason_code"] for item in records)
+        summary = {
+            "total_ignored": len(records),
+            "generic": counts["generic"],
+            "quantity": counts["quantity"],
+            "malformed": counts["malformed"],
+            "contextual_residue": counts["contextual_residue"],
+            "insufficient_identity_evidence": counts["insufficient_identity_evidence"],
+            "competing_identity": counts["competing_identity"],
+            "other": sum(
+                count
+                for code, count in counts.items()
+                if code
+                not in {
+                    "generic",
+                    "quantity",
+                    "malformed",
+                    "contextual_residue",
+                    "insufficient_identity_evidence",
+                    "competing_identity",
+                }
+            ),
+        }
+        keys = [chapter.number for chapter, _ in self.pairs]
+        source_name = inputs.get("book_title") or inputs.get("source_name")
+        return {
+            "version": IGNORED_DICTIONARY_VERSION,
+            "pipeline_version": PIPELINE_VERSION,
+            "dictionary_version": DICTIONARY_VERSION,
+            "available": self.ignored_source_available,
+            "complete": complete and self.ignored_source_available,
+            "batch_status": (
+                (batch_status or ("DONE" if complete else "RUNNING"))
+                if self.ignored_source_available
+                else "UNAVAILABLE"
+            ),
+            "source": {
+                "book": source_name,
+                "chapter_start": min(keys) if keys else None,
+                "chapter_end": max(keys) if keys else None,
+            },
+            "register": self.address_register,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "summary": summary,
+            "candidates": records,
+        }
+
+    def write_ignored_dictionary(self, complete=False, batch_status=None):
+        self.store.write(
+            "ignored_dictionary.json",
+            self.ignored_dictionary(complete=complete, batch_status=batch_status),
         )
 
     def local(self, operation, message):
@@ -325,6 +557,7 @@ class Pipeline:
             "report_only", {}
         ).get(source, {})
         extra.setdefault("raw_occurrences", candidate.get("frequency", 0))
+        extra.setdefault("resolver_used", source in self.index.get("candidates", {}))
         extra.setdefault(
             "entity_class",
             candidate.get("entity_class", candidate.get("classification", "unknown")),
@@ -939,6 +1172,7 @@ class Pipeline:
         sources = list(dict.fromkeys(sources))
         if not sources:
             return
+        resolved_candidates = 0
         for page in batches([self.resolver_payload(source) for source in sources]):
             page_sources = [item["source"] for item in page]
             result = await self.ai(
@@ -982,6 +1216,16 @@ class Pipeline:
                     term = None
                     self.ignore(source, str(exc))
                 if term is None:
+                    if source not in self.ignored:
+                        self.ignore(
+                            source,
+                            item.reason if item else "resolver omitted or malformed candidate",
+                            proposed_canonical=(item.term.source if item and item.term else None),
+                            proposed_translation=(
+                                item.term.translation if item and item.term else None
+                            ),
+                            resolver_used=True,
+                        )
                     self.decisions[source] = "IGNORE"
                     self.outcomes[source] = {
                         "source": source,
@@ -1004,8 +1248,19 @@ class Pipeline:
                         "reason": item.reason if item else "confirmed",
                     }
             self.save_decisions()
+            resolved_candidates += len(page_sources)
+            self.progress(
+                "Terminology resolution",
+                candidate_count=len(sources),
+                resolved_candidates=resolved_candidates,
+                current_term=page_sources[-1] if page_sources else None,
+                confirmed_terms=sum(value == "CONFIRMED" for value in self.decisions.values()),
+                ignored_candidates=len(self.ignored),
+            )
         self.progress(
             "Terminology resolution",
+            candidate_count=len(sources),
+            resolved_candidates=resolved_candidates,
             resolver_candidates=len(sources),
             confirmed_terms=sum(value == "CONFIRMED" for value in self.decisions.values()),
             ignored_candidates=sum(value == "IGNORE" for value in self.decisions.values()),
@@ -1019,6 +1274,9 @@ class Pipeline:
                 "terms": [term.model_dump() for term in self.terms.values()],
                 "decisions": self.decisions,
                 "outcomes": self.outcomes,
+                "ignored": sorted(
+                    self.ignored.values(), key=lambda item: item.get("source", "")
+                ),
             },
         )
 
@@ -1276,14 +1534,22 @@ class Pipeline:
                 if state in {"CONFIRMED", "IGNORE", "REUSED"}
             }
             self.outcomes = saved.get("outcomes", {})
+            self.ignored = {
+                record.get("source"): record
+                for record in saved.get("ignored", [])
+                if record.get("source")
+            }
         else:
             self.terms = {term.source: term for term in inherited if term.enforceable}
             self.decisions = {}
+            self.ignored = {}
 
-        self.ignored = {
-            source: {**record, "state": "IGNORE"}
-            for source, record in self.index.get("report_only", {}).items()
-        }
+        self.ignored.update(
+            {
+                source: {**record, "state": "IGNORE"}
+                for source, record in self.index.get("report_only", {}).items()
+            }
+        )
         for source, record in self.ignored.items():
             self.outcomes[source] = {
                 "source": source,
@@ -1343,11 +1609,14 @@ class Pipeline:
                 pending.append(source)
             else:
                 self.decisions[source] = "IGNORE"
+                self.ignore(source, "candidate has no attested RAW occurrences")
 
         self.save_decisions()
         self.progress(
             "Terminology candidates ready",
             raw_candidates=len(self.index.get("candidates", {})),
+            candidate_count=len(pending),
+            resolved_candidates=0,
             resolver_candidates=len(pending),
             confirmed_terms=len(self.terms),
             ignored_candidates=len(self.ignored),
@@ -1370,6 +1639,11 @@ class Pipeline:
                 ],
                 "metrics": self.dictionary_report()["summary"],
             },
+        )
+        self.progress(
+            "Reviewing ignored candidates",
+            confirmed_terms=len(self.terms),
+            ignored_candidates=len(self.ignored),
         )
         self.freeze(dictionary)
         self.store.write(
@@ -1835,6 +2109,12 @@ class Pipeline:
                     "pairs": [[raw.model_dump(), vp.model_dump()] for raw, vp in self.pairs],
                 },
             )
+        self.progress(
+            "Local parsing",
+            total_chapters=len(self.pairs),
+            chapter_start=min((raw.number for raw, _ in self.pairs), default=None),
+            chapter_end=max((raw.number for raw, _ in self.pairs), default=None),
+        )
         self.store.write("parser-version.json", {"version": PARSER_VERSION})
         await self.parallel(self.pairs, self.align)
         self.local("alignment", "RAW/VietPhrase structural alignment passed")
@@ -1867,6 +2147,35 @@ class Pipeline:
                     )
         if not frozen:
             await self.prepare_dictionary(inputs)
+        if not self.ignored:
+            saved_ignored = self.store.read("ignored_dictionary.json")
+            saved_candidates = (saved_ignored or {}).get("candidates", [])
+            if not saved_candidates:
+                audit = self.store.read("dictionary-audit.json")
+                if audit is not None:
+                    saved_candidates = audit.get("ignored", [])
+                    saved_ignored = audit
+                    if "ignored" not in audit:
+                        self.ignored_source_available = False
+            if saved_ignored is None and not saved_candidates:
+                self.ignored_source_available = False
+            elif isinstance(saved_ignored, dict) and saved_ignored.get("available") is False:
+                self.ignored_source_available = False
+            for item in saved_candidates:
+                source = item.get("source")
+                if source:
+                    self.ignored[source] = {
+                        "source": source,
+                        "state": "IGNORE",
+                        "reason": item.get("reason", "Ignored candidate"),
+                        "entity_class": item.get("candidate_type", "unknown"),
+                        "raw_occurrences": item.get("occurrence_count", 0),
+                        "competing_identities": item.get("competing_identities", []),
+                        "evidence": item.get("evidence", []),
+                        "proposed_canonical": item.get("proposed_canonical"),
+                        "proposed_translation": item.get("proposed_translation"),
+                        "resolver_used": item.get("resolver_used", False),
+                    }
         self.assert_frozen()
         self.refresh_style()
         self.store.write("dictionary-resolution-report.json", self.dictionary_report())
@@ -1908,9 +2217,13 @@ class Pipeline:
             {
                 **export_dictionary(self.terms),
                 "dictionary_hash": self.frozen_hash,
-                "resolution_report": self.dictionary_report(),
+                # The confirmed dictionary is a runtime artifact.  Detailed
+                # ignored candidates live in ignored_dictionary.json instead
+                # of being smuggled back into this namespace.
+                "resolution_summary": self.dictionary_report()["summary"],
             },
         )
+        self.write_ignored_dictionary(complete=True, batch_status="DONE")
         self.store.progress(
             "done",
             stage="Complete",
@@ -1919,5 +2232,7 @@ class Pipeline:
             active_chapters={},
             dictionary_frozen=True,
             dictionary_hash=self.frozen_hash,
+            confirmed_terms=len(self.terms),
+            ignored_candidates=len(self.ignored),
             request_statistics=self.store.request_statistics(),
         )

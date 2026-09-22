@@ -142,7 +142,13 @@ async def translate(arguments):
         vp = first_chapters(vp, arguments.first, "VIETPHRASE")
     if not api_keys():
         raise ValueError("Set GOOGLE_AI_API_KEY in the project-root .env file")
-    inputs = Inputs(raw=raw, vietphrase=vp, dictionary=dictionary)
+    inputs = Inputs(
+        raw=raw,
+        vietphrase=vp,
+        dictionary=dictionary,
+        book_title=arguments.raw.stem,
+        source_name=arguments.raw.name,
+    )
     translation_root = APP_DIR / "translations"
     input_data = inputs.model_dump()
     legacy_job = find_compatible_translation_job(translation_root, input_data)
@@ -156,16 +162,26 @@ async def translate(arguments):
     with store.execution():
         await run_owned(store, arguments.workers)
     arguments.output.mkdir(parents=True, exist_ok=True)
-    for name in ("translated.json", "translated.txt", "dictionary.json"):
+    for name in (
+        "translated.json",
+        "translated.txt",
+        "dictionary.json",
+        "ignored_dictionary.json",
+    ):
         target = arguments.output / name
         if target.exists() and target.read_bytes() != (store.path / name).read_bytes():
             raise ValueError(
                 f"Output already exists with different content: {target}; choose another --output directory"
             )
-    for name in ("translated.json", "translated.txt", "dictionary.json"):
+    for name in (
+        "translated.json",
+        "translated.txt",
+        "dictionary.json",
+        "ignored_dictionary.json",
+    ):
         shutil.copyfile(store.path / name, arguments.output / name)
     print(
-        f"Completed: {arguments.output.resolve() / 'translated.json'} and {arguments.output.resolve() / 'dictionary.json'}",
+        f"Completed translation, dictionary, and ignored review artifacts in {arguments.output.resolve()}",
         flush=True,
     )
     return 0

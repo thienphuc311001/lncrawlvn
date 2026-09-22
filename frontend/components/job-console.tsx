@@ -4,7 +4,7 @@ import { useEffect, useRef, useState } from 'react';
 
 import { useJobRunner } from './job-runner';
 
-const API_BASE = 'http://127.0.0.1:8000';
+const API_BASE = '';
 const POLL_INTERVAL_MS = 800;
 /** Terminal panel holds a bounded history so huge novels cannot flood the DOM. */
 const MAX_RENDERED_LINES = 300;

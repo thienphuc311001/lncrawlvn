@@ -30,7 +30,7 @@ from pydantic import BaseModel, Field
 from .context import APP_DIR, ctx
 from .core import Novel
 from .exceptions import LNException
-from .library import LIBRARY
+from .library import DEFAULT_EXPORT_CHUNK, LIBRARY, MAX_EXPORT_CHUNK
 from .translation.api import router as translation_router
 from .translation.api import shutdown as shutdown_translation
 
@@ -401,10 +401,26 @@ def fetch_missing(book_id: str) -> Job:
 
 
 @app.get("/api/books/{book_id}/export")
-def export_book(book_id: str, format: str = Query("epub", pattern="^(epub|txt)$")):
-    """Export saved chapters as one EPUB/TXT per 100-chapter folder in a ZIP."""
+def export_book(
+    book_id: str,
+    format: str = Query("epub", pattern="^(epub|txt)$"),
+    per_file: int = Query(
+        DEFAULT_EXPORT_CHUNK,
+        ge=1,
+        le=MAX_EXPORT_CHUNK,
+        description="Chapters per EPUB/TXT file inside the ZIP",
+    ),
+):
+    """Export saved chapters as EPUB/TXT files in a ZIP, ``per_file`` chapters each.
+
+    Files are named after their chapter ranges (``0001-0010.epub``, …); the
+    bundle keeps the book title.
+    Only the first file — the one holding the earliest chapters, so the one
+    containing chapter 1 when it is saved — carries the novel's front matter
+    (metadata header, intro page, cover); later files are pure chapters.
+    """
     try:
-        zip_path = LIBRARY.export_zip(book_id, format)
+        zip_path = LIBRARY.export_zip(book_id, format, per_file)
     except LNException as e:
         raise HTTPException(status_code=400, detail=str(e))
     return FileResponse(zip_path, media_type="application/zip", filename=zip_path.name)

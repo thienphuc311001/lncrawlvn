@@ -235,10 +235,28 @@ The job writes:
 
 - `translated.json` and the CLI's final Vietnamese TXT/export;
 - `dictionary.json` and `frozen-dictionary.json` containing confirmed entries only;
-- `dictionary-audit.json` and the existing resolution report for ignored candidates;
+- `ignored_dictionary.json`, a versioned, deterministically ordered manual-review
+  artifact containing every final `IGNORE` decision, bounded RAW evidence, reason
+  codes, occurrence/chapter metadata and empty manual-review fields. It is never
+  loaded as runtime terminology;
+- `dictionary-audit.json` and the existing resolution report for internal audits;
 - `dictionary-style-profile.json`, `dictionary-register-cleanup.json` and
   `dictionary-form-cleanup.json` for the derived style and local cleanup audits;
 - parser, alignment, chunk, chapter and validation checkpoints.
+
+The translation workspace derives a human-readable batch label from optional book
+metadata and the parsed chapter range. Polling snapshots expose the current stage,
+finalized chapter/chunk counts, current chapter/chunk, confirmed and ignored
+terminology counts, repair count and failure location while retaining the opaque
+batch ID only as a secondary diagnostic field. Completed batches expose the TXT,
+confirmed dictionary and ignored dictionary as separate downloads.
+
+`DELETE /api/translation/jobs/{job_id}` is an explicit batch-management operation.
+It cancels active work before cleanup, removes the persisted batch/checkpoint state,
+never deletes the original user inputs, and preserves generated outputs by moving
+only known batch-owned artifacts to a separate output store unless
+`delete_outputs=true` is explicitly requested. Repeated deletion is safe and a
+deleted batch is absent from subsequent job listings and resume operations.
 
 Normal logs report parsed/aligned chapters, RAW candidates, ignored candidates,
 resolver candidates, confirmed terms, translated/validated chunks, repair attempts

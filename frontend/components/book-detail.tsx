@@ -1,13 +1,16 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState, type FormEvent } from 'react';
 
 import { useJobRunner } from './job-runner';
 
-const API_BASE = 'http://127.0.0.1:8000';
+const API_BASE = '';
 const POLL_INTERVAL_MS = 800;
 /** Mirrors CHAPTERS_PER_FOLDER in lncrawl/library.py */
 const FOLDER_SIZE = 100;
+/** Mirrors DEFAULT_EXPORT_CHUNK / MAX_EXPORT_CHUNK in lncrawl/library.py */
+const DEFAULT_EXPORT_PER_FILE = 100;
+const MAX_EXPORT_PER_FILE = 10000;
 
 type TocChapter = { id: number; title: string; url: string; saved: boolean };
 
@@ -41,6 +44,10 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
   const [fetching, setFetching] = useState(false);
   const [exportError, setExportError] = useState('');
   const [exporting, setExporting] = useState<'epub' | 'txt' | null>(null);
+  /** Format whose "chapters per file" dialog is open, if any. */
+  const [exportDialog, setExportDialog] = useState<'epub' | 'txt' | null>(null);
+  const [perFileInput, setPerFileInput] = useState(String(DEFAULT_EXPORT_PER_FILE));
+  const [dialogError, setDialogError] = useState('');
   const [deleting, setDeleting] = useState(false);
   const [deletingChapter, setDeletingChapter] = useState(false);
 
@@ -123,12 +130,13 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
   }, [bookId, book?.title, load, trackJob]);
 
   const exportBook = useCallback(
-    async (format: 'epub' | 'txt') => {
+    async (format: 'epub' | 'txt', chaptersPerFile: number) => {
       setExporting(format);
       setExportError('');
       try {
         const res = await fetch(
-          `${API_BASE}/api/books/${encodeURIComponent(bookId)}/export?format=${format}`,
+          `${API_BASE}/api/books/${encodeURIComponent(bookId)}/export` +
+            `?format=${format}&per_file=${chaptersPerFile}`,
         );
         if (!res.ok) {
           const detail = await res.json().catch(() => null);
@@ -150,6 +158,51 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
       }
     },
     [book, bookId],
+  );
+
+  const openExportDialog = useCallback((format: 'epub' | 'txt') => {
+    setDialogError('');
+    setExportDialog(format);
+  }, []);
+
+  const closeExportDialog = useCallback(() => {
+    setExportDialog(null);
+    setDialogError('');
+  }, []);
+
+  /** Files the export would produce at the typed size (chunks with ≥1 saved chapter). */
+  const estimatedFiles = useMemo(() => {
+    if (!book) return 0;
+    const perFile = Number(perFileInput);
+    if (!Number.isInteger(perFile) || perFile < 1 || perFile > MAX_EXPORT_PER_FILE) return 0;
+    let files = 0;
+    let currentChunk = -1;
+    for (const ch of book.chapters) {
+      if (!ch.saved) continue;
+      const chunk = Math.floor((ch.id - 1) / perFile);
+      if (chunk !== currentChunk) files += 1;
+      currentChunk = chunk;
+    }
+    return files;
+  }, [book, perFileInput]);
+
+  const submitExport = useCallback(
+    (event: FormEvent<HTMLFormElement>) => {
+      event.preventDefault();
+      if (!exportDialog) return;
+      const perFile = Number(perFileInput);
+      if (!Number.isInteger(perFile) || perFile < 1 || perFile > MAX_EXPORT_PER_FILE) {
+        setDialogError(
+          `Số chương mỗi file phải là số nguyên trong khoảng 1–${MAX_EXPORT_PER_FILE}.`,
+        );
+        return;
+      }
+      const format = exportDialog;
+      setExportDialog(null);
+      setDialogError('');
+      void exportBook(format, perFile);
+    },
+    [exportBook, exportDialog, perFileInput],
   );
 
 
@@ -288,7 +341,7 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
                 type="button"
                 className="btn btn-ghost"
                 disabled={exporting !== null || book.saved_count === 0}
-                onClick={() => void exportBook('epub')}
+                onClick={() => openExportDialog('epub')}
               >
                 {exporting === 'epub' ? 'Packing…' : 'Export EPUB'}
               </button>
@@ -296,7 +349,7 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
                 type="button"
                 className="btn btn-ghost"
                 disabled={exporting !== null || book.saved_count === 0}
-                onClick={() => void exportBook('txt')}
+                onClick={() => openExportDialog('txt')}
               >
                 {exporting === 'txt' ? 'Packing…' : 'Export TXT'}
               </button>
@@ -361,6 +414,72 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
             );
           })}
         </div>
+
+        {exportDialog && (
+          <div
+            className="settings-overlay"
+            role="dialog"
+            aria-modal="true"
+            aria-label="Export options"
+            onKeyDown={(e) => {
+              if (e.key === 'Escape') closeExportDialog();
+            }}
+          >
+            <form className="settings-modal export-dialog" onSubmit={submitExport}>
+              <div className="settings-head">
+                <h3>📦 Export {exportDialog.toUpperCase()}</h3>
+                <button
+                  type="button"
+                  className="btn btn-ghost"
+                  onClick={closeExportDialog}
+                  aria-label="Đóng"
+                >
+                  ✕
+                </button>
+              </div>
+              <section className="settings-group">
+                <label className="settings-field">
+                  <span>Số chương trong mỗi file</span>
+                  <input
+                    type="number"
+                    min={1}
+                    max={MAX_EXPORT_PER_FILE}
+                    step={1}
+                    value={perFileInput}
+                    // eslint-disable-next-line jsx-a11y/no-autofocus
+                    autoFocus
+                    onChange={(e) => {
+                      setPerFileInput(e.target.value);
+                      setDialogError('');
+                    }}
+                  />
+                  <small>
+                    {estimatedFiles > 0
+                      ? `${book.saved_count} chương đã lưu → khoảng ${estimatedFiles} file.`
+                      : `Mặc định ${DEFAULT_EXPORT_PER_FILE} chương/file.`}
+                  </small>
+                  <small>
+                    Thông tin truyện (tên, tác giả, giới thiệu, nguồn, tags, bìa) chỉ có trong
+                    file đầu tiên — file chứa chương 1.
+                  </small>
+                </label>
+              </section>
+              {dialogError && (
+                <p className="muted error-text" role="alert">
+                  ✗ {dialogError}
+                </p>
+              )}
+              <div className="settings-actions">
+                <button type="button" className="btn btn-ghost" onClick={closeExportDialog}>
+                  Cancel
+                </button>
+                <button type="submit" className="btn btn-primary" disabled={exporting !== null}>
+                  Export {exportDialog.toUpperCase()}
+                </button>
+              </div>
+            </form>
+          </div>
+        )}
 
         {reading && (
           <div className="reader-overlay" role="dialog" aria-modal="true" aria-label="Chapter reader">

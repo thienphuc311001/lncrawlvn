@@ -739,6 +739,7 @@ def new_audit(target: int, maximum: int) -> Dict[str, Any]:
     """Audit record for one export. Never written into the TXT itself."""
     return {
         "chapters_exported": 0,
+        "include_header": True,
         "safe_block_target": target,
         "safe_block_max": maximum,
         "safe_blocks_created": 0,
@@ -790,13 +791,20 @@ def build_export_text(
     *,
     target: Optional[int] = None,
     maximum: Optional[int] = None,
+    include_header: bool = True,
 ) -> ExportText:
-    """Chunk every successful chapter and assemble the whole TXT."""
+    """Chunk every successful chapter and assemble the whole TXT.
+
+    ``include_header`` (default ``True``) prepends the novel metadata header.
+    Split exports keep it in the first file only, so every later file is pure
+    chapters and starts directly at its first chapter separator.
+    """
     resolved_target, resolved_maximum = resolve_safe_block_limits(target, maximum)
     included = [chapter for chapter in chapters if chapter.success]
-    front_matter = front_matter_lines(novel, len(included))
+    front_matter = front_matter_lines(novel, len(included)) if include_header else []
 
     audit = new_audit(resolved_target, resolved_maximum)
+    audit["include_header"] = include_header
     lines: List[str] = list(front_matter)
     records: List[Tuple[Any, List[str]]] = []
     block_sizes: List[int] = []
@@ -923,7 +931,7 @@ def validate_export(built: ExportText) -> None:
         raise LNException("Export validation failed: synthetic wrapper in front matter")
     marker = FRONT_MATTER_MARKER
     pos = built.text.find(marker)
-    if pos < 0:
+    if pos < 0 and built.front_matter:
         raise LNException("Export validation failed: front-matter marker missing")
     if "\r" in built.text:
         raise LNException("Export validation failed: non-LF line ending")
@@ -931,7 +939,9 @@ def validate_export(built: ExportText) -> None:
         built.text.encode("utf-8")
     except UnicodeEncodeError as exc:
         raise LNException(f"Export validation failed: not UTF-8: {exc}") from exc
-    after = normalize_newlines(built.text[pos + len(marker):])
+    # Headerless exports (the files after the first in a split export) start
+    # directly at the first chapter separator.
+    after = normalize_newlines(built.text[pos + len(marker):] if pos >= 0 else built.text)
     tail = after.strip("\n")
     if not tail and audit.get("chapters_exported"):
         raise LNException("Export validation failed: chapter region is empty")

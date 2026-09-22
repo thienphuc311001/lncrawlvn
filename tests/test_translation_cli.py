@@ -80,7 +80,12 @@ class CLITests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(count, len(fake.calls))
                 self.assertEqual(
                     sorted(p.name for p in arguments.output.iterdir()),
-                    ["dictionary.json", "translated.json", "translated.txt"],
+                    [
+                        "dictionary.json",
+                        "ignored_dictionary.json",
+                        "translated.json",
+                        "translated.txt",
+                    ],
                 )
                 result = json.loads((arguments.output / "translated.json").read_text())
                 self.assertEqual([ch["number"] for ch in result["chapters"]], [1])

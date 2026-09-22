@@ -14,7 +14,8 @@ from tempfile import TemporaryDirectory
 
 from lncrawl.binder import make_text
 from lncrawl.core import Chapter, Novel
-from lncrawl.library import Library
+from lncrawl.exceptions import LNException
+from lncrawl.library import MAX_EXPORT_CHUNK, Library
 
 SEP = "-" * 60
 WRAPPER_LINE = re.compile(r"^Chapter \d+[:：]", re.MULTILINE)
@@ -50,8 +51,12 @@ def export(chapters):
 
 
 def chapter_blocks(text):
-    """Chapter line-blocks in order, each without its leading separator."""
-    region = text.split("+" * 60, 1)[1]
+    """Chapter line-blocks in order, each without its leading separator.
+
+    Works for both header-carrying exports (front-matter marker present) and
+    headerless ones, where the file starts at the first chapter separator.
+    """
+    region = text.split("+" * 60, 1)[-1]
     parts = region.split("\n" + SEP + "\n")
     return [part.strip("\n").split("\n") for part in parts[1:]]
 
@@ -207,6 +212,124 @@ class LibraryTextExportTests(unittest.TestCase):
             ],
         )
         self.assertEqual(blocks[1][1], "高启愚搞了个大新闻...")
+
+
+class SplitExportTests(unittest.TestCase):
+    """Exports split into N chapters per file, with the header in file 1 only."""
+
+    @staticmethod
+    def _library(tmp, chapter_ids, title="测试小说"):
+        library = Library(root=Path(tmp) / "library")
+        book_id = library.save_book_meta(
+            {
+                "title": title,
+                "url": "https://example.test/book",
+                "author": "作者",
+                "synopsis": "简介。",
+                "tags": ["历史"],
+                "toc": [
+                    {"id": cid, "title": f"第{cid}章", "url": f"https://example.test/ch/{cid}"}
+                    for cid in chapter_ids
+                ],
+            }
+        )
+        for cid in chapter_ids:
+            library.save_chapter(
+                book_id,
+                {
+                    "id": cid,
+                    "title": f"第{cid}章",
+                    "url": f"https://example.test/ch/{cid}",
+                    "body": f"<h3>第{cid}章</h3><p>正文{cid}。</p>",
+                },
+            )
+        return library, book_id
+
+    @staticmethod
+    def _txt_files(zip_path):
+        with zipfile.ZipFile(zip_path) as archive:
+            names = sorted(n for n in archive.namelist() if n.endswith(".txt"))
+            return names, [archive.read(name).decode("utf-8") for name in names]
+
+    def test_per_file_split_keeps_header_in_first_file(self):
+        with TemporaryDirectory() as tmp:
+            library, book_id = self._library(tmp, [1, 2, 3, 4])
+            names, texts = self._txt_files(library.export_zip(book_id, "txt", per_file=2))
+
+        self.assertEqual(names, ["0001-0002.txt", "0003-0004.txt"])
+        # The header lives in the first file only and counts that file's chapters.
+        self.assertIn("Source: https://example.test/book", texts[0])
+        self.assertIn("Tags: 历史", texts[0])
+        self.assertIn("Chapters: 2", texts[0])
+        self.assertIn("+" * 60, texts[0])
+        for text in texts[1:]:
+            self.assertNotIn("Source:", text)
+            self.assertNotIn("Tags:", text)
+            self.assertNotIn("+" * 60, text)
+        for text in texts:
+            self.assertNotRegex(text, WRAPPER_LINE)
+            self.assertEqual(len(chapter_blocks(text)), 2)
+        self.assertEqual(
+            [block[0] for block in chapter_blocks(texts[1])], ["第3章", "第4章"]
+        )
+
+    def test_last_chunk_holds_the_remaining_chapters(self):
+        with TemporaryDirectory() as tmp:
+            library, book_id = self._library(tmp, [1, 2, 3, 4, 5])
+            names, texts = self._txt_files(library.export_zip(book_id, "txt", per_file=2))
+
+        self.assertEqual(names, ["0001-0002.txt", "0003-0004.txt", "0005-0006.txt"])
+        self.assertEqual([block[0] for block in chapter_blocks(texts[2])], ["第5章"])
+        self.assertNotIn("+" * 60, texts[2])
+
+    def test_default_is_one_file_per_hundred_chapters(self):
+        with TemporaryDirectory() as tmp:
+            library, book_id = self._library(tmp, [1, 2, 3])
+            names, _ = self._txt_files(library.export_zip(book_id, "txt"))
+
+        self.assertEqual(names, ["0001-0100.txt"])
+
+    def test_one_chapter_per_file_uses_bare_numbers(self):
+        with TemporaryDirectory() as tmp:
+            library, book_id = self._library(tmp, [1, 2, 3])
+            names, texts = self._txt_files(library.export_zip(book_id, "txt", per_file=1))
+            bundle_name = library.export_zip(book_id, "txt", per_file=1).name
+
+        self.assertEqual(names, ["0001.txt", "0002.txt", "0003.txt"])
+        self.assertEqual([block[0] for block in chapter_blocks(texts[2])], ["第3章"])
+        # The bundle itself keeps the title.
+        self.assertTrue(bundle_name.endswith(".txt.zip"))
+
+    def test_rerun_removes_stale_export_files(self):
+        with TemporaryDirectory() as tmp:
+            library, book_id = self._library(tmp, [1, 2, 3, 4])
+            library.export_zip(book_id, "txt", per_file=2)
+            names, _ = self._txt_files(library.export_zip(book_id, "txt", per_file=4))
+            on_disk = sorted(p.name for p in (library.root / book_id / "exports").glob("*.txt"))
+
+        self.assertEqual(names, ["0001-0004.txt"])
+        self.assertEqual(on_disk, ["0001-0004.txt"])
+
+    def test_rejects_out_of_range_per_file(self):
+        with TemporaryDirectory() as tmp:
+            library, book_id = self._library(tmp, [1])
+            for per_file in (0, -1, MAX_EXPORT_CHUNK + 1):
+                with self.subTest(per_file=per_file):
+                    with self.assertRaises(LNException):
+                        library.export_zip(book_id, "txt", per_file=per_file)
+
+    def test_glob_metacharacters_in_the_title_stay_inert(self):
+        # A title with ``[`` used to break the stale-file cleanup pattern.
+        title = "测试[1]小说"
+        with TemporaryDirectory() as tmp:
+            library, book_id = self._library(tmp, [1, 2], title=title)
+            library.export_zip(book_id, "txt", per_file=1)
+            names, _ = self._txt_files(library.export_zip(book_id, "txt", per_file=2))
+            on_disk = sorted(p.name for p in (library.root / book_id / "exports").iterdir())
+
+        self.assertEqual(names, ["0001-0002.txt"])
+        self.assertIn("0001-0002.txt", on_disk)
+        self.assertNotIn("0001-0001.txt", on_disk)
 
 
 if __name__ == "__main__":

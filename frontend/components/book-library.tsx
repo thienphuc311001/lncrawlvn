@@ -4,7 +4,7 @@ import { useCallback, useEffect, useState } from 'react';
 
 import BookDetail from './book-detail';
 
-const API_BASE = 'http://127.0.0.1:8000';
+const API_BASE = '';
 
 export type BookSummary = {
   book_id: string;

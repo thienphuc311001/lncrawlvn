@@ -207,3 +207,18 @@ test('dictionary confirmed and ignored summary remains visible', () => {
   const html = renderToStaticMarkup(React.createElement(api.TranslationWorkspace));
   for (const text of ['Dictionary summary', '842 confirmed', '37 ignored', '极光石', 'Cực Quang Thạch', 'IGNORED', 'item/material classification unresolved', 'confidence 97.8%', 'fallback: provisional', 'Address/title register: Sino-Vietnamese (configured)', 'Normalized forms: 3', 'Inconsistent forms dropped: 1']) assert.ok(html.includes(text), text);
 });
+
+test('completed batch shows human progress and three downloadable artifacts', () => {
+  const api = load({ job: {
+    job_id: 'abcdef1234567890', display_title: '朕真的不务正业 · Ch. 101–200', status: 'done',
+    stage_label: 'Completed', chapters_finalized: 100, total_chapters: 100,
+    confirmed_terms: 52, repairs_used: 3,
+    dictionary_report: { confirmed_terms: 52, ignored_candidates: 573, unresolved_terms: 0 },
+    ignored_dictionary_available: true,
+  } });
+  const html = renderToStaticMarkup(React.createElement(api.TranslationWorkspace));
+  for (const text of ['朕真的不务正业 · Ch. 101–200', 'COMPLETED', '100/100 chapters finalized',
+    'Targeted repairs used: 3', 'Translation TXT', 'Confirmed dictionary JSON', 'Ignored dictionary JSON',
+    'Delete batch']) assert.ok(html.includes(text), text);
+  assert.ok(!html.includes('Translated Chapters'));
+});

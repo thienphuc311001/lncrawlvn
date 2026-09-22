@@ -1,4 +1,4 @@
-"""Minimal text binder: one plain-text file with the whole novel."""
+"""Minimal text binder: one plain-text file, optionally with the novel header."""
 
 import logging
 from pathlib import Path
@@ -36,7 +36,13 @@ def make_text(
     *,
     target: Optional[int] = None,
     maximum: Optional[int] = None,
+    include_header: bool = True,
 ) -> Path:
+    """Write one TXT file.
+
+    ``include_header`` (default ``True``) keeps the novel metadata header in the
+    file; split exports pass ``False`` for every file after the first one.
+    """
     if target is None:
         target = _configured_limit("safe_block_target")
     if maximum is None:
@@ -47,18 +53,20 @@ def make_text(
         included,
         target=target,
         maximum=maximum,
+        include_header=include_header,
     )
     validate_export(built)
     out_file.parent.mkdir(parents=True, exist_ok=True)
     out_file.write_bytes(built.text.encode("utf-8"))
     audit = built.audit
     logger.info(
-        "Created: %s (chapters=%d blocks=%d blanks=%d oversized=%d max=%d)",
+        "Created: %s (chapters=%d blocks=%d blanks=%d oversized=%d max=%d header=%s)",
         out_file,
         audit["chapters_exported"],
         audit["safe_blocks_created"],
         audit["blank_boundaries_inserted"],
         audit["oversized_paragraphs_split"],
         audit["maximum_block_chars"],
+        audit["include_header"],
     )
     return out_file

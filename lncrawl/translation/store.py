@@ -56,6 +56,19 @@ def atomic_json(path, value):
         temporary.unlink(missing_ok=True)
 
 
+def atomic_text(path, value):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
+    try:
+        with temporary.open("w", encoding="utf-8") as stream:
+            stream.write(value)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 class Store:
     def __init__(self, root: Path, inputs=None, job_id=None):
         self.policy = ResolutionPolicy.from_environment()
@@ -69,10 +82,18 @@ class Store:
 
     def read(self, name, default=None):
         path = self.path / name
-        return json.loads(path.read_text(encoding="utf-8")) if path.exists() else default
+        if not path.exists():
+            return default
+        if path.suffix == ".txt":
+            return path.read_text(encoding="utf-8")
+        return json.loads(path.read_text(encoding="utf-8"))
 
     def write(self, name, value):
-        atomic_json(self.path / name, value)
+        path = self.path / name
+        if path.suffix == ".txt" and isinstance(value, str):
+            atomic_text(path, value)
+        else:
+            atomic_json(path, value)
 
     def progress(self, status="running", **fields):
         value = self.read("progress.json", {})

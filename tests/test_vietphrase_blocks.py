@@ -229,6 +229,45 @@ class PreservationTests(unittest.TestCase):
         self.assertNotIn("\n\n\n" + SEP, region)
 
 
+class HeaderlessExportTests(unittest.TestCase):
+    """Split exports: only the first file keeps the metadata header."""
+
+    def test_headerless_export_starts_at_the_first_separator(self):
+        chapters = [
+            chapter(1, "\u7b2c1\u7ae0 \u7532", ["\u6b63\u6587\u4e00\u3002"]),
+            chapter(2, "\u7b2c2\u7ae0 \u4e59", ["\u6b63\u6587\u4e8c\u3002"]),
+        ]
+        built = build_export_text(novel(), chapters, include_header=False)
+        validate_export(built)  # must pass without a front-matter marker
+        self.assertEqual(built.front_matter, [])
+        self.assertFalse(built.audit["include_header"])
+        self.assertNotIn("+" * 60, built.text)
+        self.assertNotIn("Source:", built.text)
+        self.assertTrue(built.text.startswith("\n" + SEP + "\n"))
+        bodies = [chunk[1:] for chunk in built.text.split(SEP)[1:]]
+        self.assertEqual(len(bodies), 2)
+        self.assertIn("\u7b2c1\u7ae0 \u7532", bodies[0])
+        self.assertIn("\u7b2c2\u7ae0 \u4e59", bodies[1])
+
+    def test_default_export_keeps_the_header(self):
+        built = build_export_text(
+            novel(), [chapter(1, "\u7b2c1\u7ae0 \u7532", ["\u6b63\u6587\u3002"])]
+        )
+        self.assertTrue(built.audit["include_header"])
+        self.assertIn("Source: https://example.test/book", built.text)
+        self.assertIn("+" * 60, built.text)
+
+    def test_headerless_chapter_region_matches_the_header_export(self):
+        paragraphs = [para("\u6bb5", 400) for _ in range(10)]
+        chapters = [chapter(1, "\u7b2c1\u7ae0 \u7532", paragraphs)]
+        with_header = build_export_text(novel(), chapters)
+        without_header = build_export_text(novel(), chapters, include_header=False)
+        self.assertEqual(
+            with_header.text.split("+" * 60, 1)[1].strip("\n"),
+            without_header.text.strip("\n"),
+        )
+
+
 class HeadingLessTests(unittest.TestCase):
     def test_heading_less_chapter_is_report_only(self):
         chapters = [chapter(7, "wrapper", ["\u6b63\u6587\u7b2c\u4e00\u6bb5\u3002"])]

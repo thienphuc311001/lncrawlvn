@@ -665,6 +665,15 @@ class OptimizedPipelineTests(unittest.IsolatedAsyncioTestCase):
             await self.run_book(store, provider)
             self.assertNotIn("极光石", {t["source"] for t in store.read("dictionary.json")["entries"]})
             self.assertGreater(store.read("dictionary-audit.json")["ignored_candidates"], 0)
+            ignored = store.read("ignored_dictionary.json")
+            self.assertEqual(ignored["version"], 1)
+            self.assertGreater(ignored["summary"]["total_ignored"], 0)
+            entry = next(item for item in ignored["candidates"] if item["source"] == "极光石")
+            self.assertEqual(entry["decision"], "IGNORED")
+            self.assertIn("reason_code", entry)
+            self.assertGreaterEqual(entry["occurrence_count"], 1)
+            self.assertLessEqual(len(entry["evidence"]), 3)
+            self.assertNotIn("极光石", {item["source"] for item in store.read("dictionary.json")["entries"]})
             self.assertEqual(
                 [call[0] for call in provider.calls],
                 [prompts.BATCH_RESOLVE, prompts.TRANSLATE],
@@ -683,6 +692,18 @@ class OptimizedPipelineTests(unittest.IsolatedAsyncioTestCase):
             entry = next(t for t in store.read("dictionary.json")["entries"] if t["source"] == "秦政光")
             self.assertEqual((entry["translation"], entry["type"], entry["aliases"]), ("Tần Chính Quang", "character", []))
             self.assertEqual(store.request_statistics()["requests"]["terminology_resolver"], 0)
+
+    async def test_empty_ignored_dictionary_is_still_emitted(self):
+        with tempfile.TemporaryDirectory() as root:
+            store = self.make_store(
+                root,
+                raw="第1章\n秦政光来了。\n秦政光点头。\n秦政光离开。",
+                vp="Chương 1\nTần Chính Quang đến.\nTần Chính Quang gật đầu.\nTần Chính Quang rời đi.",
+            )
+            await self.run_book(store, BookProvider(store))
+            ignored = store.read("ignored_dictionary.json")
+            self.assertEqual(ignored["summary"]["total_ignored"], 0)
+            self.assertEqual(ignored["candidates"], [])
 
     async def test_uncertain_alias_is_ignored_without_identity_inference(self):
         with tempfile.TemporaryDirectory() as root:

@@ -5,7 +5,7 @@ No database, no artifacts, no translations: just a book and chapter bodies.
 
 import logging
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, List, Optional
 
 from ebooklib import epub  # type: ignore
 
@@ -62,7 +62,15 @@ def make_epub(
     chapters: List[Chapter],
     out_file: Path,
     cover_file: Optional[Path] = None,
+    *,
+    include_intro: bool = True,
 ) -> Path:
+    """Bind chapters into one EPUB.
+
+    ``include_intro`` (default ``True``) adds the novel's front matter: the intro
+    page (title, author, synopsis, source) and the cover page. Split exports keep
+    it in the first file only, so every later file is pure chapters.
+    """
     book = epub.EpubBook()
     book.set_identifier(generate_md5(novel.url, novel.title)[:40])
     book.set_title(novel.title or "Untitled")
@@ -79,11 +87,13 @@ def make_epub(
     )
     book.add_item(style_item)
 
-    intro = _intro_item(novel)
-    book.add_item(intro)
-
+    intro = _intro_item(novel) if include_intro else None
     toc = []
-    spine = ["nav", intro]
+    spine: List[Any] = ["nav"]
+    if intro is not None:
+        book.add_item(intro)
+        spine.append(intro)
+
     for chapter in chapters:
         if not chapter.success:
             continue
@@ -98,7 +108,7 @@ def make_epub(
     # The cover page must be added *before* the nav item: when the writer
     # processes the nav it scans every other document (``epub3_pages``), and
     # ``EpubCoverHtml`` only loads its template when it is written itself.
-    if cover_file and cover_file.is_file():
+    if include_intro and cover_file and cover_file.is_file():
         book.set_template("cover", epub_cover_xhtml())
         book.set_cover("cover.jpg", cover_file.read_bytes(), create_page=True)
         book.spine.insert(1, "cover")

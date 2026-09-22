@@ -2,7 +2,7 @@
 
 import { useEffect, useId, useRef, useState, type ReactNode } from 'react';
 
-const API = 'http://127.0.0.1:8000/api/translation';
+const API = '/api/translation';
 type TranslationEvent = {
   id?: string; timestamp?: string; task?: string; model?: string; status: string;
   attempt?: number; key_slot?: number; retry_after?: number; category?: string; operation?: string; reason?: string; error?: string; message?: string;
@@ -13,7 +13,11 @@ type TranslationEvent = {
 };
 type Job = {
   job_id: string; status: string; stage?: string; error?: string; error_detail?: unknown;
-  total_chapters?: number; completed_chapters?: number; aligned?: number;
+  stage_label?: string; display_title?: string; book_title?: string; chapter_start?: number; chapter_end?: number;
+  total_chapters?: number; completed_chapters?: number; chapters_finalized?: number; aligned?: number;
+  chunks_total?: number; chunks_finalized?: number; current_chapter?: string | number | null;
+  current_chunk?: number | null; current_chunk_total?: number | null; repairs_used?: number;
+  confirmed_terms?: number; ignored_candidates?: number;
   scanned_chapter?: number;
   candidate_count?: number; resolved_candidates?: number; current_term?: string;
   active_chapters?: Record<string, { chunk: number; chunks: number }>;
@@ -33,6 +37,9 @@ type Job = {
     state?: string; resolution_status?: string; confidence?: number; resolver_attempts?: number;
     fallback?: string; continue?: boolean;
   }>;
+  failure_context?: { task?: string; repair_attempts?: number; findings?: number; location?: { chapter?: number; chunk?: number | null } | null };
+  ignored_dictionary_available?: boolean;
+  outputs?: { translation?: string; dictionary?: string; ignored_dictionary?: string };
   request_statistics?: {
     total_requests: number; requests: Record<string, number>; logical_operations: Record<string, number>;
     local_ai_requests: Record<string, number>; retry: number; model_fallback: number; cache_hits: number;
@@ -169,9 +176,19 @@ function chapterLabel(key: string): string {
   return scoped ? `Volume ${scoped[1]} / Chapter ${scoped[2]}` : `Chapter ${key}`;
 }
 
-async function request(path: string, body?: unknown): Promise<unknown> {
-  const res = await fetch(`${API}${path}`, body === undefined ? {} : {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+function readableChapter(value: string | number | null | undefined): string {
+  if (value === null || value === undefined || value === '') return '';
+  return chapterLabel(String(value));
+}
+
+function statusLabel(status: string): string {
+  return ({ pending: 'QUEUED', running: 'RUNNING', done: 'COMPLETED', failed: 'FAILED', cancelled: 'CANCELLED', interrupted: 'PAUSED', deleting: 'DELETING' } as Record<string, string>)[status] ?? status.toUpperCase();
+}
+
+async function request(path: string, body?: unknown, method?: 'POST' | 'DELETE'): Promise<unknown> {
+  const res = await fetch(`${API}${path}`, body === undefined && !method ? {} : {
+    method: method ?? 'POST', headers: { 'Content-Type': 'application/json' },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
   });
   const data = await res.json();
   if (!res.ok) throw new RequestError(data?.detail ?? `Request failed (HTTP ${res.status}).`, res.status);
@@ -220,9 +237,33 @@ export default function TranslationWorkspace() {
       const [raw, vietphrase, dictionary] = await Promise.all([
         files.raw.text(), files.vietphrase.text(), files.dictionary?.text(),
       ]);
-      const result = await request('/jobs', { raw, vietphrase, dictionary: dictionary ? JSON.parse(dictionary) : null }) as Job;
+      const result = await request('/jobs', {
+        raw,
+        vietphrase,
+        dictionary: dictionary ? JSON.parse(dictionary) : null,
+        book_title: files.raw.name.replace(/\.[^.]+$/, ''),
+        source_name: files.raw.name,
+      }) as Job;
       setJob(result);
       setJobs(previous => [result, ...previous.filter(j => j.job_id !== result.job_id)]);
+    } catch (e) { setError(errorDetail(e)); }
+    finally { setBusy(false); }
+  }
+
+  async function deleteCurrent() {
+    if (!job) return;
+    const running = active;
+    const title = job.display_title ?? `Translation batch ${job.job_id.slice(0, 8)}`;
+    const prompt = running
+      ? `Delete running batch?\n\n${title}\n\nThe active translation will be cancelled and the batch removed. Completed output files, if any, will be kept.`
+      : `Delete ${statusLabel(job.status).toLowerCase()} batch?\n\n${title}\n\nBatch history and temporary state will be removed. Generated outputs will be kept.`;
+    if (typeof window !== 'undefined' && !window.confirm(prompt)) return;
+    setBusy(true); setError(null);
+    try {
+      await request(`/jobs/${job.job_id}`, undefined, 'DELETE');
+      const remaining = jobs.filter(item => item.job_id !== job.job_id);
+      setJobs(remaining);
+      setJob(remaining[0] ?? null);
     } catch (e) { setError(errorDetail(e)); }
     finally { setBusy(false); }
   }
@@ -259,16 +300,22 @@ export default function TranslationWorkspace() {
     {config?.api_key_configured && <p className="muted">{config.api_key_count ?? 1} API key(s) configured · Automatic rotation on quota errors · Key values stay on the server</p>}
     {jobs.length > 0 && <label className="settings-field"><span>Saved batches</span><select value={job?.job_id ?? ''} disabled={busy}
       onChange={e => { request(`/jobs/${e.target.value}`).then(data => setJob(data as Job)).catch(e => setError(errorDetail(e))); }}>
-      {jobs.map(j => <option key={j.job_id} value={j.job_id}>{j.job_id.slice(0, 12)}</option>)}
+      {jobs.map(j => <option key={j.job_id} value={j.job_id}>{j.display_title ?? `Translation batch ${j.job_id.slice(0, 8)}`}</option>)}
     </select></label>}
     {job && <div className="translation-progress" aria-live="polite">
-      <h2>{job.stage ?? job.status}</h2>
-      <p>{job.status} · {job.completed_chapters ?? 0}/{job.total_chapters ?? '?'} chapters finalized</p>
+      <h2>{job.display_title ?? `Translation batch ${job.job_id.slice(0, 8)}`}</h2>
+      <p>{statusLabel(job.status)} · {job.stage_label ?? job.stage ?? 'Preparing inputs'}</p>
+      <p className="muted">Batch ID: {job.job_id}</p>
+      <p>{job.chapters_finalized ?? job.completed_chapters ?? 0}/{job.total_chapters ?? '?'} chapters finalized</p>
+      {(job.chunks_total !== undefined || job.chunks_finalized !== undefined) && <p>{job.chunks_finalized ?? 0}/{job.chunks_total ?? '?'} chunks finalized</p>}
       {job.aligned !== undefined && <p>Aligned chapters: {job.aligned}</p>}
+      {(job.current_chapter !== undefined && job.current_chapter !== null) && <p>Currently working: {readableChapter(job.current_chapter)}{job.current_chunk !== undefined && job.current_chunk !== null ? ` · Chunk ${job.current_chunk}${job.current_chunk_total ? ` / ${job.current_chunk_total}` : ''}` : ''}</p>}
       {job.dictionary_frozen && <p>Dictionary frozen for this batch · {job.dictionary_hash?.slice(0, 12)}</p>}
-      {job.dictionary_report && <details className="dictionary-report" open={(job.dictionary_report.ignored_candidates ?? job.dictionary_report.report_only_terms ?? job.dictionary_report.provisional_terms ?? 0) > 0 || (job.dictionary_report.fatal_conflicts ?? 0) > 0}>
+      {(job.confirmed_terms !== undefined || job.ignored_candidates !== undefined) && <p>Terminology: {job.confirmed_terms ?? 0} confirmed · {job.ignored_candidates ?? 0} ignored</p>}
+      {job.dictionary_report && <details className="dictionary-report">
         <summary>Dictionary summary · {job.dictionary_report.confirmed_terms ?? job.dictionary_report.locked_terms ?? 0} confirmed · {job.dictionary_report.ignored_candidates ?? job.dictionary_report.report_only_terms ?? job.dictionary_report.provisional_terms ?? 0} ignored</summary>
         <p>Confirmed: {job.dictionary_report.confirmed_terms ?? job.dictionary_report.locked_terms ?? 0} · Ignored candidates: {job.dictionary_report.ignored_candidates ?? job.dictionary_report.report_only_terms ?? job.dictionary_report.provisional_terms ?? 0} · Rejected generic: {job.dictionary_report.rejected_generic_candidates ?? 0} · Removed contextual forms: {job.dictionary_report.removed_contextual_forms ?? 0} · Preserved identity forms: {job.dictionary_report.preserved_identity_forms ?? 0} · Fatal conflicts: {job.dictionary_report.fatal_conflicts ?? 0}</p>
+        {job.ignored_dictionary_available && <p><a href={job.outputs?.ignored_dictionary ?? `${API}/jobs/${job.job_id}/outputs/ignored_dictionary.json`}>Ignored candidates: {job.dictionary_report.ignored_candidates ?? 0} · Download ignored dictionary</a></p>}
         {job.dictionary_report.register && <p>Address/title register: {job.dictionary_report.register === 'sino-vietnamese' ? 'Sino-Vietnamese' : 'Modern Vietnamese'}{job.dictionary_report.register_source ? ` (${job.dictionary_report.register_source})` : ''} · Normalized forms: {job.dictionary_report.register_normalizations ?? 0} · Inconsistent forms dropped: {job.dictionary_report.register_conflicts ?? 0}</p>}
         {(job.dictionary_review ?? []).map(entry => <article className="dictionary-review-entry" key={entry.source}>
           <strong>{entry.source}</strong>{entry.translation && <span> → {entry.translation}</span>}
@@ -278,16 +325,19 @@ export default function TranslationWorkspace() {
           {entry.fallback && <span> · fallback: {entry.fallback}</span>}
         </article>)}
       </details>}
-      {job.stage === 'Dictionary resolution' && job.candidate_count !== undefined && job.resolved_candidates !== undefined && <p>Terms reviewed: {job.resolved_candidates}/{job.candidate_count}{job.current_term ? ` · ${job.current_term}` : ''}</p>}
+      {(job.stage === 'Dictionary resolution' || job.stage === 'Terminology resolution') && job.candidate_count !== undefined && job.resolved_candidates !== undefined && <p>Terms reviewed: {job.resolved_candidates}/{job.candidate_count}{job.current_term ? ` · ${job.current_term}` : ''}</p>}
       {Object.entries(job.active_chapters ?? {}).map(([chapter, value]) => <p key={chapter}>{chapterLabel(chapter)} · Chunk {value.chunk}/{value.chunks}</p>)}
+      {job.repairs_used !== undefined && <p>Targeted repairs used: {job.repairs_used}</p>}
+      {job.failure_context && <p>Stopped at: {job.failure_context.location?.chapter !== undefined ? `Chapter ${job.failure_context.location.chapter}` : job.failure_context.task ?? 'last validation'}{job.failure_context.location?.chunk !== undefined && job.failure_context.location?.chunk !== null ? ` · Chunk ${job.failure_context.location.chunk + 1}` : ''}. Validation failed after {job.failure_context.repair_attempts ?? 0} targeted repair(s); {job.failure_context.findings ?? 0} finding(s) remain.</p>}
       <ErrorNotice detail={job.error_detail ?? job.error} />
       {active ? <button className="btn btn-ghost" disabled={busy} onClick={() => void action('cancel')}>Cancel</button>
         : job.status !== 'done' && <button className="btn btn-primary" disabled={busy} onClick={() => void action('resume')}>Resume batch</button>}
       {job.status === 'done' && <div className="translation-downloads">
-        <a className="btn btn-primary" href={`${API}/jobs/${job.job_id}/outputs/translated.txt`}>Vietnamese TXT</a>
-        <a className="btn btn-primary" href={`${API}/jobs/${job.job_id}/outputs/translated.json`}>Translated Chapters</a>
-        <a className="btn btn-primary" href={`${API}/jobs/${job.job_id}/outputs/dictionary.json`}>Updated Book Dictionary</a>
+        <a className="btn btn-primary" href={job.outputs?.translation ?? `${API}/jobs/${job.job_id}/outputs/translated.txt`}>Translation TXT</a>
+        <a className="btn btn-primary" href={job.outputs?.dictionary ?? `${API}/jobs/${job.job_id}/outputs/dictionary.json`}>Confirmed dictionary JSON</a>
+        <a className="btn btn-primary" href={job.outputs?.ignored_dictionary ?? `${API}/jobs/${job.job_id}/outputs/ignored_dictionary.json`}>Ignored dictionary JSON</a>
       </div>}
+      <button className="btn btn-ghost" disabled={busy} onClick={() => void deleteCurrent()}>Delete batch</button>
       <TranslationLog key={job.job_id} logs={job.logs} status={job.status} />
       {job.request_statistics && <details className="translation-statistics"><summary>Request statistics · {job.request_statistics.total_requests} API requests</summary>
         <table><thead><tr><th>Operation</th><th>Logical calls</th><th>API attempts</th></tr></thead><tbody>

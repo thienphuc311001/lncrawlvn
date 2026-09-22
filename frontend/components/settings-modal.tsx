@@ -4,7 +4,7 @@ import { useEffect, useState } from 'react';
 
 import type { ExtractOptions } from './job-runner';
 
-const API_BASE = 'http://127.0.0.1:8000';
+const API_BASE = '';
 
 type ConfigField = {
   key: string;

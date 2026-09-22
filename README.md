@@ -38,7 +38,7 @@ installer lives at `scripts/lnmini.sh`; copy it anywhere on your `PATH` as
 | `/api/books/{book_id}/chapters/{n}` | DELETE | Remove one saved chapter file (TOC entry kept) → `204`; re-download later via fetch-missing (`409` while a crawl job is running for the book) |
 | `/api/books/{book_id}/fetch-missing` | POST | Start a job that downloads only chapters missing on disk → `202` + job |
 | `/api/books/{book_id}` | DELETE | Remove a book with all saved chapters, cover, and exports → `204` (`409` while a crawl job is running for it) |
-| `/api/books/{book_id}/export?format=epub\|txt` | GET | Build an EPUB/TXT and download it as a ZIP — one `<title>_0001-0100.epub`-style file per 100-chapter folder |
+| `/api/books/{book_id}/export?format=epub\|txt&per_file=100` | GET | Build an EPUB/TXT and download it as a ZIP — one `0001-0010.epub`-style file (chapter range only; the ZIP name keeps the title) per `per_file` chapters (default 100, max 10000). Only the first file carries the novel metadata header, intro page, and cover |
 
 
 ## Usage
@@ -144,6 +144,10 @@ observed to merge adjacent source lines around ~4000 cumulative characters:
   punctuation.
 - Removing the inserted blank lines reproduces the crawled text exactly, so
   translation pairing is unaffected: blank lines were already block boundaries.
+- A ZIP export split into several files keeps the metadata header in the first
+  file only (the file holding the earliest chapters, so the one with chapter 1
+  when it is saved). Every later file starts directly at the chapter separator,
+  which the chapter parser accepts as a headerless novel.
 
 Defaults `VIETPHRASE_SAFE_BLOCK_TARGET=2600` / `VIETPHRASE_SAFE_BLOCK_MAX=3000`
 come from `.env.example`, and can be overridden in the settings modal

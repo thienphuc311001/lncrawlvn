@@ -361,6 +361,9 @@ h1, h2, h3, h4 { text-wrap: balance; }
   padding: 24px;
   box-shadow: 0 16px 48px oklch(0% 0 0 / 0.22);
 }
+/* Export options dialog (book detail): a narrow variant of the settings modal. */
+.export-dialog { width: min(440px, calc(100vw - 40px)); }
+
 .settings-head {
   display: flex;
   align-items: center;

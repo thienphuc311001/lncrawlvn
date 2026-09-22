@@ -9,8 +9,9 @@ from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
 from .style import AUTO, MODERN, SINO_VIETNAMESE, configured_register
 
 MODELS = ("gemini-3.1-flash-lite", "gemini-3.5-flash-lite", "gemini-3.7-flash")
-PIPELINE_VERSION = 11
-DICTIONARY_VERSION = 7
+PIPELINE_VERSION = 12
+DICTIONARY_VERSION = 8
+IGNORED_DICTIONARY_VERSION = 1
 PARSER_VERSION = 6
 CONFIRMED = "CONFIRMED"
 IGNORE = "IGNORE"
@@ -40,6 +41,10 @@ class Inputs(StrictModel):
     raw: str = Field(min_length=1, max_length=20_000_000)
     vietphrase: str = Field(min_length=1, max_length=40_000_000)
     dictionary: Optional[dict] = None
+    # Optional display metadata.  It is deliberately separate from RAW so
+    # existing callers and checkpoints remain compatible when it is absent.
+    book_title: Optional[str] = Field(default=None, max_length=500)
+    source_name: Optional[str] = Field(default=None, max_length=500)
 
 
 class ResolutionPolicy(StrictModel):

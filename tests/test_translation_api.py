@@ -210,3 +210,77 @@ class APITests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(response.json()["logs"]), 3)
         # Merely viewing a legacy job never changes its persisted checkpoint.
         self.assertTrue(store.read("progress.json")["error"].startswith("Gemini HTTP"))
+
+    async def test_batch_snapshot_has_human_label_and_finalized_progress(self):
+        store = Store(
+            api.ROOT,
+            {
+                "raw": "第101章\n正文。\n第102章\n正文。",
+                "vietphrase": "Chương 101\nVăn.\nChương 102\nVăn.",
+                "book_title": "朕真的不务正业",
+                "source_name": "book.txt",
+            },
+        )
+        store.progress(
+            "running",
+            stage="Translating",
+            total_chapters=2,
+            chapter_start=101,
+            chapter_end=102,
+            completed_chapters=1,
+            chapters_finalized=1,
+            chunks_total=4,
+            chunks_finalized=2,
+            current_chapter="101",
+            current_chunk=2,
+            current_chunk_total=2,
+            repairs_used=1,
+        )
+        api._tasks[store.id] = asyncio.create_task(asyncio.sleep(60))
+        response = await self.client.get(f"/api/translation/jobs/{store.id}")
+        data = response.json()
+        self.assertEqual(data["display_title"], "朕真的不务正业 · Ch. 101–102")
+        self.assertEqual(data["stage_label"], "Translating")
+        self.assertEqual(data["chapters_finalized"], 1)
+        self.assertEqual(data["current_chapter"], "101")
+        self.assertEqual(data["current_chunk_total"], 2)
+        self.assertEqual(data["repairs_used"], 1)
+
+    async def test_delete_completed_batch_preserves_outputs_and_is_persistent(self):
+        store = Store(
+            api.ROOT,
+            {"raw": "第1章\n正文。", "vietphrase": "Chương 1\nVăn."},
+        )
+        store.progress("done", stage="Complete")
+        store.write("translated.txt", "output")
+        store.write("dictionary.json", {"entries": []})
+        store.write("ignored_dictionary.json", {"candidates": []})
+        response = await self.client.delete(f"/api/translation/jobs/{store.id}")
+        self.assertEqual(response.status_code, 200)
+        self.assertFalse(store.path.exists())
+        self.assertEqual(
+            (api.ROOT / "_outputs" / store.id / "translated.txt").read_text(), "output"
+        )
+        output = await self.client.get(
+            f"/api/translation/jobs/{store.id}/outputs/translated.txt"
+        )
+        self.assertEqual(output.status_code, 200)
+        self.assertEqual((await self.client.get("/api/translation/jobs")).json(), [])
+        self.assertEqual(
+            (await self.client.delete(f"/api/translation/jobs/{store.id}")).status_code,
+            404,
+        )
+
+    async def test_delete_running_batch_cancels_task_before_removing_state(self):
+        store = Store(
+            api.ROOT,
+            {"raw": "第1章\n正文。", "vietphrase": "Chương 1\nVăn."},
+        )
+        store.progress("running", stage="Translating")
+        task = asyncio.create_task(asyncio.sleep(60))
+        api._tasks[store.id] = task
+        response = await self.client.delete(f"/api/translation/jobs/{store.id}")
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(task.cancelled())
+        self.assertNotIn(store.id, api._tasks)
+        self.assertFalse(store.path.exists())

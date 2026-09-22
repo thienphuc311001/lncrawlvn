@@ -5,11 +5,15 @@ Layout (under ``APP_DIR/library``)::
     <book_id>/book.json                      metadata + full chapter TOC
     <book_id>/cover.jpg                      optional downloaded cover
     <book_id>/chapters/0001-0100/ch_0001.json  one file per fetched chapter
-    <book_id>/exports/<title>.epub.zip       export ZIP, one file per 100-chapter folder
+    <book_id>/exports/0001-0100.epub           one file per export chunk
+    <book_id>/exports/<title>.epub.zip         bundled export download
 
 Chapters are written to disk the moment their download finishes, so a crashed
 job, dead server, or flaky network never loses already-fetched content. A
 later "fetch missing" run only downloads chapters that have no file yet.
+
+Storage always groups chapters 100 per folder (``CHAPTERS_PER_FOLDER``), while
+an export can pick its own number of chapters per file (``per_file``).
 """
 
 import json
@@ -29,6 +33,11 @@ from .utils.file_tools import atomic_write, safe_filename
 logger = logging.getLogger(__name__)
 
 CHAPTERS_PER_FOLDER = 100
+# Exports default to the on-disk folder size and accept anything from one
+# chapter per file up to this ceiling (a book of N chapters yields at most
+# N files, so the cap only guards against nonsense values).
+DEFAULT_EXPORT_CHUNK = CHAPTERS_PER_FOLDER
+MAX_EXPORT_CHUNK = 10000
 
 
 class Library:
@@ -44,10 +53,14 @@ class Library:
     def _book_dir(self, book_id: str) -> Path:
         return self.root / book_id
 
+    def _chunk_bounds(self, chapter_id: int, per_file: int) -> Tuple[int, int]:
+        """First and last chapter id of the export chunk holding a chapter."""
+        start = ((chapter_id - 1) // per_file) * per_file + 1
+        return start, start + per_file - 1
+
     def _folder_bounds(self, chapter_id: int) -> Tuple[int, int]:
         """First and last chapter id of the 100-chapter folder holding a chapter."""
-        start = ((chapter_id - 1) // CHAPTERS_PER_FOLDER) * CHAPTERS_PER_FOLDER + 1
-        return start, start + CHAPTERS_PER_FOLDER - 1
+        return self._chunk_bounds(chapter_id, CHAPTERS_PER_FOLDER)
 
     def chapter_rel_path(self, chapter_id: int) -> str:
         """Relative file path for a chapter, grouped 100 per numbered folder."""
@@ -266,35 +279,72 @@ class Library:
             raise LNException("No chapters saved yet — fetch the book first")
         return novel, chapters
 
-    def _group_saved_by_folder(
-        self, chapters: List[Chapter]
+    def _group_saved(
+        self, chapters: List[Chapter], per_file: int
     ) -> List[Tuple[int, int, List[Chapter]]]:
-        """Split saved chapters into the same 100-chapter folders used on disk.
+        """Split saved chapters into export chunks of ``per_file`` chapters.
 
-        Returns ``(start, end, chapters_in_folder)`` tuples in folder order,
-        skipping any folder without a saved chapter.
+        Boundaries follow chapter ids (1-``per_file``, ``per_file``+1-2×
+        ``per_file``, …), which is exactly the on-disk 100-chapter folder layout
+        at the default size. Returns ``(start, end, chapters_in_chunk)`` tuples in
+        chunk order, skipping any chunk without a saved chapter.
         """
         groups: List[Tuple[int, int, List[Chapter]]] = []
         for chapter in chapters:
             if not chapter.success:
                 continue
-            start, end = self._folder_bounds(chapter.id)
+            start, end = self._chunk_bounds(chapter.id, per_file)
             if not groups or groups[-1][0] != start:
                 groups.append((start, end, []))
             groups[-1][2].append(chapter)
         return groups
 
-    def export_zip(self, book_id: str, fmt: str = "epub") -> Path:
-        """Build one EPUB/TXT per 100-chapter folder and bundle them into a ZIP.
+    def _clear_exports(self, exports_dir: Path, stem: str, fmt: str) -> None:
+        """Remove earlier export files of one book/format.
 
-        Mirrors the on-disk/library folder ranges (``<title>_0001-0100.epub``,
-        ``<title>_0101-0200.epub``, …), one file per folder containing only that
-        folder's saved chapters.
+        Chapter-per-file is chosen per export, so filenames change between runs;
+        stale copies are deleted instead of accumulating in ``exports/``. Chunk
+        files carry no title — they are named after their chapter range only —
+        so every direct file ending in ``.{fmt}`` is stale, including copies
+        written by older builds that prefixed the title. The bundle itself ends
+        in ``.{fmt}.zip`` and is removed separately. Files of other formats are
+        never touched.
+        """
+        suffix = f".{fmt}"
+        for path in exports_dir.iterdir():
+            if path.is_file() and path.name.endswith(suffix):
+                path.unlink(missing_ok=True)
+        (exports_dir / f"{stem}.{fmt}.zip").unlink(missing_ok=True)
+
+    def export_zip(
+        self,
+        book_id: str,
+        fmt: str = "epub",
+        per_file: int = DEFAULT_EXPORT_CHUNK,
+    ) -> Path:
+        """Build one EPUB/TXT per chapter chunk and bundle them into a ZIP.
+
+        ``per_file`` is the number of chapters per output file (default 100,
+        mirroring the on-disk folder ranges). Files are named after their chapter
+        ranges only (``0001-0010.epub``, ``0011-0020.epub``, …); a file holding a
+        single chapter drops the range (``0007.txt``). Only the bundle keeps the
+        novel title.
+
+        Only the first file — the one holding the earliest chapters, so the one
+        containing chapter 1 when it is saved — carries the novel's front matter
+        (metadata header, intro page, cover); the remaining files are pure
+        chapters.
         """
         if fmt not in ("epub", "txt"):
             raise LNException(f"Unsupported export format: {fmt}")
+        per_file = int(per_file)
+        if not 1 <= per_file <= MAX_EXPORT_CHUNK:
+            raise LNException(
+                f"Chapters per file must be between 1 and {MAX_EXPORT_CHUNK}, "
+                f"got {per_file}"
+            )
         novel, chapters = self._load_novel_and_chapters(book_id)
-        groups = self._group_saved_by_folder(chapters)
+        groups = self._group_saved(chapters, per_file)
 
         exports_dir = self._book_dir(book_id) / "exports"
         exports_dir.mkdir(parents=True, exist_ok=True)
@@ -303,21 +353,35 @@ class Library:
         cover = self._book_dir(book_id) / "cover.jpg"
         cover = cover if cover.is_file() else None
 
+        self._clear_exports(exports_dir, stem, fmt)
+
         targets: List[Path] = []
-        for start, end, folder_chapters in groups:
-            label = f"{start:04d}-{end:04d}"
-            out = exports_dir / f"{stem}_{label}.{fmt}"
+        for index, (start, end, chunk_chapters) in enumerate(groups):
+            first = index == 0
+            label = f"{start:04d}" if start == end else f"{start:04d}-{end:04d}"
+            out = exports_dir / f"{label}.{fmt}"
             if fmt == "epub":
-                make_epub(novel, folder_chapters, out, cover)
+                make_epub(
+                    novel,
+                    chunk_chapters,
+                    out,
+                    cover if first else None,
+                    include_intro=first,
+                )
             else:
-                make_text(novel, folder_chapters, out)
+                make_text(novel, chunk_chapters, out, include_header=first)
             targets.append(out)
 
         zip_path = exports_dir / f"{stem}.{fmt}.zip"
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
             for target in targets:
                 zf.write(target, arcname=target.name)
-        logger.info("Export bundle (%d files): %s", len(targets), zip_path)
+        logger.info(
+            "Export bundle (%d files, %d chapters per file): %s",
+            len(targets),
+            per_file,
+            zip_path,
+        )
         return zip_path
 
 
