@@ -1,2238 +1,1165 @@
-"""Deterministic RAW/VietPhrase translation pipeline.
-
-The pipeline has one mutable phase (pre-freeze dictionary construction) and one
-immutable phase (chapter translation). Terminology has only two runtime
-decisions: CONFIRMED mappings are enforced, everything else is IGNORE metadata.
-"""
+"""The single RAW-only, resumable Chinese-to-Vietnamese translation pipeline."""
 
 from __future__ import annotations
 
 import asyncio
-from collections import Counter
-from datetime import datetime, timezone
-from types import MappingProxyType
+import copy
+import json
+import os
+import re
+from collections import defaultdict
 
-from . import prompts, style
+from . import prompts
 from .dictionary import (
-    AUDIT_ONLY_CLASSIFICATIONS,
-    clean_identity_forms,
-    evaluate_reference_evidence,
-    export_dictionary,
-    load_legacy,
-    normalize_term_register,
-    quantity_source_problem,
-    relevant,
-    sanity,
-    source_problem,
-    term_problem,
-    vet_confirmed_reference_forms,
+    DictionaryConflict,
+    load_dictionary,
+    load_unresolved,
+    merge_patch,
+    relevant_entries,
+    scan,
+    validate_dictionary,
 )
 from .models import (
-    MODELS,
-    DICTIONARY_VERSION,
-    IGNORED_DICTIONARY_VERSION,
+    AddAlias,
+    AddEntry,
+    CoverageAudit,
+    DictionaryPatch,
+    FALLBACK_MODEL,
     PARSER_VERSION,
     PIPELINE_VERSION,
-    Alignment,
-    BatchResolution,
-    Chapter,
+    PRIMARY_MODEL,
+    ProposedPatch,
     Repair,
-    Resolution,
-    ResolutionPolicy,
-    Segment,
-    Term,
     Translation,
+    TranslatedSegment,
+    Unresolved,
 )
-from .parsing import deterministic_alignment, make_chunks, validate_inputs
-from .preprocessing import (
-    ENTITY_CLASS_POLICIES,
-    batches,
-    build_index,
-    class_confirmation,
-    local_resolution,
+from .manual_review import accepted_review, accepted_review_ids
+from .notes import author_note_policy, is_author_note
+from .parsing import ChapterValidationError, parse_chapters
+from .scheduler import ErrorCategory, ProviderError
+from .store import digest
+from .validation import (
+    SEMANTIC_SUSPICIONS,
+    TITLE_WRAPPER,
+    _segment_findings,
+    deterministic_defects,
+    local_findings,
+    repair_integrity_findings,
+    semantic_suspicions,
+    source_quality_findings,
+    structural_findings,
 )
-from .store import digest, pipeline_identity
-from .validation import local_findings, validate_findings
 
 
 class QualityError(RuntimeError):
     pass
 
 
-def chapter_identity(chapter, field="number"):
-    result = {field: chapter.number}
-    if chapter.volume is not None:
-        result["volume"] = chapter.volume
-    return result
+def _unresolved_merge(previous, additions, chapters):
+    merged = {item["source"]: dict(item) for item in previous}
+    numbers = sorted(chapter.number for chapter in chapters)
+    for item in additions:
+        source = item["source"]
+        old = merged.get(source, {})
+        evidence = list(dict.fromkeys((old.get("evidence") or []) + item.get("evidence", [])))[:8]
+        chapter_numbers = item.get("chapters") or numbers
+        merged[source] = {
+            "source": source,
+            "possible_type": item.get("possible_type", old.get("possible_type", "unknown")),
+            "reason": item.get("reason", old.get("reason", "insufficient evidence")),
+            "evidence": evidence,
+            "first_seen_chapter": old.get("first_seen_chapter", min(chapter_numbers)),
+            "last_seen_chapter": max(old.get("last_seen_chapter", 0), max(chapter_numbers)),
+        }
+    return sorted(merged.values(), key=lambda item: item["source"])
+
+
+def _candidate_batches(candidates, max_chars=32_000):
+    """Batch at book scope; split only when evidence would exceed a useful payload."""
+    batch = []
+    size = 0
+    for item in candidates:
+        item_size = len(json.dumps(item, ensure_ascii=False))
+        if batch and size + item_size > max_chars:
+            yield batch
+            batch, size = [], 0
+        batch.append(item)
+        size += item_size
+    if batch:
+        yield batch
+
+
+def _split_paragraph(paragraph, limit):
+    """Preserve one stable paragraph identity while splitting extreme prose safely."""
+    if len(paragraph) <= limit:
+        return [paragraph]
+    sentences = re.findall(r".*?(?:[。！？!?][”’」』]?|$)", paragraph)
+    sentences = [item for item in sentences if item]
+    if "".join(sentences) != paragraph:
+        raise QualityError("Source sentence splitting would change RAW text")
+    if any(len(item) > limit for item in sentences):
+        finer = []
+        for sentence in sentences:
+            if len(sentence) <= limit:
+                finer.append(sentence)
+            else:
+                clauses = re.findall(r".*?(?:[，；][”’」』]?|$)", sentence)
+                if "".join(clauses) != sentence or any(len(item) > limit for item in clauses if item):
+                    raise QualityError("One source clause exceeds the safe translation request limit")
+                finer.extend(item for item in clauses if item)
+        sentences = finer
+    pieces = []
+    current = ""
+    for sentence in sentences:
+        if current and len(current) + len(sentence) > limit:
+            pieces.append(current)
+            current = ""
+        current += sentence
+    if current:
+        pieces.append(current)
+    return pieces
+
+
+def _units(chapter, limit):
+    """(request ID, RAW, persistent paragraph ID) tuples."""
+    units = []
+    for identifier, paragraph in chapter.paragraph_items:
+        pieces = _split_paragraph(paragraph, limit)
+        if len(pieces) == 1:
+            units.append((identifier, paragraph, identifier))
+        else:
+            units.extend((f"{identifier}.F{index:04d}", piece, identifier)
+                         for index, piece in enumerate(pieces, 1))
+    return units
+
+
+def _estimated_output_tokens(text):
+    """Conservative local sizing signal; it is not a semantic quality gate."""
+    han = sum("\u3400" <= char <= "\u9fff" for char in text)
+    dialogue_marks = sum(char in "“”「」『』\"" for char in text)
+    return int(han * 1.9 + max(0, len(text) - han) * 0.6 + dialogue_marks * 5)
+
+
+def _groups(units, limit, max_paragraphs=40, output_token_limit=12_000):
+    if (sum(len(unit[1]) for unit in units) <= limit
+            and sum(_estimated_output_tokens(unit[1]) for unit in units) <= output_token_limit):
+        return [units] if units else []
+    groups = []
+    group = []
+    size = 0
+    estimated = 0
+    for unit in units:
+        unit_tokens = _estimated_output_tokens(unit[1])
+        if group and (size + len(unit[1]) > limit
+                      or estimated + unit_tokens > output_token_limit
+                      or len(group) >= max_paragraphs):
+            groups.append(group)
+            group, size, estimated = [], 0, 0
+        group.append(unit)
+        size += len(unit[1])
+        estimated += unit_tokens
+    if group:
+        groups.append(group)
+    return groups
+
+
+def _group_hash(chapter, group, dictionary, previous, lookahead, is_first):
+    return digest({
+        "chapter": chapter.number,
+        "title": chapter.title if is_first else "",
+        "raw": [(identifier, text) for identifier, text, _ in group],
+        "dictionary": dictionary,
+        "previous_translation": previous,
+        "next_source": lookahead,
+        "policy": prompts.POLICY_VERSIONS["translation"],
+        "schema": Translation.model_json_schema(),
+        "thinking_budget": os.getenv("TRANSLATION_THINKING_BUDGET"),
+    })
 
 
 class Pipeline:
     def __init__(self, store, scheduler):
-        self.store, self.scheduler = store, scheduler
-        self.terms = {}
-        self.pairs = []
-        self.alignments = {}
-        self.chunks = {}
-        self.index = {}
-        self.activity = {}
-        self.cache_keys = {}
-        self.decisions = {}
-        self.ignored = {}
-        self.reference_audit = []
-        self.form_cleanup = []
-        self._raw_contexts = None
-        self.register_cleanup = []
-        self.style_profile = {}
-        self.ignored_source_available = True
-        self.address_register = style.SINO_VIETNAMESE
-        self.address_register_source = "configured"
-        self.outcomes = {}
-        self.metrics = Counter()
-        self.frozen_hash = None
+        self.store = store
+        self.scheduler = scheduler
+        self.chapters = []
+        self.dictionary = None
+        self.unresolved = []
+        self.pre_hash = None
         self.input_hash = None
-        self.compatible_input_hashes = set()
-        self.compatible_frozen_hashes = set()
-        policy_data = self.store.read(
-            "resolution-policy.json", ResolutionPolicy.from_environment().model_dump()
+        self.legacy_raw = {}
+        self.dictionary_migrations = []
+        self.ratio_baseline = []
+        self.paragraph_ratio_baseline = []
+        self.validation_baselines = {}
+
+    def _remember_ratios(self, chapter, translation):
+        self.ratio_baseline.append(
+            sum(len(item.text) for item in translation.segments)
+            / max(1, sum(len(raw) for raw in chapter.paragraphs))
         )
-        # Old checkpoints carried a resolver-correction limit. The active
-        # architecture has no resolver repair loop, so discard that legacy
-        # setting while keeping the checkpoint resumable.
-        policy_data.pop("max_targeted_corrections", None)
-        self.policy = ResolutionPolicy.model_validate(policy_data)
+        self.paragraph_ratio_baseline.extend(
+            len(item.text) / max(1, len(raw))
+            for raw, item in zip(chapter.paragraphs, translation.segments)
+        )
+
+    def _local_findings(self, chapter, translation):
+        chapter_ratios, paragraph_ratios = self.validation_baselines.get(
+            chapter.number, (self.ratio_baseline, self.paragraph_ratio_baseline))
+        findings = local_findings(
+            chapter, translation, self.dictionary,
+            ratio_baseline=chapter_ratios,
+            paragraph_ratio_baseline=paragraph_ratios,
+        )
+        raw_by_id = dict(chapter.paragraph_items)
+        text_by_id = {segment.id: segment.text for segment in translation.segments}
+        accepted = {}
+        for finding in findings:
+            identifier = finding.get("id")
+            if identifier not in raw_by_id or identifier not in text_by_id:
+                continue
+            if identifier not in accepted:
+                accepted[identifier] = accepted_review(
+                    self.store, chapter.number, identifier, raw_by_id[identifier],
+                    text_by_id[identifier], self.dictionary)
+        return [finding for finding in findings
+                if not (finding.get("id") in accepted
+                        and accepted[finding["id"]]
+                        and finding in accepted[finding["id"]].get("accepted_findings", []))]
+
+    def event(self, name, **fields):
+        self.store.log({"event": name, "status": name.lower(), **fields})
 
     def progress(self, stage, **fields):
-        fields.setdefault("repairs_used", len(list((self.store.path / "repair-validation").glob("*.json"))))
-        if self.pairs:
-            finalized = sum(
-                self.store.read(f"chapters/{chapter.key}.json") is not None
-                for chapter, _ in self.pairs
-            )
-            fields.setdefault("total_chapters", len(self.pairs))
-            fields.setdefault("completed_chapters", finalized)
-            fields.setdefault("chapters_finalized", finalized)
-        if self.chunks:
-            total_chunks = sum(len(chunks) for chunks in self.chunks.values())
-            finalized_chunks = sum(
-                len(list(self.store.path.glob(f"chunks/{key}-*.json")))
-                for key in self.chunks
-            )
-            fields.setdefault("chunks_total", total_chunks)
-            fields.setdefault("chunks_finalized", finalized_chunks)
-        active = fields.get("active_chapters", self.activity)
-        if active:
-            key, value = sorted(active.items())[0]
-            fields.setdefault("current_chapter", key)
-            fields.setdefault("current_chunk", value.get("chunk"))
-            fields.setdefault("current_chunk_total", value.get("chunks"))
-        elif stage == "Translating":
-            fields.setdefault("current_chapter", None)
-            fields.setdefault("current_chunk", None)
-            fields.setdefault("current_chunk_total", None)
+        complete = sum(self.store.read(f"chapters/{chapter.key}.json") is not None
+                       for chapter in self.chapters)
         self.store.progress(
-            stage=stage, request_statistics=self.store.request_statistics(), **fields
+            "running", stage=stage, total_chapters=len(self.chapters),
+            completed_chapters=complete, chapters_finalized=complete,
+            request_statistics=self.store.request_statistics(), **fields,
         )
 
-    @staticmethod
-    def _chapter_value(key):
-        if isinstance(key, int):
-            return key
-        if isinstance(key, str) and key.isdigit():
-            return int(key)
-        return key
-
-    @staticmethod
-    def _ignored_reason_code(record):
-        reason = str(record.get("reason", "")).casefold()
-        classification = str(
-            record.get("entity_class", record.get("classification", ""))
-        ).casefold()
-        if classification in {"generic", "common_noun", "generic_phrase", "verb_phrase", "descriptive_phrase"}:
-            return "generic"
-        if "quantity" in reason or "numeric" in reason:
-            return "quantity"
-        if "malformed" in reason or "leading aspect" in reason or classification == "malformed":
-            return "malformed"
-        if "contextual" in reason or "residue" in reason:
-            return "contextual_residue"
-        if "truncated" in reason:
-            return "truncated_identity"
-        if "competing" in reason:
-            return "competing_identity"
-        if "insufficient" in reason or "unproven" in reason or "owner proof" in reason:
-            return "insufficient_identity_evidence"
-        if "identity requires proof" in reason or "surname plus title" in reason or "title/reference" in reason:
-            return "insufficient_identity_evidence"
-        if "contained lexical" in reason:
-            return "contained_lexical_fragment"
-        if "register" in reason:
-            return "register_inconsistency"
-        if "unknown" in reason or "unrecognized" in reason:
-            return "unknown_reference_form"
-        if "unconfirmed" in reason or "class-specific" in reason:
-            return "unconfirmed_entity"
-        return "other"
-
-    def _ignored_evidence(self, source, record):
-        candidate = self.index.get("candidates", {}).get(source) or self.index.get(
-            "report_only", {}
-        ).get(source, {})
-        raw_items = record.get("evidence") or candidate.get("representative_evidence", [])
-        if not raw_items:
-            raw_items = []
-            units = self.index.get("units", [])
-            for occurrence in candidate.get("occurrences", []):
-                unit_id = occurrence.get("unit")
-                if not isinstance(unit_id, int) or not (0 <= unit_id < len(units)):
-                    continue
-                unit = units[unit_id]
-                positions = occurrence.get("positions") or [unit.get("raw", "").find(source)]
-                position = positions[0] if positions else 0
-                raw_text = unit.get("raw", "")
-                raw_items.append(
-                    {
-                        "chapter": unit.get("chapter_key"),
-                        "raw": raw_text[max(0, position - 120) : position + len(source) + 240],
-                    }
-                )
-        result, seen = [], set()
-        for item in raw_items if isinstance(raw_items, list) else []:
-            if not isinstance(item, dict):
-                continue
-            excerpt = item.get("raw_excerpt") or item.get("raw") or ""
-            if not excerpt:
-                continue
-            excerpt = str(excerpt)[:600]
-            chapter = item.get("chapter")
-            if chapter is None and item.get("unit") is not None:
-                units = self.index.get("units", [])
-                if 0 <= item["unit"] < len(units):
-                    chapter = units[item["unit"]].get("chapter_key")
-            key = (chapter, excerpt)
-            if key in seen:
-                continue
-            seen.add(key)
-            result.append(
-                {"chapter": self._chapter_value(chapter), "raw_excerpt": excerpt}
-            )
-            if len(result) >= 3:
-                break
-        return result
-
-    def ignored_dictionary(self, complete=False, batch_status=None):
-        inputs = self.store.read("inputs.json", {}) or {}
-        records = []
-        for source, raw_record in self.ignored.items():
-            record = dict(raw_record)
-            candidate = self.index.get("candidates", {}).get(source) or self.index.get(
-                "report_only", {}
-            ).get(source, {})
-            evidence = self._ignored_evidence(source, record)
-            chapters = sorted(
-                {
-                    item["chapter"]
-                    for item in evidence
-                    if item.get("chapter") is not None
-                },
-                key=lambda value: (isinstance(value, str), str(value)),
-            )
-            if not chapters:
-                units = self.index.get("units", [])
-                chapters = sorted(
-                    {
-                        self._chapter_value(units[item["unit"]].get("chapter_key"))
-                        for item in candidate.get("occurrences", [])
-                        if isinstance(item.get("unit"), int)
-                        and 0 <= item["unit"] < len(units)
-                    },
-                    key=lambda value: (isinstance(value, str), str(value)),
-                )
-            occurrences = record.get("raw_occurrences", candidate.get("frequency", 0))
-            proposed_translation = record.get("proposed_translation") or candidate.get(
-                "dominant_translation"
-            )
-            competing = sorted(set(record.get("competing_identities", [])))
-            records.append(
-                {
-                    "source": source,
-                    "decision": "IGNORED",
-                    "reason_code": self._ignored_reason_code(record),
-                    "reason": record.get("reason", "Candidate was not confirmed"),
-                    "candidate_type": record.get(
-                        "entity_class", record.get("classification", "unknown")
-                    ),
-                    "proposed_entity_type": record.get(
-                        "entity_class", record.get("classification", "unknown")
-                    ),
-                    "proposed_canonical": record.get("proposed_canonical"),
-                    "proposed_translation": proposed_translation,
-                    "occurrence_count": occurrences,
-                    "chapters": chapters,
-                    "evidence": evidence,
-                    "competing_identities": competing,
-                    "resolver_used": bool(
-                        record.get("resolver_used", source in self.index.get("candidates", {}))
-                    ),
-                    "manual_review": {
-                        "status": "unreviewed",
-                        "action": None,
-                        "notes": None,
-                    },
-                }
-            )
-        records.sort(key=lambda item: (item["candidate_type"], item["reason_code"], item["source"]))
-        counts = Counter(item["reason_code"] for item in records)
-        summary = {
-            "total_ignored": len(records),
-            "generic": counts["generic"],
-            "quantity": counts["quantity"],
-            "malformed": counts["malformed"],
-            "contextual_residue": counts["contextual_residue"],
-            "insufficient_identity_evidence": counts["insufficient_identity_evidence"],
-            "competing_identity": counts["competing_identity"],
-            "other": sum(
-                count
-                for code, count in counts.items()
-                if code
-                not in {
-                    "generic",
-                    "quantity",
-                    "malformed",
-                    "contextual_residue",
-                    "insufficient_identity_evidence",
-                    "competing_identity",
-                }
-            ),
-        }
-        keys = [chapter.number for chapter, _ in self.pairs]
-        source_name = inputs.get("book_title") or inputs.get("source_name")
+    def _operation(self, event):
         return {
-            "version": IGNORED_DICTIONARY_VERSION,
-            "pipeline_version": PIPELINE_VERSION,
-            "dictionary_version": DICTIONARY_VERSION,
-            "available": self.ignored_source_available,
-            "complete": complete and self.ignored_source_available,
-            "batch_status": (
-                (batch_status or ("DONE" if complete else "RUNNING"))
-                if self.ignored_source_available
-                else "UNAVAILABLE"
-            ),
-            "source": {
-                "book": source_name,
-                "chapter_start": min(keys) if keys else None,
-                "chapter_end": max(keys) if keys else None,
-            },
-            "register": self.address_register,
-            "generated_at": datetime.now(timezone.utc).isoformat(),
-            "summary": summary,
-            "candidates": records,
-        }
+            "PRE_DICTIONARY_REQUEST": "pre_dictionary",
+            "POST_DICTIONARY_REQUEST": "post_dictionary",
+            "TRANSLATION_REQUEST": "translation",
+            "QA_REQUEST": "qa",
+            "REPAIR_REQUEST": "repair",
+        }[event]
 
-    def write_ignored_dictionary(self, complete=False, batch_status=None):
-        self.store.write(
-            "ignored_dictionary.json",
-            self.ignored_dictionary(complete=complete, batch_status=batch_status),
-        )
+    def _guard_requests(self):
+        statistics = self.store.request_statistics()
+        count = statistics["logical_call_count"]
+        translation_calls = statistics["by_operation"].get("translation", {}).get("logical_calls", 0)
+        repair_calls = statistics["by_operation"].get("repair", {}).get("logical_calls", 0)
+        if (translation_calls and repair_calls > translation_calls
+                and self.store.read("request-warning.json", {}).get("code") != "REPAIR_VOLUME_ANOMALY"):
+            self.store.write("request-warning.json", {
+                "code": "REPAIR_VOLUME_ANOMALY", "severity": "severe",
+                "logical_calls": count, "breakdown": statistics["by_operation"],
+            })
+            self.event("REQUEST_BUDGET_ANOMALY", logical_calls=count,
+                       breakdown=statistics["by_operation"], severity="severe",
+                       reason="Repair calls exceed translation calls")
+        warning = int(os.getenv("TRANSLATION_WARNING_LOGICAL_CALLS",
+                                str(max(20, 10 * len(self.chapters)))))
+        hard = int(os.getenv("TRANSLATION_HARD_LOGICAL_CALLS",
+                             str(max(30, 15 * len(self.chapters)))))
+        if count == warning:
+            self.store.write("request-warning.json", {
+                "code": "REQUEST_BUDGET_ANOMALY", "severity": "warning",
+                "logical_calls": count,
+                "breakdown": self.store.request_statistics()["by_operation"],
+            })
+            self.event("REQUEST_BUDGET_ANOMALY", logical_calls=count,
+                       breakdown=self.store.request_statistics()["by_operation"], severity="warning")
+        if count >= hard:
+            self.store.write("request-warning.json", {
+                "code": "REQUEST_BUDGET_ANOMALY", "severity": "fatal",
+                "logical_calls": count,
+                "breakdown": self.store.request_statistics()["by_operation"],
+            })
+            self.event("REQUEST_BUDGET_ANOMALY", logical_calls=count,
+                       breakdown=self.store.request_statistics()["by_operation"], severity="fatal")
+            raise QualityError(f"Request budget exceeded: {count} semantic logical calls")
 
-    def local(self, operation, message):
-        self.store.log(
-            {
-                "status": "local_success",
-                "operation": operation,
-                "ai_requests": 0,
-                "message": message,
-            }
-        )
+    def _fingerprint(self, operation, policy, payload, schema, requested_model):
+        return digest({
+            "operation": operation,
+            "policy_version": prompts.POLICY_VERSIONS[operation],
+            "policy": policy,
+            "payload": payload,
+            "schema": schema.model_json_schema(),
+            "requested_model": requested_model,
+            "thinking_budget": os.getenv("TRANSLATION_THINKING_BUDGET"),
+            "context_strategy": "previous-4-next-1-adaptive-v2",
+        })
 
-    async def ai(
-        self,
-        task,
-        instruction,
-        payload,
-        schema,
-        operation="terminology_resolver",
-        reason="Translation pipeline operation",
-    ):
-        key = digest(
-            {
-                "task": task,
-                "instruction": instruction,
-                "payload": payload,
-                "schema": schema.model_json_schema(),
-                "pipeline_version": PIPELINE_VERSION,
-                "models": MODELS,
-            }
-        )
-        self.cache_keys.setdefault(task, set()).add(key)
-        cached = self.store.read(f"cache/{key}.json")
-        if cached is not None:
-            self.store.account(operation, "cache_hits")
-            self.store.diagnostic(
-                {
-                    "task": task,
-                    "operation": operation,
-                    "status": "cached",
-                    "message": "Reused completed model response",
-                }
-            )
-            return schema.model_validate(cached)
-
+    async def request(self, event, policy, payload, schema, chapter=None,
+                      requested_model=None, cache=False):
+        operation = self._operation(event)
+        requested_model = requested_model or (FALLBACK_MODEL if operation in ("qa", "repair")
+                                             else PRIMARY_MODEL)
+        fingerprint = self._fingerprint(operation, policy, payload, schema, requested_model)
+        if cache:
+            saved = self.store.cache_get(fingerprint)
+            if saved:
+                parsed = schema.model_validate(saved["value"])
+                object.__setattr__(parsed, "_request_meta", saved.get("metadata", {}))
+                self.store.account(operation, "cache_hit")
+                self.store.chapter_account(chapter, operation, "cache_hit")
+                self.event("CACHE_HIT", operation=operation, chapter=chapter,
+                           fingerprint=fingerprint)
+                return parsed
+        self._guard_requests()
         self.store.account(operation, "logical")
-        previous_model = None
+        self.store.chapter_account(chapter, operation, "logical")
+        raw_value = payload.get("raw", [])
+        raw_chars = sum(len(item.get("text", "")) for item in raw_value) if isinstance(raw_value, list) else len(str(raw_value))
+        relevant = payload.get("dictionary", payload.get("locked_dictionary", []))
+        self.event(event, chapter=chapter, requested_model=requested_model,
+                   raw_chars=raw_chars, dictionary_entry_count=len(relevant),
+                   alias_count=sum(len(item.get("aliases", [])) for item in relevant),
+                   raw_ids=[item.get("id") for item in raw_value] if isinstance(raw_value, list) else [])
 
         def record(metadata):
-            nonlocal previous_model
-            if metadata["status"] == "running":
-                fallback = (
-                    metadata["model"] != previous_model
-                    if previous_model
-                    else metadata["model"] != MODELS[0]
-                )
-                self.store.account(operation, "running", model_fallback=fallback)
-                if metadata.get("retry_count", 0):
-                    self.store.account(operation, "retry")
-                previous_model = metadata["model"]
-            self.store.diagnostic(
-                {"task": task, "operation": operation, "reason": reason, **metadata}
-            )
+            status = metadata.get("status")
+            if status == "running":
+                attempt_count = self.store.request_statistics()["api_attempt_count"]
+                attempt_hard = int(os.getenv("TRANSLATION_HARD_API_ATTEMPTS",
+                                              str(max(60, 30 * len(self.chapters)))))
+                if attempt_count >= attempt_hard:
+                    self.store.write("request-warning.json", {
+                        "code": "REQUEST_BUDGET_ANOMALY", "severity": "fatal",
+                        "logical_calls": self.store.request_statistics()["logical_call_count"],
+                        "api_attempts": attempt_count,
+                        "breakdown": self.store.request_statistics()["by_operation"],
+                    })
+                    self.event("REQUEST_BUDGET_ANOMALY", api_attempts=attempt_count,
+                               severity="fatal", reason="API attempt guard exceeded")
+                    raise QualityError(f"API attempt budget exceeded: {attempt_count}")
+                self.store.account(operation, "attempt")
+                self.store.chapter_account(chapter, operation, "attempt", metadata.get("model"))
+                if metadata.get("technical_retry"):
+                    self.store.account(operation, "technical_retry")
+                    self.store.chapter_account(chapter, operation, "technical_retry")
+                if metadata.get("key_rotated"):
+                    self.event("KEY_ROTATION", chapter=chapter, operation=operation,
+                               actual_model=metadata.get("model"), key_slot=metadata.get("key_slot"))
+                if metadata.get("model_fallback_started"):
+                    self.store.account(operation, "fallback")
+                    self.store.chapter_account(chapter, operation, "fallback")
+                    self.event("MODEL_FALLBACK", chapter=chapter, operation=operation,
+                               from_model=requested_model, to_model=metadata.get("model"))
+            elif status == "retrying":
+                self.event("TECHNICAL_RETRY", chapter=chapter, operation=operation,
+                           actual_model=metadata.get("model"), attempt=metadata.get("attempt"))
+            elif status == "daily_quota_disabled":
+                self.event("DAILY_QUOTA_DISABLED", chapter=chapter, operation=operation,
+                           actual_model=metadata.get("model"), key_slot=metadata.get("key_slot"))
+            elif status == "rate_limit_cooldown":
+                self.event("RATE_LIMIT_COOLDOWN", chapter=chapter, operation=operation,
+                           actual_model=metadata.get("model"), key_slot=metadata.get("key_slot"),
+                           retry_after=metadata.get("retry_after"))
+            self.store.diagnostic({"event": event, "operation": operation, "chapter": chapter,
+                                   "requested_model": requested_model,
+                                   "actual_model": metadata.get("model"), **metadata})
 
-        result = await self.scheduler.request(instruction, payload, schema, record)
-        self.store.write(f"cache/{key}.json", result.model_dump())
+        result = await self.scheduler.request(policy, payload, schema, record,
+                                              requested_model=requested_model,
+                                              allow_fallback=requested_model == PRIMARY_MODEL)
+        if cache:
+            self.store.cache_put(fingerprint, result.model_dump(),
+                                 getattr(result, "_request_meta", {}))
         return result
 
-    def fail(self, task, message):
-        raise QualityError(message)
-
-    async def parallel(self, items, function):
-        iterator = iter(items)
-
-        async def worker():
-            for item in iterator:
-                await function(item)
-
-        tasks = [asyncio.create_task(worker()) for _ in range(self.scheduler.concurrency)]
-        try:
-            await asyncio.gather(*tasks)
-        finally:
-            for task in tasks:
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(*tasks, return_exceptions=True)
-
-    async def align(self, pair):
-        raw, vp = pair
-        saved = self.store.read(f"alignment/{raw.key}.json")
-        alignment = Alignment.model_validate(saved) if saved else deterministic_alignment(raw, vp)
-        proven = deterministic_alignment(raw, vp)
-        if alignment != proven:
-            raise QualityError(f"Invalid structural alignment checkpoint for {raw.key}")
-        self.alignments[raw.key] = alignment
-        self.chunks[raw.key] = make_chunks(alignment, raw, vp)
-        if not saved:
-            self.store.write(f"alignment/{raw.key}.json", alignment.model_dump())
-        self.progress(
-            "Local chapter alignment",
-            aligned=len(self.alignments),
-            total_chapters=len(self.pairs),
-        )
-
-    def occurrences(self, source):
-        result = []
-        for raw, vp in self.pairs:
-            if source in raw.title:
-                result.append(
-                    {
-                        **chapter_identity(raw, "chapter"),
-                        "paragraph_ids": [-1],
-                        "count": raw.title.count(source),
-                        "raw": [raw.title],
-                        "vp": [vp.title],
-                    }
-                )
-            for group in self.alignments[raw.key].groups:
-                matching = [index for index in group.raw if source in raw.paragraphs[index]]
-                if matching:
-                    result.append(
-                        {
-                            **chapter_identity(raw, "chapter"),
-                            "paragraph_ids": matching,
-                            "count": sum(raw.paragraphs[index].count(source) for index in matching),
-                            "raw": [raw.paragraphs[index] for index in group.raw],
-                            "vp": [vp.paragraphs[index] for index in group.vp],
-                        }
-                    )
-        return result
-
-    def known_source(self, source):
-        return any(
-            source in [term.source, *term.aliases, *term.forms]
-            for term in self.terms.values()
-        )
-
-    def source_issue(self, source, inherited=None):
-        problem = source_problem(source, self.terms)
-        if problem:
-            return problem
-        if inherited and source in [inherited.source, *inherited.aliases, *inherited.forms]:
-            return None
-        return quantity_source_problem(
-            source,
-            (text for raw, _ in self.pairs for text in [raw.title, *raw.paragraphs]),
-        )
-
-    def resolver_payload(self, source):
-        candidate = self.index.get("candidates", {}).get(source, {})
-        inherited = next(
-            (
-                term
-                for term in self.terms.values()
-                if source in [term.source, *term.aliases, *term.forms]
-            ),
-            None,
-        )
-        payload = {
-            "source": source,
-            "entity_class": candidate.get("entity_class", "unknown"),
-            "entity_policy": ENTITY_CLASS_POLICIES.get(
-                candidate.get("entity_class", "unknown"), {}
-            ),
-            "candidate_shape": candidate.get("shape"),
-            "frequency": candidate.get("frequency", 0),
-            "signals": candidate.get("reasons", []),
-            "vietphrase_evidence": candidate.get("vietphrase_variants", {}),
-            "representative_evidence": candidate.get("representative_evidence", []),
-            "class_evidence": candidate.get(
-                "class_evidence", class_confirmation(candidate)
-            ),
-            "inherited_confirmed": inherited.model_dump() if inherited else None,
-        }
-        # A title/kinship/address shape is not a character identity: tell the
-        # resolver its class and the register it must render it in.
-        address = style.address_payload(
-            source,
-            inherited.source if inherited else "",
-            inherited.translation if inherited else "",
-            self.address_register,
-            self.evidence_contexts(source),
-        )
-        if address:
-            payload["address_form"] = address
-        return payload
-
-    def evidence_contexts(self, source):
-        """Bounded RAW windows already selected for one candidate (no rescan)."""
-        candidate = self.index.get("candidates", {}).get(source, {})
-        return [
-            item.get("raw", "")
-            for item in candidate.get("representative_evidence", [])
-            if item.get("raw")
-        ]
-
-    def competing_identities(self, candidate, canonical):
-        """Find other confirmed/person-shaped owners for a surname reference."""
-        spec = style.address_spec(candidate)
-        surname = spec.get("surname") if spec else ""
-        if not surname:
-            return []
-        possible = set()
-        for term in self.terms.values():
-            if (
-                term.source != canonical
-                and term.type in {"character", "character_form"}
-                and term.source.startswith(surname)
-            ):
-                possible.add(term.source)
-        for source, record in self.index.get("candidates", {}).items():
-            if (
-                source != canonical
-                and source != candidate
-                and source.startswith(surname)
-                and "person_name_pattern" in record.get("reasons", [])
-            ):
-                possible.add(source)
-        return sorted(possible)
-
-    def ignore(self, source, reason, **extra):
-        candidate = self.index.get("candidates", {}).get(source) or self.index.get(
-            "report_only", {}
-        ).get(source, {})
-        extra.setdefault("raw_occurrences", candidate.get("frequency", 0))
-        extra.setdefault("resolver_used", source in self.index.get("candidates", {}))
-        extra.setdefault(
-            "entity_class",
-            candidate.get("entity_class", candidate.get("classification", "unknown")),
-        )
-        record = {"source": source, "state": "IGNORE", "reason": reason, **extra}
-        self.ignored[source] = record
-        if extra.get("candidate_shape") or extra.get("evidence_types") or extra.get(
-            "competing_identities"
-        ):
-            key = (
-                source,
-                extra.get("candidate_shape", ""),
-                reason,
-                tuple(extra.get("competing_identities", ())),
-            )
-            if not any(item.get("_key") == key for item in self.reference_audit):
-                self.reference_audit.append({**record, "_key": key})
-                self.store.write(
-                    "character-reference-audit.json",
-                    {
-                        "entries": [
-                            {key: value for key, value in item.items() if key != "_key"}
-                            for item in self.reference_audit
-                        ]
-                    },
-                )
-        self.store.write(f"term-audit/{digest(source)}.json", record)
-
-    def raw_contexts(self):
-        # Called once per confirmed term by the register guard, so the whole
-        # batch's paragraphs are collected at most once.
-        if self._raw_contexts is None:
-            self._raw_contexts = [
-                text
-                for raw, _ in self.pairs
-                for text in [raw.title, *raw.paragraphs]
-            ]
-        return self._raw_contexts
-
-    def record_form_cleanup(self, problems):
-        cleanup = [
-            problem
-            for problem in problems
-            if problem.get("classification") == "form_cleanup"
-        ]
-        if not cleanup:
+    async def resolve(self, candidates, phase, start_offset=0):
+        if not candidates:
             return
-        self.form_cleanup.extend(cleanup)
-        removed = sum(len(item.get("removed_forms", [])) for item in self.form_cleanup)
-        preserved = sum(len(item.get("preserved_forms", [])) for item in self.form_cleanup)
-        self.store.write("dictionary-form-cleanup.json", {"entries": self.form_cleanup})
-        self.local(
-            "dictionary_form_cleanup",
-            f"Removed contextual pseudo-forms: {removed}; preserved identity forms: {preserved}",
-        )
-
-    def record_register_cleanup(self, problems):
-        """Audit address/title forms that were normalized or dropped locally."""
-        cleanup = [
-            problem
-            for problem in problems
-            if problem.get("classification") == "register_form_cleanup"
-        ]
-        if not cleanup:
-            return
-        self.register_cleanup.extend(cleanup)
-        normalized = sum(len(item.get("normalizations", [])) for item in cleanup)
-        removed = sum(len(item.get("removed_forms", [])) for item in cleanup)
-        self.store.write(
-            "dictionary-register-cleanup.json", {"entries": self.register_cleanup}
-        )
-        self.local(
-            "dictionary_register_cleanup",
-            f"Register {self.address_register}: normalized forms={normalized}; removed forms={removed}",
-        )
-
-    def refresh_style(self):
-        """Derive the batch address/title register from confirmed terminology."""
-        stored = style.stored_register(
-            self.store.read("frozen-dictionary.json"),
-            self.terms.values(),
-        )
-        self.style_profile = style.profile(
-            self.terms.values(),
-            self.policy.min_register_evidence,
-            self.policy.min_register_dominance,
-        )
-        if stored in (style.SINO_VIETNAMESE, style.MODERN):
-            self.address_register, self.address_register_source = stored, "stored"
-        else:
-            self.address_register, self.address_register_source = style.effective_register(
-                self.policy.address_register, self.style_profile
-            )
-        self.style_profile["register"] = self.address_register
-        self.style_profile["source"] = self.address_register_source
-        self.store.write("dictionary-style-profile.json", self.style_profile)
-        return self.style_profile
-
-    def apply_register_policy(self, term, reason):
-        """Normalize or drop address forms that contradict the batch register."""
-        normalizations, removed = normalize_term_register(
-            term, self.address_register, self.evidence_contexts(term.source)
-        )
-        if not normalizations and not removed:
-            return
-        self.record_register_cleanup(
-            [
-                {
-                    "classification": "register_form_cleanup",
-                    "source": term.source,
-                    "register": self.address_register,
-                    "normalizations": normalizations,
-                    "removed_forms": removed,
-                    "preserved_forms": sorted(term.forms),
-                    "reason": reason,
-                }
-            ]
-        )
-
-    def apply_resolution(self, source, inherited, result):
-        """Install only a complete ACCEPT result; all uncertainty is IGNORE."""
-        if self.frozen_hash is not None:
-            raise QualityError("Cannot mutate the frozen batch dictionary")
-        self.store.write(f"resolution/{digest(source)}.json", result.model_dump())
-        if result.decision in {"IGNORE", "REVIEW", "REJECT"} or result.term is None:
-            return None
-        failed = [
-            name for name, passed in result.eligibility.model_dump().items() if not passed
-        ]
-        if failed:
-            self.ignore(source, "failed eligibility gates", failed_gates=failed)
-            return None
-        if result.term.type == "character_alias":
-            raise QualityError("character_alias cannot be a canonical dictionary identity")
-        try:
-            term = Term.model_validate(result.term.model_dump())
-        except (ValueError, TypeError) as exc:
-            raise QualityError(f"Invalid resolver metadata: {exc}") from exc
-
-        candidate = self.index.get("candidates", {}).get(source, {})
-        entity_class = candidate.get("entity_class", "unknown")
-        raw_texts = self.raw_contexts()
-
-        def attested_entity_evidence(value):
-            if isinstance(value, dict):
-                return any(attested_entity_evidence(item) for item in value.values())
-            if isinstance(value, (list, tuple)):
-                return any(attested_entity_evidence(item) for item in value)
-            return (
-                isinstance(value, str)
-                and len(value) >= 2
-                and source in value
-                and any(value in text for text in raw_texts)
-            )
-
-        character_like = term.type in {"character", "character_form"} or entity_class in {
-            "character",
-            "character_reference",
-        }
-        if entity_class in {"generic", "malformed"}:
-            self.ignore(
-                source,
-                "generic_or_malformed_candidate",
-                entity_class=entity_class,
-            )
-            return None
-        if entity_class not in {"character", "character_reference", "unknown", "proper_noun"} and term.type in {
-            "character",
-            "character_form",
-        }:
-            self.ignore(
-                source,
-                "resolver class contradicts local non-character classification",
-                entity_class=entity_class,
-                returned_type=term.type,
-            )
-            return None
-        if entity_class in {"character", "character_reference"} and term.type not in {
-            "character",
-            "character_form",
-        }:
-            self.ignore(
-                source,
-                "resolver returned a non-character class for a character candidate",
-                entity_class=entity_class,
-                returned_type=term.type,
-            )
-            return None
-        if not character_like:
-            term.entity_evidence = {
-                **result.entity_evidence,
-                **term.entity_evidence,
-            }
-            evidence = candidate.get("class_evidence") or class_confirmation(
-                candidate, entity_class
-            )
-            if not evidence.get("confirmed") and attested_entity_evidence(
-                term.entity_evidence
-            ):
-                evidence = {
-                    "confirmed": True,
-                    "reason": "resolver_class_evidence_attested_in_raw",
-                    "evidence": term.entity_evidence,
-                }
-            if not evidence.get("confirmed"):
-                self.ignore(
-                    source,
-                    evidence.get("reason", "insufficient class-specific evidence"),
-                    entity_class=entity_class,
-                    entity_evidence=evidence.get("evidence", {}),
-                )
-                return None
-            expected_type = ENTITY_CLASS_POLICIES.get(entity_class, {}).get("term_type")
-            if expected_type and term.type in {"unknown", "proper_noun", "other_term"}:
-                term.type = expected_type
-            term.entity_evidence = {
-                **term.entity_evidence,
-                **evidence.get("evidence", {}),
-            }
-
-        term.status = "locked"
-        term.enforceable = True
-        term.semantic_resolution = "resolved"
-        term.needs_review = False
-        term.resolution_reason = None
-        term.runtime_state = "CONFIRMED"
-        result_evidence = [*result.identity_evidence, *result.evidence]
-        term.identity_evidence = list(
-            {record.model_dump_json(): record for record in [*term.identity_evidence, *result_evidence]}.values()
-        )
-        term.evidence_types = sorted(
-            set(term.evidence_types)
-            | set(result.evidence_types)
-            | {record.type for record in term.identity_evidence}
-        )
-        term.competing_identities = sorted(
-            set(term.competing_identities) | set(result.competing_identities)
-        )
-        if not term.evidence and term.identity_evidence:
-            term.evidence = "\n".join(
-                record.raw_excerpt
-                for record in term.identity_evidence
-                if record.raw_excerpt
-            )
-        term.aliases = sorted(set(alias for alias in term.aliases if alias != term.source))
-        original_source = term.source
-        original_translation = term.translation
-        original_form_translation = term.forms.get(original_source, original_translation)
-        term.forms.pop(term.source, None)
-        def raw_attested(name):
-            return any(name in text for text in raw_texts)
-
-        prefix_spec = style.address_spec(original_source) if character_like else None
-        original_prefix_parts = (
-            style.title_prefix_parts(original_source) if character_like else None
-        )
-        if character_like and original_prefix_parts and term.source == original_source:
-            prefix, person = original_prefix_parts
-            if any(
-                reference.startswith(prefix + person)
-                and len(reference) > len(original_source)
-                and raw_attested(reference)
-                for reference in self.index.get("candidates", {})
-            ):
-                raise QualityError(
-                    f"truncated title-prefixed canonical extraction {original_source}"
-                )
-        if character_like and prefix_spec and prefix_spec.get("prefix_reference") and term.source == source:
-            prefix_parts = original_prefix_parts
-            raw_proven = raw_attested(original_source)
-            if not prefix_parts or not raw_proven:
-                raise QualityError(
-                    f"title-prefixed reference {original_source} lacks RAW identity evidence"
-                )
-            prefix_words = prefix_spec["honorific"].casefold().split()
-            translated_words = original_translation.split()
-            if [word.casefold() for word in translated_words[: len(prefix_words)]] != prefix_words:
-                raise QualityError(
-                    f"cannot derive canonical translation from title-prefixed source {original_source}"
-                )
-            canonical_translation = " ".join(translated_words[len(prefix_words) :]).strip()
-            if not canonical_translation:
-                raise QualityError(
-                    f"title-prefixed source {original_source} has no full personal translation"
-                )
-            term.source = prefix_parts[1]
-            term.translation = canonical_translation
-            term.forms[original_source] = original_form_translation
-        elif character_like and original_prefix_parts and term.source == original_prefix_parts[1]:
-            # The resolver may return the correct canonical identity directly
-            # instead of echoing the title-prefixed candidate as ``term.source``.
-            if not raw_attested(original_source):
-                raise QualityError(
-                    f"title-prefixed reference {original_source} lacks RAW identity evidence"
-                )
-            term.forms.setdefault(
-                original_source,
-                style.preferred_form(
-                    original_source,
-                    term.source,
-                    term.translation,
-                    prefix_spec,
-                )
-                or original_form_translation,
-            )
-        migrated_title_source = False
-        title_parts = style.title_prefix_parts(source) if character_like else None
-        if title_parts:
-            prefix, partial_person = title_parts
-            longer_reference = any(
-                reference.startswith(prefix + partial_person)
-                and len(reference) > len(source)
-                and raw_attested(reference)
-                for reference in self.index.get("candidates", {})
-            )
-            if term.source == partial_person and longer_reference:
-                raise QualityError(
-                    f"truncated title-prefixed canonical extraction {source}"
-                )
-            if term.source == partial_person and raw_attested(source):
-                term.forms.setdefault(
-                    source,
-                    style.preferred_form(
-                        source,
-                        term.source,
-                        term.translation,
-                        style.address_spec(source, term.source),
-                    )
-                    or original_form_translation,
-                )
-                migrated_title_source = True
-            elif term.source.startswith(partial_person) and len(term.source) > len(partial_person):
-                full_form = prefix + term.source
-                raw_proven = raw_attested(full_form)
-                proven = raw_proven
-                if not proven:
-                    raise QualityError(
-                        f"unproven title-prefixed canonical extraction {source}"
-                    )
-                term.forms.setdefault(
-                    full_form,
-                    style.preferred_form(
-                        full_form,
-                        term.source,
-                        term.translation,
-                        style.address_spec(full_form, term.source),
-                    )
-                    or term.translation,
-                )
-                migrated_title_source = True
-        if (
-            term.source != source
-            and source not in [*term.aliases, *term.forms]
-            and not migrated_title_source
-        ):
-            raise QualityError(f"Resolver lost source term {source}")
-        # A surname-prefixed address form is a reference to a person, never a
-        # person: 唐姐 must be attached to 唐菲菲, not created as its own
-        # character.  Bare nicknames (老秦) and bare titles stay eligible
-        # because they can be the only attested way a character is named.
-        spec = style.address_spec(source) if character_like else None
-        if character_like and spec and spec["surname"] and term.source == source:
-            raise QualityError(
-                f"address form {source} cannot be a canonical identity; "
-                "attach it to the proven full name"
-            )
-        if character_like and (
-            spec
-            and spec.get("suffix")
-            and not spec.get("surname")
-            and term.source == source
-        ):
-            raise QualityError(
-                f"role-only reference {source} cannot be a canonical identity"
-            )
-
-        inherited_names = (
-            [inherited.source, *inherited.aliases, *inherited.forms] if inherited else []
-        )
-
-        # Vet every resolver-proposed reference before it can enter the
-        # confirmed namespace.  Unknown or weakly supported candidates are
-        # report-only; only contradictions among already-confirmed mappings
-        # remain fatal.
-        reference_audit = []
-        if term.type in {"character", "character_form"}:
-            if source != term.source:
-                evidence_candidate = source
-                source_parts = style.title_prefix_parts(source)
-                if (
-                    source_parts
-                    and term.source.startswith(source_parts[1])
-                    and len(term.source) > len(source_parts[1])
-                ):
-                    # The resolver repaired a title-prefix truncation.  Vet
-                    # the complete RAW expression, never the malformed key.
-                    evidence_candidate = source_parts[0] + term.source
-                competing = sorted(
-                    set(term.competing_identities)
-                    | set(self.competing_identities(source, term.source))
-                )
-                decision = evaluate_reference_evidence(
-                    evidence_candidate,
-                    term.source,
-                    raw_texts,
-                    term.identity_evidence,
-                    term.evidence_types,
-                    competing,
-                )
-                if not decision["confirmed"]:
-                    self.ignore(
-                        source,
-                        decision["reason"],
-                        proposed_canonical=term.source,
-                        candidate_shape=decision["shape"],
-                        evidence_types=decision["evidence_types"],
-                        competing_identities=decision["competing_identities"],
-                    )
-                    return None
-                term.candidate_shape = decision["shape"]
-                term.identity_evidence = list(
-                    {record.model_dump_json(): record for record in [*term.identity_evidence, *decision["evidence"]]}.values()
-                )
-                term.evidence_types = sorted(
-                    set(term.evidence_types) | set(decision["evidence_types"])
-                )
-                term.competing_identities = decision["competing_identities"]
-                if not term.evidence:
-                    term.evidence = "\n".join(
-                        record.raw_excerpt
-                        for record in term.identity_evidence
-                        if record.raw_excerpt
-                    )
-            for name in list(term.forms):
-                competing = sorted(
-                    set(term.competing_identities)
-                    | set(self.competing_identities(name, term.source))
-                )
-                decision = evaluate_reference_evidence(
-                    name,
-                    term.source,
-                    raw_texts,
-                    term.identity_evidence,
-                    term.evidence_types,
-                    competing,
-                )
-                if not decision["confirmed"]:
-                    reference_audit.append(
-                        {
-                            "source": name,
-                            "reason": decision["reason"],
-                            "candidate_shape": decision["shape"],
-                            "evidence_types": decision["evidence_types"],
-                        }
-                    )
-                    term.forms.pop(name, None)
-                else:
-                    spec = style.address_spec(name, term.source, raw_texts)
-                    if spec:
-                        term.form_kinds[name] = spec["kind"]
-        if reference_audit:
-            self.store.write(
-                f"term-audit/{digest(term.source)}-forms.json",
-                {"source": term.source, "state": "CONFIRMED", "removed_forms": reference_audit},
-            )
-
-        removed, preserved = clean_identity_forms(
-            term,
-            raw_texts,
-            require_evidence=True,
-        )
-        removed.extend(
-            {
-                "source": item["source"],
-                "reason": item["reason"],
-                "field": "forms",
-            }
-            for item in reference_audit
-        )
-        if removed:
-            self.record_form_cleanup(
-                [
-                    {
-                        "classification": "form_cleanup",
-                        "source": term.source,
-                        "removed_forms": removed,
-                        "preserved_forms": preserved,
-                        "reason": "removed resolver-proposed contextual character pseudo-forms",
-                    }
-                ]
-            )
-
-        def attested(name):
-            if source_problem(name):
-                return False
-            if name in inherited_names or raw_attested(name):
-                return True
-            # A full title-prefix reference proves the trailing canonical
-            # person even when the bare name never appears independently.
-            return any(
-                style.title_prefix_parts(reference)
-                and style.title_prefix_parts(reference)[1] == name
-                and raw_attested(reference)
-                for reference in term.forms
-            )
-
-        term.aliases = [alias for alias in term.aliases if attested(alias)]
-        term.forms = {name: value for name, value in term.forms.items() if attested(name)}
-        if not attested(term.source):
-            raise QualityError(f"Unattested canonical source {term.source}")
-        problem = term_problem(term, self.terms)
-        if problem:
-            raise QualityError(f"Invalid resolved term {term.source}: {problem}")
-
-        owner = next(
-            (
-                existing
-                for existing in self.terms.values()
-                if source in [existing.source, *existing.aliases, *existing.forms]
-            ),
-            None,
-        )
-        existing = self.terms.get(term.source) or owner
-        if existing:
-            if existing.translation != term.translation:
-                raise QualityError(f"confirmed identity {existing.source} has contradictory mappings")
-            term.source = existing.source
-            term.translation = existing.translation
-            term.type = existing.type
-            term.gender = existing.gender
-            term.aliases = sorted(set(existing.aliases + term.aliases))
-            term.forms = {**term.forms, **existing.forms}
-            term.aliases = sorted(set(term.aliases) - set(term.forms))
-            term.form_kinds = {**term.form_kinds, **existing.form_kinds}
-
-        # Address/title forms must keep the batch register: rewrite them to the
-        # deterministic established rendering, or drop the form and keep only
-        # the canonical identity.
-        self.apply_register_policy(
-            term, "aligned resolver address/title forms with the batch register"
-        )
-
-        for name in [*term.aliases, *term.forms]:
-            other = next(
-                (
-                    existing
-                    for existing in self.terms.values()
-                    if existing.source != term.source
-                    and name in [existing.source, *existing.aliases, *existing.forms]
-                ),
-                None,
-            )
-            if other:
-                raise QualityError(
-                    f"source {name} already belongs to confirmed identity {other.source}"
-                )
-        self.terms[term.source] = term
-        return term
-
-    async def resolve(self, source, inherited=None):
-        """Compatibility helper for one candidate; it still has one AI call."""
-        if self.frozen_hash is not None:
-            raise QualityError("Dictionary is frozen; rebuild the batch to resolve terminology")
-        issue = self.source_issue(source, inherited)
-        if issue:
-            self.ignore(source, issue)
-            return None
-        result = await self.ai(
-            f"term:{source}:resolve",
-            prompts.RESOLVE,
-            {
-                **(
-                    self.resolver_payload(source)
-                    if source in self.index.get("candidates", {})
-                    else {
-                        "source": source,
-                        "entity_class": "unknown",
-                        "entity_policy": {},
-                        "representative_evidence": self.occurrences(source)[:6],
-                    }
-                ),
-                "inherited_confirmed": inherited.model_dump() if inherited else None,
-            },
-            Resolution,
-            reason="Ambiguous plausible terminology candidate",
-        )
-        try:
-            term = self.apply_resolution(source, inherited, result)
-        except (QualityError, ValueError) as exc:
-            self.ignore(source, str(exc))
-            return None
-        if term is None:
-            self.ignore(source, result.reason or "candidate not confirmed")
-        return term
-
-    def dictionary_conflicts(self):
-        """Return concrete source/alias collisions; shared targets are legal."""
-        owners, conflicts = {}, set()
-        for source, term in self.terms.items():
-            if not term.enforceable:
-                continue
-            for name in [source, *term.aliases, *term.forms]:
-                owner = owners.get(name)
-                if owner and owner != source:
-                    conflicts.update((source, owner))
-                else:
-                    owners[name] = source
-        return conflicts
-
-    async def resolve_candidates(self, sources):
-        """Resolve plausible candidates in bounded batches, without correction loops."""
-        sources = list(dict.fromkeys(sources))
-        if not sources:
-            return
-        resolved_candidates = 0
-        for page in batches([self.resolver_payload(source) for source in sources]):
-            page_sources = [item["source"] for item in page]
-            result = await self.ai(
-                f"batch:terminology:{digest(page_sources)}",
-                prompts.BATCH_RESOLVE,
-                {
-                    "candidates": page,
-                    "translation_style": style.resolver_context(
-                        self.address_register,
-                        self.address_register_source,
-                        self.style_profile,
-                    ),
-                },
-                BatchResolution,
-                operation="terminology_resolver",
-                reason="Ambiguous plausible terminology candidates",
-            )
-            by_source = {}
-            for item in result.results:
-                if item.source in page_sources and item.source not in by_source:
-                    by_source[item.source] = item
-            for source in page_sources:
-                item = by_source.get(source)
-                inherited = next(
-                    (
-                        term
-                        for term in self.terms.values()
-                        if source in [term.source, *term.aliases, *term.forms]
-                    ),
-                    None,
-                )
+        raw = "\n".join(chapter.raw for chapter in self.chapters)
+        offset = start_offset
+        for batch in _candidate_batches(candidates):
+            known = {item["source"] for item in batch}
+            evidence_text = "\n".join("\n".join(item.get("evidence", [])) for item in batch)
+            relevant = relevant_entries(self.dictionary, evidence_text)
+            relevant_sources = {entry["source"] for entry in relevant}
+            for entry in self.dictionary["entries"]:
+                if (entry["type"] == "character" and entry["source"] not in relevant_sources
+                        and any(item["source"].startswith(entry["source"][:1]) for item in batch)):
+                    relevant.append(entry)
+                    relevant_sources.add(entry["source"])
+            payload = {"candidates": batch, "locked_dictionary": relevant,
+                       "rule": "Confirm only proven identity and reusable terminology; leave uncertainty unresolved."}
+            event = "PRE_DICTIONARY_REQUEST" if phase == "pre" else "POST_DICTIONARY_REQUEST"
+            proposal = await self.request(event, prompts.DICTIONARY, payload,
+                                          ProposedPatch, cache=True)
+            self.event("DICTIONARY_PATCH_RECEIVED", phase=phase, operations=len(proposal.confirmed))
+            valid_operations = []
+            rejected = {}
+            for record in proposal.confirmed:
+                source = ((record.get("entry") or {}).get("source") if isinstance(record.get("entry"), dict)
+                          else None) or ((record.get("alias") or {}).get("source")
+                                         if isinstance(record.get("alias"), dict) else None)
                 try:
-                    if item is None:
-                        raise QualityError("resolver omitted or malformed candidate")
-                    term = self.apply_resolution(
-                        source,
-                        inherited,
-                        Resolution.model_validate(item.model_dump(exclude={"source"})),
-                    )
-                except (QualityError, ValueError) as exc:
-                    term = None
-                    self.ignore(source, str(exc))
-                if term is None:
-                    if source not in self.ignored:
-                        self.ignore(
-                            source,
-                            item.reason if item else "resolver omitted or malformed candidate",
-                            proposed_canonical=(item.term.source if item and item.term else None),
-                            proposed_translation=(
-                                item.term.translation if item and item.term else None
-                            ),
-                            resolver_used=True,
-                        )
-                    self.decisions[source] = "IGNORE"
-                    self.outcomes[source] = {
-                        "source": source,
-                        "state": "IGNORE",
-                        "entity_class": (
-                            self.index.get("candidates", {}).get(source, {}).get(
-                                "entity_class", "unknown"
-                            )
-                        ),
-                        "reason": item.reason if item else "resolver omitted or malformed candidate",
-                    }
+                    if record.get("operation") == "add_entry":
+                        valid_operations.append(AddEntry.model_validate(record))
+                    elif record.get("operation") == "add_alias":
+                        valid_operations.append(AddAlias.model_validate(record))
+                    else:
+                        raise ValueError("Invalid patch operation")
+                except (ValueError, TypeError) as exc:
+                    self.event("DICTIONARY_PATCH_REJECTED", phase=phase, source=source,
+                               reason=str(exc)[:500])
+                    if source in known:
+                        rejected[source] = "Invalid provider patch schema"
+            valid_unresolved = []
+            for record in proposal.unresolved:
+                try:
+                    valid_unresolved.append(Unresolved.model_validate(record))
+                except (ValueError, TypeError):
+                    self.event("DICTIONARY_PATCH_REJECTED", phase=phase,
+                               reason="Invalid unresolved record")
+            patch = DictionaryPatch(confirmed=valid_operations, unresolved=valid_unresolved)
+            merged = self.dictionary
+            confirmed = set()
+            operations = sorted(patch.confirmed,
+                                key=lambda item: 0 if item.operation == "add_entry" else 1)
+            for operation in operations:
+                source = operation.entry.source if operation.operation == "add_entry" else operation.alias.source
+                if source not in known:
+                    self.event("DICTIONARY_PATCH_REJECTED", phase=phase, source=source,
+                               reason="Unsolicited source")
+                    continue
+                try:
+                    merged = merge_patch(merged, {"confirmed": [operation.model_dump()],
+                                                  "unresolved": []}, raw)
+                except DictionaryConflict as exc:
+                    reason = str(exc)
+                    self.event("DICTIONARY_PATCH_REJECTED", phase=phase, source=source, reason=reason)
+                    if any(token in reason.lower() for token in ("locked", "conflict", "owned")):
+                        raise
+                    rejected[source] = reason
+                    continue
+                confirmed.add(source)
+                if operation.operation == "add_entry":
+                    confirmed.update(alias.source for alias in operation.entry.aliases)
+            candidate_by_source = {item["source"]: item for item in batch}
+            unresolved = []
+            for item in patch.unresolved:
+                if item.source not in known:
+                    continue
+                record = item.model_dump()
+                evidence = candidate_by_source[item.source]["evidence"]
+                record["evidence"] = list(dict.fromkeys(evidence + record["evidence"]))[:8]
+                record["chapters"] = candidate_by_source[item.source]["chapters"]
+                unresolved.append(record)
+            unresolved_sources = {item["source"] for item in unresolved}
+            unresolved.extend({
+                "source": item["source"], "possible_type": "unknown",
+                "reason": rejected.get(item["source"], "Resolver left candidate unresolved"),
+                "evidence": item["evidence"], "chapters": item["chapters"],
+            } for item in batch if item["source"] not in confirmed
+                                  and item["source"] not in unresolved_sources)
+            self.dictionary = merged
+            self.unresolved = _unresolved_merge(self.unresolved, unresolved, self.chapters)
+            self.unresolved = [item for item in self.unresolved if item["source"] not in confirmed]
+            offset += len(batch)
+            self.store.write(f"{phase}-dictionary-progress.json", {
+                "input_hash": self.input_hash, "offset": offset,
+                "pre_hash": self.pre_hash if phase == "post" else None,
+                "dictionary": self.dictionary, "unresolved": self.unresolved,
+            })
+            self.event("DICTIONARY_PATCH_VALIDATED", phase=phase, confirmed=len(confirmed))
+            self.event("DICTIONARY_MERGED", phase=phase, entries=len(self.dictionary["entries"]))
+
+    async def pre_dictionary(self, inputs):
+        saved = self.store.read("pre-dictionary.json")
+        if saved and saved.get("input_hash") == self.input_hash:
+            self.dictionary = load_dictionary(saved["dictionary"], self.dictionary_migrations)
+            self.event("DICTIONARY_LOADED", entries=len(self.dictionary["entries"]), reused=True)
+            self.unresolved = load_unresolved({"unresolved": saved.get("unresolved", [])})
+            if self.dictionary_migrations:
+                self.store.write("dictionary-migration.json", {
+                    "target_version": self.dictionary["version"],
+                    "operations": self.dictionary_migrations,
+                })
+                self.store.write("pre-dictionary.json", {
+                    "input_hash": self.input_hash, "dictionary": self.dictionary,
+                    "unresolved": self.unresolved,
+                })
+            self.pre_hash = digest(self.dictionary)
+            return
+        self.dictionary = load_dictionary(inputs.get("dictionary"), self.dictionary_migrations)
+        self.event("DICTIONARY_LOADED", entries=len(self.dictionary["entries"]), reused=False)
+        frozen = self.store.read("frozen-dictionary.json")
+        if frozen and isinstance(frozen.get("dictionary"), dict):
+            legacy = load_dictionary(frozen["dictionary"], self.dictionary_migrations)
+            existing = {entry["source"]: entry for entry in self.dictionary["entries"]}
+            operations = []
+            for entry in legacy["entries"]:
+                current = existing.get(entry["source"])
+                if current is None:
+                    operations.append({"operation": "add_entry", "entry": entry})
                 else:
-                    self.decisions[source] = "CONFIRMED"
-                    self.outcomes[source] = {
-                        "source": source,
-                        "state": "CONFIRMED",
-                        "entity_class": term.type,
-                        "type": term.type,
-                        "translation": term.translation,
-                        "reason": item.reason if item else "confirmed",
-                    }
-            self.save_decisions()
-            resolved_candidates += len(page_sources)
-            self.progress(
-                "Terminology resolution",
-                candidate_count=len(sources),
-                resolved_candidates=resolved_candidates,
-                current_term=page_sources[-1] if page_sources else None,
-                confirmed_terms=sum(value == "CONFIRMED" for value in self.decisions.values()),
-                ignored_candidates=len(self.ignored),
-            )
-        self.progress(
-            "Terminology resolution",
-            candidate_count=len(sources),
-            resolved_candidates=resolved_candidates,
-            resolver_candidates=len(sources),
-            confirmed_terms=sum(value == "CONFIRMED" for value in self.decisions.values()),
-            ignored_candidates=sum(value == "IGNORE" for value in self.decisions.values()),
-        )
+                    if any(current[field] != entry[field]
+                           for field in ("translation", "type", "gender", "status")):
+                        raise DictionaryConflict(f"Legacy frozen mapping conflicts with input: {entry['source']}")
+                    operations.extend({"operation": "add_alias", "canonical_source": entry["source"],
+                                       "alias": alias} for alias in entry["aliases"])
+            self.dictionary = merge_patch(self.dictionary, {"confirmed": operations, "unresolved": []},
+                                          inputs["raw"], allow_unattested=True)
+            self.event("DICTIONARY_MERGED", phase="legacy_migration",
+                       entries=len(self.dictionary["entries"]))
+        if self.dictionary_migrations:
+            self.store.write("dictionary-migration.json", {
+                "target_version": self.dictionary["version"],
+                "operations": self.dictionary_migrations,
+            })
+        self.unresolved = _unresolved_merge(load_unresolved(inputs.get("dictionary")),
+                                            self.store.read("unresolved.json", []) or [], self.chapters)
+        locked_sources = validate_dictionary(self.dictionary)
+        self.unresolved = [item for item in self.unresolved if item["source"] not in locked_sources]
+        self.event("PRE_SCAN_STARTED")
+        candidates = scan(self.chapters, self.dictionary)
+        candidate_sources = {item["source"] for item in candidates}
+        raw = "\n".join(chapter.raw for chapter in self.chapters)
+        for item in self.unresolved:
+            if item["source"] in raw and item["source"] not in candidate_sources:
+                candidates.append({
+                    "source": item["source"], "frequency": raw.count(item["source"]),
+                    "chapters": [chapter.number for chapter in self.chapters
+                                 if item["source"] in chapter.raw],
+                    "evidence": item.get("evidence", [])[:3],
+                })
+        self.event("PRE_SCAN_COMPLETED", candidates=len(candidates))
+        self.progress("Pre-dictionary resolution", candidate_count=len(candidates))
+        partial = self.store.read("pre-dictionary-progress.json")
+        offset = 0
+        if partial and partial.get("input_hash") == self.input_hash:
+            self.dictionary = load_dictionary(partial["dictionary"])
+            self.unresolved = load_unresolved({"unresolved": partial.get("unresolved", [])})
+            offset = partial["offset"]
+        await self.resolve(candidates[offset:], "pre", offset)
+        self.pre_hash = digest(self.dictionary)
+        self.store.write("pre-dictionary.json", {
+            "input_hash": self.input_hash, "dictionary": self.dictionary,
+            "unresolved": self.unresolved,
+        })
+        self.store.write("unresolved.json", self.unresolved)
+        self.event("CHECKPOINT_SAVED", stage="pre_dictionary")
 
-    def save_decisions(self):
-        self.store.write(
-            "resolved-terms.json",
-            {
-                "input_hash": self.input_hash,
-                "terms": [term.model_dump() for term in self.terms.values()],
-                "decisions": self.decisions,
-                "outcomes": self.outcomes,
-                "ignored": sorted(
-                    self.ignored.values(), key=lambda item: item.get("source", "")
-                ),
-            },
-        )
+    def _convert_legacy_translation(self, chapter, value):
+        title = re.sub(rf"^Chương\s+{chapter.number}\s*[:：.-]?\s*", "", value["title"], flags=re.I)
+        segments = value["segments"]
+        if [part.get("id") for part in segments] == list(range(len(chapter.paragraphs))):
+            segments = [{"id": identifier, "text": part["text"]}
+                        for identifier, part in zip(chapter.paragraph_ids, segments)]
+        return Translation.model_validate({"title": title, "segments": segments})
 
-    def migrate_legacy_resolution(self, source):
-        """Reuse a structurally valid old ACCEPT response without another call."""
-        paths = sorted((self.store.path / "resolution-rejections").glob(f"{digest(source)}-*.json"))
-        for path in reversed(paths):
-            record = self.store.read(str(path.relative_to(self.store.path)))
-            response = record.get("response") if record else None
-            if not response:
-                continue
-            try:
-                # Older resolver checkpoints wrapped the strict response with
-                # a top-level source field.  Accept that envelope only during
-                # migration, and never allow it to migrate to another term.
-                legacy_source = response.get("source") if isinstance(response, dict) else None
-                if legacy_source is not None and legacy_source != source:
-                    continue
-                normalized = {
-                    key: value for key, value in response.items() if key != "source"
-                }
-                result = Resolution.model_validate(normalized)
-                if result.decision not in {"ACCEPT", "CONFIRMED"} or result.term is None:
-                    continue
-                term = self.apply_resolution(source, None, result)
-            except (QualityError, ValueError, TypeError):
-                continue
-            if term:
-                self.decisions[source] = "CONFIRMED"
-                self.outcomes[source] = {
-                    "source": source,
-                    "state": "CONFIRMED",
-                    "translation": term.translation,
-                    "reason": "migrated valid legacy resolver response",
-                }
-                return True
-        return False
-
-    def dictionary_report(self):
-        entries = sorted(self.outcomes.values(), key=lambda item: item.get("source", ""))
-        confirmed = len(self.terms)
-        ignored = len(self.ignored)
-        confirmed_types = Counter(term.type for term in self.terms.values())
-        ignored_classes = Counter(
-            item.get("entity_class", item.get("classification", "unknown"))
-            for item in self.ignored.values()
-        )
-        ignored_reasons = Counter(item.get("reason", "unknown") for item in self.ignored.values())
-        removed_forms = sum(
-            len(item.get("removed_forms", [])) for item in self.form_cleanup
-        )
-        preserved_forms = sum(
-            len(item.get("preserved_forms", [])) for item in self.form_cleanup
-        )
-        reference_forms = [
-            (term, name)
-            for term in self.terms.values()
-            for name in term.forms
-            if term.type in {"character", "character_form"}
-        ]
-        direct_confirmations = sum(
-            bool(
-                set(term.evidence_types).intersection(
-                    {"DIRECT_EXPLICIT_LINK", "DIRECT_FULL_NAME_WITH_TITLE", "DIRECT_ALIAS_DECLARATION"}
-                )
-            )
-            for term, _name in reference_forms
-        )
-        indirect_confirmations = sum(
-            bool(
-                set(term.evidence_types).intersection(
-                    {
-                        "INDIRECT_REPEATED_CONTEXT",
-                        "INDIRECT_UNIQUE_SURNAME_TITLE",
-                        "INDIRECT_ROLE_CONTINUITY",
-                        "INDIRECT_LOCAL_COREFERENCE",
-                    }
-                )
-            )
-            for term, _name in reference_forms
-        )
-        return {
-            "summary": {
-                "confirmed_terms": confirmed,
-                "confirmed_characters": confirmed_types["character"],
-                "confirmed_character_forms": sum(
-                    1
-                    for term in self.terms.values()
-                    for _name in term.forms
-                    if term.type in {"character", "character_form"}
-                ),
-                "confirmed_locations": confirmed_types["location"],
-                "confirmed_books": confirmed_types["book_title"] + confirmed_types["historical_work"],
-                "confirmed_organizations": confirmed_types["organization"] + confirmed_types["faction"],
-                "confirmed_artifacts": confirmed_types["artifact"] + confirmed_types["weapon"],
-                "confirmed_techniques": confirmed_types["technique"],
-                "confirmed_titles": (
-                    confirmed_types["honorific"]
-                    + confirmed_types["official_title"]
-                    + confirmed_types["historical_office"]
-                    + confirmed_types["title"]
-                ),
-                "ignored_candidates": ignored,
-                "ignored_generic": ignored_classes["generic"] + ignored_classes["common_noun"],
-                "ignored_quantity": ignored_reasons["quantity modifier is not a canonical entity name"]
-                + ignored_reasons["quantity or numeric descriptive phrase"],
-                "ignored_malformed": ignored_classes["malformed"],
-                "ignored_unproven_character_reference": ignored_reasons[
-                    "character_identity_requires_owner_proof"
-                ]
-                + ignored_reasons["insufficient_identity_evidence"],
-                "ignored_ambiguous_entity": ignored_reasons["competing_identity"]
-                + ignored_reasons["insufficient class-specific evidence"],
-                "ignored_contextual_residue": ignored_reasons["contextual_residue"]
-                + ignored_reasons["leading contextual residue"]
-                + ignored_reasons["leading aspect residue"],
-                "locked_terms": confirmed,
-                "provisional_terms": 0,
-                "needs_review": 0,
-                "report_only_terms": ignored,
-                "unresolved_terms": 0,
-                "unresolved_plausible_terms": 0,
-                "rejected_generic_candidates": sum(
-                    item.get("classification") in {
-                        "generic_phrase",
-                        "common_noun",
-                        "verb_phrase",
-                        "descriptive_phrase",
-                    }
-                    for item in self.index.get("report_only", {}).values()
-                ),
-                "fatal_conflicts": 0,
-                "removed_contextual_forms": removed_forms,
-                "preserved_identity_forms": preserved_forms,
-                "register": self.address_register,
-                "register_source": self.address_register_source,
-                "register_conflicts": sum(
-                    len(item.get("removed_forms", [])) for item in self.register_cleanup
-                ),
-                "register_normalizations": sum(
-                    len(item.get("normalizations", [])) for item in self.register_cleanup
-                ),
-                "character_reference_candidates": sum(
-                    1
-                    for record in [
-                        *self.index.get("candidates", {}).values(),
-                        *self.index.get("report_only", {}).values(),
-                    ]
-                    if record.get("shape")
-                    and record.get("shape") != "full_name"
-                ),
-                "character_reference_confirmed": len(reference_forms),
-                "character_reference_ignored": len(self.reference_audit),
-                "direct_evidence_confirmations": direct_confirmations,
-                "indirect_evidence_confirmations": indirect_confirmations,
-                "ignored_insufficient_evidence": sum(
-                    item.get("reason") == "insufficient_identity_evidence"
-                    for item in self.reference_audit
-                ),
-                "ignored_competing_identity": sum(
-                    item.get("reason") == "competing_identity"
-                    for item in self.reference_audit
-                ),
-                "ignored_contextual_residue": sum(
-                    item.get("reason") == "contextual_residue"
-                    for item in self.reference_audit
-                ),
-                "ignored_truncated_identity": sum(
-                    item.get("reason") == "truncated_identity"
-                    for item in self.reference_audit
-                ),
-                "ignored_unknown_reference": sum(
-                    item.get("candidate_shape") in {"unknown", "alias"}
-                    for item in self.reference_audit
-                ),
-                "ignored_role_only_ambiguous": sum(
-                    item.get("candidate_shape") == "role_only"
-                    or "NEGATIVE_ROLE_ONLY_AMBIGUOUS" in item.get("evidence_types", [])
-                    for item in self.reference_audit
-                ),
-            },
-            "entries": entries,
-            "form_cleanup": self.form_cleanup,
-            "register_cleanup": self.register_cleanup,
-            "character_reference_audit": [
-                {key: value for key, value in item.items() if key != "_key"}
-                for item in self.reference_audit
-            ],
-            "style_profile": self.style_profile,
-            "policy": self.policy.model_dump(),
-            "metrics": dict(self.metrics),
-        }
-
-    async def prepare_dictionary(self, inputs):
-        """Parse candidates from RAW, use VP as evidence, then freeze once."""
-        inherited, problems = load_legacy(inputs.get("dictionary"))
-        vet_confirmed_reference_forms(inherited, self.raw_contexts(), problems)
-        self.record_form_cleanup(problems)
-        self.record_register_cleanup(problems)
-        self.store.write("legacy-audit.json", problems)
-        fatal = [item for item in problems if item.get("classification") == "fatal"]
-        if fatal:
-            raise QualityError(
-                "Fatal inherited dictionary error: " + fatal[0].get("reason", "invalid mapping")
-            )
-
-        saved_index = self.store.read("terminology-index.json")
-        if saved_index and saved_index.get("input_hash") == self.input_hash:
-            self.index = saved_index["index"]
+    def _valid_checkpoint(self, chapter):
+        saved = self.store.read(f"chapters/{chapter.key}.json")
+        if not saved:
+            return None
+        if saved.get("pipeline_version") not in (None, PIPELINE_VERSION):
+            return None
+        if saved.get("qa_status") not in (None, "pass", "manual_override"):
+            return None
+        if saved.get("raw_hash"):
+            if saved["raw_hash"] != digest((chapter.title, chapter.paragraphs)):
+                raise QualityError(f"Chapter {chapter.number} checkpoint RAW mismatch")
+            if (saved.get("pre_dictionary_hash") != self.pre_hash
+                    and saved.get("pipeline_version") == PIPELINE_VERSION
+                    and not self.dictionary_migrations):
+                raise QualityError(f"Chapter {chapter.number} checkpoint dictionary mismatch")
         else:
-            self.progress("Local terminology scan")
-            self.index = await asyncio.to_thread(
-                build_index, self.pairs, self.alignments, inherited
-            )
-            self.store.write(
-                "terminology-index.json", {"input_hash": self.input_hash, "index": self.index}
-            )
-        self.metrics.update(self.index.get("metrics", {}))
-        self.local(
-            "terminology_scan",
-            f"RAW candidates={len(self.index.get('candidates', {}))}; ignored locally={len(self.index.get('report_only', {}))}",
-        )
+            old = self.legacy_raw.get(chapter.key)
+            if (not old or old.get("title") != chapter.title
+                    or tuple(old.get("paragraphs", [])) != chapter.paragraphs):
+                return None
+        try:
+            translated = self._convert_legacy_translation(chapter, saved["translation"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        findings = self._local_findings(chapter, translated)
+        if saved.get("pipeline_version") == PIPELINE_VERSION:
+            audited = set(saved.get("audited_ids", []))
+            findings = [finding for finding in findings
+                        if not (finding["kind"] in SEMANTIC_SUSPICIONS
+                                and finding.get("id") in audited)]
+        if findings:
+            return None
+        if saved.get("pipeline_version") != PIPELINE_VERSION:
+            saved.update({
+                "raw_hash": digest((chapter.title, chapter.paragraphs)),
+                "pre_dictionary_hash": self.pre_hash,
+                "translation": translated.model_dump(),
+                "qa_status": "pass", "state": "committed",
+                "pipeline_version": PIPELINE_VERSION,
+                "migrated": True,
+            })
+            self.store.write(f"chapters/{chapter.key}.json", saved)
+            self.event("CHECKPOINT_SAVED", chapter=chapter.number, migrated=True)
+        self._remember_ratios(chapter, translated)
+        return translated
 
-        saved = self.store.read("resolved-terms.json")
-        if saved and saved.get("input_hash") in {self.input_hash, self.store.id}:
-            loaded_terms = []
-            for item in saved.get("terms", []):
-                term = Term.model_validate(item)
-                removed, preserved = clean_identity_forms(
-                    term,
-                    self.raw_contexts(),
-                    require_evidence=True,
-                )
-                if removed:
-                    self.record_form_cleanup(
-                        [
-                            {
-                                "classification": "form_cleanup",
-                                "source": term.source,
-                                "removed_forms": removed,
-                                "preserved_forms": preserved,
-                                "reason": "removed checkpointed contextual character pseudo-forms",
-                            }
-                        ]
-                    )
-                self.apply_register_policy(
-                    term, "aligned checkpointed address/title forms with the batch register"
-                )
-                if term.enforceable:
-                    loaded_terms.append(term)
-            self.terms = {term.source: term for term in loaded_terms}
-            self.decisions = {
-                source: state
-                for source, state in saved.get("decisions", {}).items()
-                if state in {"CONFIRMED", "IGNORE", "REUSED"}
-            }
-            self.outcomes = saved.get("outcomes", {})
-            self.ignored = {
-                record.get("source"): record
-                for record in saved.get("ignored", [])
-                if record.get("source")
-            }
+    async def _translate_group(self, chapter, group, group_number, previous, lookahead,
+                               is_first=True):
+        source_by_id = dict(chapter.paragraph_items)
+        raw = [{"id": identifier, "text": text,
+                "role": "author_note" if is_author_note(source_by_id[original]) else "narrative"}
+               for identifier, text, original in group]
+        relevant = relevant_entries(self.dictionary, "\n".join(text for _, text, _ in group))
+        payload = {
+            "chapter": chapter.number,
+            "title": chapter.title if is_first else "",
+            "raw": raw,
+            "dictionary": relevant,
+            "previous_translation": previous[-4:],
+            "next_source": lookahead,
+        }
+        fingerprint = _group_hash(chapter, group, relevant, previous[-4:], lookahead, is_first)
+        saved = self.store.read(f"accepted-groups/{chapter.key}/{fingerprint}.json")
+        if saved and saved.get("state") == "validated" and saved.get("fingerprint") == fingerprint:
+            response = Translation.model_validate(saved["translation"])
+            if not structural_findings([item["id"] for item in raw], response.segments):
+                self.store.account("translation", "cache_hit")
+                self.store.chapter_account(chapter.number, "translation", "cache_hit")
+                self.event("CACHE_HIT", operation="translation", chapter=chapter.number,
+                           group=group_number)
+                return response, saved.get("request_metadata", {}), True
+        if os.getenv("TRANSLATION_DEBUG_SNAPSHOTS") == "1":
+            self.store.write(f"debug/chapter-{chapter.key}-part-{group_number}.json", {
+                "model": PRIMARY_MODEL, "system_policy_version": prompts.POLICY_VERSIONS["translation"],
+                "system_instruction": prompts.TRANSLATE, "payload": payload,
+                "generation_config": {"thinking_budget": os.getenv("TRANSLATION_THINKING_BUDGET")},
+            })
+        last_failure = None
+        for requested_model in (PRIMARY_MODEL, FALLBACK_MODEL):
+            if requested_model == FALLBACK_MODEL:
+                self.store.account("translation", "fallback")
+                self.store.chapter_account(chapter.number, "translation", "fallback")
+                self.event("MODEL_FALLBACK", chapter=chapter.number, operation="translation",
+                           from_model=PRIMARY_MODEL, to_model=FALLBACK_MODEL,
+                           reason="invalid_structural_response")
+            try:
+                response = await self.request("TRANSLATION_REQUEST", prompts.TRANSLATE,
+                                              payload, Translation, chapter.number,
+                                              requested_model=requested_model)
+            except ProviderError as exc:
+                raise
+            meta = getattr(response, "_request_meta", {})
+            findings = structural_findings([item["id"] for item in raw], response.segments)
+            if is_first and chapter.title and not response.title.strip():
+                findings.append({"kind": "empty_title", "id": chapter.title_id})
+            if not findings:
+                self.event("TRANSLATION_RESPONSE", chapter=chapter.number, group=group_number,
+                           requested_model=requested_model,
+                           actual_model=meta.get("actual_model", requested_model),
+                           finish_reason=meta.get("finish_reason", "STOP"),
+                           output_chars=sum(len(item.text) for item in response.segments))
+                unit_findings = [finding for identifier, raw_text, _ in group
+                                 for segment in response.segments if segment.id == identifier
+                                 for finding in _segment_findings(identifier, raw_text,
+                                                                  segment.text, self.dictionary)]
+                if is_first and chapter.title:
+                    unit_findings.extend(_segment_findings(
+                        chapter.title_id, chapter.title, response.title,
+                        self.dictionary, check_truncation=False))
+                    if TITLE_WRAPPER.match(response.title):
+                        unit_findings.append({"kind": "malformed_title_wrapper",
+                                              "id": chapter.title_id})
+                locally_accepted = not unit_findings
+                if locally_accepted:
+                    self.store.write(f"accepted-groups/{chapter.key}/{fingerprint}.json", {
+                        "fingerprint": fingerprint, "state": "validated",
+                        "translation": response.model_dump(), "request_metadata": meta,
+                    })
+                    self.event("CHECKPOINT_SAVED", chapter=chapter.number, group=group_number,
+                               stage="accepted_translation_group")
+                return response, meta, locally_accepted
+            self.event("TRANSLATION_VALIDATION_FAIL", chapter=chapter.number,
+                       group=group_number, findings=findings)
+            last_failure = QualityError(f"Chapter {chapter.number} group {group_number} invalid IDs/title: {findings}")
+            if meta.get("actual_model") == FALLBACK_MODEL:
+                break
+        raise last_failure
+
+    async def _translate_group_with_recovery(self, chapter, group, group_number, previous,
+                                             lookahead, is_first=True):
+        try:
+            return [await self._translate_group(chapter, group, group_number,
+                                                previous, lookahead, is_first)]
+        except ProviderError as exc:
+            if exc.category is not ErrorCategory.INCOMPLETE_GENERATION:
+                raise
+        except QualityError:
+            pass
+        if len(group) == 1:
+            identifier, raw, original = group[0]
+            pieces = _split_paragraph(raw, max(100, len(raw) // 2))
+            if len(pieces) < 2:
+                raise QualityError(f"Chapter {chapter.number} has an incomplete single-unit generation")
+            subgroup = [(f"{identifier}.F{index:04d}", piece, original)
+                        for index, piece in enumerate(pieces, 1)]
+            return await self._translate_group_with_recovery(chapter, subgroup, group_number,
+                                                              previous, lookahead, is_first)
+        cut = len(group) // 2
+        self.event("TRANSLATION_INCOMPLETE", chapter=chapter.number, group=group_number,
+                   reason="Incomplete response or invalid structure; splitting affected group",
+                   groups=[len(group[:cut]), len(group[cut:])])
+        left = await self._translate_group_with_recovery(chapter, group[:cut], group_number,
+                                                         previous, group[cut][1], is_first)
+        left_texts = [segment.text for response, _, accepted in left if accepted
+                      for segment in response.segments]
+        right_previous = (previous + left_texts)[-4:]
+        right = await self._translate_group_with_recovery(chapter, group[cut:], group_number + 1,
+                                                          right_previous, lookahead, False)
+        return left + right
+
+    def _raw_by_id(self, chapter):
+        return {**dict(chapter.paragraph_items), chapter.title_id: chapter.title}
+
+    def _text_by_id(self, chapter, result, identifier):
+        if identifier == chapter.title_id:
+            return result.title
+        return next(item.text for item in result.segments if item.id == identifier)
+
+    def _set_text_by_id(self, chapter, result, identifier, text):
+        if identifier == chapter.title_id:
+            result.title = text
         else:
-            self.terms = {term.source: term for term in inherited if term.enforceable}
-            self.decisions = {}
-            self.ignored = {}
+            next(item for item in result.segments if item.id == identifier).text = text
 
-        self.ignored.update(
-            {
-                source: {**record, "state": "IGNORE"}
-                for source, record in self.index.get("report_only", {}).items()
-            }
-        )
-        for source, record in self.ignored.items():
-            self.outcomes[source] = {
-                "source": source,
-                "state": "IGNORE",
-                "entity_class": record.get("entity_class", record.get("classification", "unknown")),
-                "classification": record.get("classification", "ignored"),
-                "reason": record.get("reason", "locally rejected candidate"),
-            }
-            if record.get("shape") and record.get("shape") != "full_name":
-                key = (source, record.get("shape"), record.get("reason", ""), ())
-                if not any(item.get("_key") == key for item in self.reference_audit):
-                    self.reference_audit.append(
-                        {
-                            **record,
-                            "candidate_shape": record.get("shape"),
-                            "_key": key,
-                        }
-                    )
-
-        conflicts = self.dictionary_conflicts()
-        if conflicts:
-            raise QualityError(
-                "Confirmed dictionary has duplicate source identities: "
-                + ", ".join(sorted(conflicts)[:20])
-            )
-
-        # Derive the batch style profile before the resolver runs, then apply it
-        # to the confirmed set so the resolver sees one consistent register.
-        self.refresh_style()
-        for term in self.terms.values():
-            self.apply_register_policy(
-                term, "aligned confirmed address/title forms with the batch register"
-            )
-
-        pending = []
-        for source, candidate in self.index.get("candidates", {}).items():
-            if source in self.decisions:
-                continue
-            if self.migrate_legacy_resolution(source):
-                continue
-            if self.known_source(source):
-                self.decisions[source] = "CONFIRMED"
-                continue
-            local_term = local_resolution(candidate, self.policy)
-            if local_term:
-                self.terms[source] = local_term
-                self.decisions[source] = "CONFIRMED"
-                self.outcomes[source] = {
-                    "source": source,
-                    "state": "CONFIRMED",
-                    "entity_class": local_term.type,
-                    "type": local_term.type,
-                    "translation": local_term.translation,
-                    "reason": "local RAW/VietPhrase consensus",
-                }
-            elif candidate.get("frequency", 0):
-                pending.append(source)
-            else:
-                self.decisions[source] = "IGNORE"
-                self.ignore(source, "candidate has no attested RAW occurrences")
-
-        self.save_decisions()
-        self.progress(
-            "Terminology candidates ready",
-            raw_candidates=len(self.index.get("candidates", {})),
-            candidate_count=len(pending),
-            resolved_candidates=0,
-            resolver_candidates=len(pending),
-            confirmed_terms=len(self.terms),
-            ignored_candidates=len(self.ignored),
-        )
-        await self.resolve_candidates(pending)
-        sanity(self.terms, allow_shared_translations=True)
-        dictionary = export_dictionary(self.terms)
-        self.store.write("working-dictionary.json", dictionary)
-        self.store.write(
-            "dictionary-audit.json",
-            {
-                "confirmed_terms": len(self.terms),
-                "ignored_candidates": len(self.ignored),
-                "ignored": sorted(
-                    self.ignored.values(), key=lambda item: item.get("source", "")
-                ),
-                "character_reference_audit": [
-                    {key: value for key, value in item.items() if key != "_key"}
-                    for item in self.reference_audit
-                ],
-                "metrics": self.dictionary_report()["summary"],
-            },
-        )
-        self.progress(
-            "Reviewing ignored candidates",
-            confirmed_terms=len(self.terms),
-            ignored_candidates=len(self.ignored),
-        )
-        self.freeze(dictionary)
-        self.store.write(
-            "frozen-dictionary.json",
-            {
-                "input_hash": self.input_hash,
-                "dictionary_hash": self.frozen_hash,
-                "dictionary": dictionary,
-            },
-        )
-        self.store.write("dictionary-resolution-report.json", self.dictionary_report())
-
-    def freeze(self, dictionary):
-        terms, invalid = load_legacy(dictionary)
-        vet_confirmed_reference_forms(terms, self.raw_contexts(), invalid)
-        self.record_form_cleanup(invalid)
-        self.record_register_cleanup(invalid)
-        invalid = [
-            problem
-            for problem in invalid
-            if problem.get("classification") not in AUDIT_ONLY_CLASSIFICATIONS
-        ]
-        if invalid:
-            raise QualityError("Malformed frozen dictionary checkpoint")
-        confirmed = {
-            term.source: term.model_copy(deep=True) for term in terms if term.enforceable
+    async def _audit_suspicions(self, chapter, result, findings):
+        suspects = list(dict.fromkeys(item["id"] for item in findings if item.get("id")))
+        raw_by_id = self._raw_by_id(chapter)
+        if not suspects:
+            raise QualityError(f"Chapter {chapter.number} has unlocalized QA suspicion")
+        positions = {identifier: index for index, identifier in enumerate(chapter.paragraph_ids)}
+        context = []
+        for identifier in suspects:
+            index = positions.get(identifier)
+            context.append({
+                "id": identifier,
+                "previous_raw": chapter.paragraphs[index - 1] if index is not None and index > 0 else "",
+                "previous_translation": result.segments[index - 1].text
+                if index is not None and index > 0 else "",
+                "next_raw": chapter.paragraphs[index + 1]
+                if index is not None and index + 1 < len(chapter.paragraphs) else "",
+            })
+        payload = {
+            "raw": [{"id": identifier, "text": raw_by_id[identifier]} for identifier in suspects],
+            "vietnamese": [{"id": identifier, "text": self._text_by_id(chapter, result, identifier)}
+                           for identifier in suspects],
+            "dictionary": relevant_entries(self.dictionary,
+                                           "\n".join(raw_by_id[identifier] for identifier in suspects)),
+            "local_findings": findings,
+            "context": context,
         }
-        sanity(confirmed, allow_shared_translations=True)
-        self.terms = MappingProxyType(confirmed)
-        self.refresh_style()
-        self.frozen_hash = digest(export_dictionary(self.terms))
-        self.progress(
-            "Dictionary frozen",
-            dictionary_hash=self.frozen_hash,
-            dictionary_frozen=True,
-            dictionary_summary=self.dictionary_report()["summary"],
-        )
-        self.local("dictionary_freeze", f"Frozen dictionary {self.frozen_hash}")
+        self.event("QA_REQUEST", chapter=chapter.number, suspects=suspects)
+        audit = await self.request("QA_REQUEST", prompts.QA, payload, CoverageAudit,
+                                   chapter.number, cache=True)
+        confirmed = []
+        for finding in audit.findings:
+            if finding.id not in suspects:
+                raise QualityError(f"Chapter {chapter.number} QA named an unrequested ID")
+            confirmed.append({"kind": finding.kind, "id": finding.id,
+                              "reason": finding.reason, "confirmed_by": "semantic_qa"})
+        self.event("QA_DEFECT_CONFIRMED" if confirmed else "QA_PASS",
+                   chapter=chapter.number, findings=confirmed)
+        return confirmed, suspects
 
-    def assert_frozen(self):
-        if self.frozen_hash is None or digest(export_dictionary(self.terms)) != self.frozen_hash:
-            raise QualityError("Frozen dictionary changed; stop and rebuild the batch")
-
-    def check_unresolved(self, task, payload, translation):
-        found = [
-            candidate.model_dump()
-            for candidate in translation.unresolved_terms
-            if candidate.source in candidate.evidence
-            and candidate.evidence
-            in payload.get("raw_title", "") + "\n" + "\n".join(
-                paragraph["text"] for paragraph in payload["raw"]
-            )
-        ]
-        if found:
-            self.store.write(
-                f"ignored-terms/{digest(task)}.json",
-                {"dictionary_hash": self.frozen_hash, "state": "IGNORE", "candidates": found},
-            )
-
-    @staticmethod
-    def finding_data(issues):
-        validate_findings(issues)
-        return [issue.model_dump(exclude_none=True) for issue in issues]
-
-    def persist_validation_failure(self, task, issues, attempts):
-        findings = self.finding_data(issues)
-        self.store.write(
-            f"validation-failures/{digest(task)}.json",
-            {"task": task, "repair_attempts": attempts, "findings": findings},
-        )
-        self.store.log(
-            {
-                "status": "failed",
-                "operation": "validation",
-                "task": task,
-                "message": f"Local validation still fails after {attempts} targeted repair(s)",
-                "findings": findings,
-            }
-        )
-
-    @staticmethod
-    def validation_failure_text(task, issues, attempts):
-        validate_findings(issues)
-        lines = [
-            f"{task}: local validation still fails after {attempts} targeted repair(s)"
-        ]
-        for index, issue in enumerate(issues, 1):
-            data = issue.model_dump(exclude_none=True)
-            lines.append(f"{index}. Type: {issue.type}; Validator: {issue.validator}")
-            lines.append(f"   Reason: {issue.reason}")
-            if issue.chapter_number is not None:
-                lines.append(f"   Chapter: {issue.chapter_number}")
-            if issue.chunk_index is not None:
-                lines.append(f"   Chunk: {issue.chunk_index}")
-            if issue.source_segment_id:
-                lines.append(f"   Source segment: {issue.source_segment_id}")
-            if issue.source_line is not None:
-                lines.append(f"   RAW line: {issue.source_line}")
-            if issue.source_excerpt:
-                lines.append(f"   RAW excerpt: {issue.source_excerpt}")
-            if issue.translated_excerpt is not None:
-                lines.append(f"   Translated excerpt: {issue.translated_excerpt}")
-            if issue.source:
-                lines.append(f"   Source: {issue.source}")
-            if issue.required_translation:
-                lines.append(f"   Required: {issue.required_translation}")
-            if issue.expected is not None:
-                lines.append(f"   Expected: {issue.expected}")
-            if issue.actual is not None:
-                lines.append(f"   Actual: {issue.actual}")
-            if issue.details:
-                for key, value in issue.details.items():
-                    lines.append(f"   {key.replace('_', ' ').title()}: {value}")
-            lines.append(f"   Explanation: {issue.explanation}")
-        return "\n".join(lines)
-
-    async def validate_and_repair(self, task, payload, translation, allow_repair=True):
-        """Run deterministic checks and permit at most one repair for one chunk."""
-        self.check_unresolved(task, payload, translation)
-        try:
-            issues = local_findings(payload, translation)
-        except ValueError as exc:
-            self.fail(task, str(exc))
-        # Never trust findings serialized by an older validator.  Every resume
-        # path reaches this point with the current RAW, frozen dictionary and
-        # translated text, so the findings used for repair are freshly derived.
-        self.store.write(
-            f"validation-rejections/{digest(task)}.json",
-            {
-                "task": task,
-                "pipeline_version": PIPELINE_VERSION,
-                "dictionary_hash": self.frozen_hash,
-                "findings": self.finding_data(issues),
-                "recomputed": True,
-            },
-        )
-        if not issues:
-            self.local("normal_output_validation", f"{task}: local checks passed")
-            return translation
-        if not allow_repair:
-            self.persist_validation_failure(task, issues, 0)
-            self.fail(task, self.validation_failure_text(task, issues, 0))
-
-        self.store.write(
-            f"validation-rejections/{digest(task)}.json",
-            {
-                "task": task,
-                "pipeline_version": PIPELINE_VERSION,
-                "dictionary_hash": self.frozen_hash,
-                "issues": self.finding_data(issues),
-                "translation": translation.model_dump(),
-            },
-        )
-        affected = sorted({issue.segment_id for issue in issues})
-        selected = set(affected)
-        chapter_key = task.split(":")[1]
-        ids = [paragraph["id"] for paragraph in payload["raw"]]
-        vp_ids = {
-            value
-            for group in self.alignments[chapter_key].groups
-            if selected.intersection(group.raw)
-            for value in group.vp
-        }
-        raw_text = "\n".join(
-            [payload.get("raw_title", "") if -1 in selected else ""]
-            + [paragraph["text"] for paragraph in payload["raw"] if paragraph["id"] in selected]
-        )
-
-        raw_by_id = {paragraph["id"]: paragraph for paragraph in payload["raw"]}
-        translated_by_id = {segment.id: segment for segment in translation.segments}
-        location = payload.get("location") or {}
-
-        def raw_context_entry(paragraph_id):
-            paragraph = raw_by_id.get(paragraph_id)
-            if paragraph is None and paragraph_id == -1:
-                paragraph = {
-                    "id": -1,
-                    "text": payload.get("raw_title", ""),
-                    "source_segment_id": (
-                        f"c{location.get('chapter')}-s-1"
-                        if location.get("chapter") is not None
-                        else "s-1"
-                    ),
-                }
-            return paragraph
-
-        ordered_ids = [-1, *ids]
-
-        def surrounding(source_id):
-            try:
-                position = ordered_ids.index(source_id)
-            except ValueError:
-                position = 0
-            neighbor_ids = ordered_ids[max(0, position - 1) : position + 2]
-            return [
-                raw_context_entry(value)
-                for value in neighbor_ids
-                if raw_context_entry(value) is not None
-            ]
-
-        source_context = [
-            {
-                "affected_id": source_id,
-                "segments": surrounding(source_id),
-            }
-            for source_id in affected
-        ]
-        translated_context = [
-            {
-                "affected_id": source_id,
-                "segments": [
-                    {
-                        "id": value,
-                        "source_segment_id": (
-                            raw_context_entry(value) or {}
-                        ).get("source_segment_id"),
-                        "text": (
-                            translation.title
-                            if value == -1
-                            else translated_by_id[value].text
-                        ),
-                    }
-                    for value in ordered_ids[max(0, ordered_ids.index(source_id) - 1) : ordered_ids.index(source_id) + 2]
-                    if value in translated_by_id or value == -1
-                ],
-            }
-            for source_id in affected
-        ]
-        repair_payload = {
-            "raw_title": payload.get("raw_title", ""),
-            "vp_title": payload.get("vp_title", ""),
-            "location": payload.get("location"),
-            "raw": [paragraph for paragraph in payload["raw"] if paragraph["id"] in selected],
-            "vp": [paragraph for paragraph in payload["vp"] if paragraph["id"] in vp_ids],
-            "terminology": relevant(self.terms, raw_text),
-            "dictionary_hash": self.frozen_hash,
-            "affected_ids": affected,
-            "issues": self.finding_data(issues),
-            "validator_findings": self.finding_data(issues),
-            "source_context": source_context,
-            "translated_context": translated_context,
-            "translation": {
-                "title": translation.title,
-                "segments": [
-                    segment.model_dump()
-                    for segment in translation.segments
-                    if segment.id in selected
-                ],
-            },
-            "repair_attempt": 1,
-            "repair_feedback": "Fix only these findings; the confirmed dictionary is frozen and immutable.",
-        }
-        repaired = await self.ai(
-            f"{task}:repair",
-            prompts.REPAIR,
-            repair_payload,
-            Repair,
-            operation="repair",
-            reason="Concrete failed local validator findings",
-        )
-        if sorted(segment.id for segment in repaired.segments) != affected:
-            self.fail(task, f"{task}: repair returned unexpected/missing paragraph IDs")
-        patched = {segment.id: segment.text for segment in translation.segments}
-        for segment in repaired.segments:
-            if segment.id == -1:
-                translation.title = segment.text
-            else:
-                patched[segment.id] = segment.text
-        translation.segments = [
-            Segment(id=paragraph_id, text=patched[paragraph_id]) for paragraph_id in ids
-        ]
-        try:
-            remaining = local_findings(payload, translation)
-        except ValueError as exc:
-            self.fail(task, str(exc))
-        self.store.write(
-            f"repair-validation/{digest(task)}.json",
-            {
-                "task": task,
-                "repair_attempts": 1,
-                "before": self.finding_data(issues),
-                "after": self.finding_data(remaining),
-            },
-        )
-        if remaining:
-            self.persist_validation_failure(task, remaining, 1)
-            self.fail(task, self.validation_failure_text(task, remaining, 1))
-        self.local("repair_validation", f"{task}: one targeted repair passed")
-        return translation
-
-    async def chapter(self, pair):
-        self.assert_frozen()
-        raw, vp = pair
-        key = raw.key
-        whole = {
-            "raw_title": raw.title,
-            "vp_title": vp.title,
-            "location": {"chapter": raw.number, "chunk": None},
-            "raw": [
-                {
-                    "id": index,
-                    "text": text,
-                    "source_segment_id": f"c{raw.number}-s{index}",
-                    "source_line": (
-                        raw.paragraph_lines[index]
-                        if index < len(raw.paragraph_lines)
-                        else None
-                    ),
-                }
-                for index, text in enumerate(raw.paragraphs)
-            ],
-            "vp": [{"id": index, "text": text} for index, text in enumerate(vp.paragraphs)],
-            "terminology": relevant(self.terms, raw.title + "\n" + "\n".join(raw.paragraphs)),
-        }
-        saved = self.store.read(f"chapters/{key}.json")
-        saved_dictionary_hash = saved.get("dictionary_hash") if saved else None
-        saved_is_compatible = (
-            saved
-            and saved.get("pipeline_input_hash")
-            in {self.input_hash, *self.compatible_input_hashes}
-            and saved_dictionary_hash in {self.frozen_hash, *self.compatible_frozen_hashes}
-        )
-        if saved_is_compatible:
-            try:
-                checked = await self.validate_and_repair(
-                    f"chapter:{key}:full",
-                    whole,
-                    Translation.model_validate(saved["translation"]),
-                    allow_repair=False,
-                )
-            except QualityError:
-                if saved_dictionary_hash not in self.compatible_frozen_hashes:
-                    raise
-                self.store.log(
-                    {
-                        "status": "local_success",
-                        "operation": "dictionary_migration",
-                        "message": f"Chapter {key} requires chunk-level revalidation after dictionary cleanup",
-                    }
-                )
-            else:
-                self.store.write(
-                    f"chapters/{key}.json",
-                    {
-                        **saved,
-                        "dictionary_hash": self.frozen_hash,
-                        "pipeline_input_hash": self.input_hash,
-                        "translation": checked.model_dump(),
-                    },
-                )
-                return
-
-        segments, title = [], ""
-        for index, chunk in enumerate(self.chunks[key]):
-            self.assert_frozen()
-            self.activity[key] = {"chunk": index + 1, "chunks": len(self.chunks[key])}
-            self.progress("Translating", active_chapters=dict(self.activity))
-            chunk_terms = relevant(
-                self.terms,
-                raw.title + "\n" + "\n".join(item["text"] for item in chunk["raw"]),
-            )
+    async def repair_findings(self, chapter, result, findings, request_meta=None):
+        """One full-paragraph repair per ID; mutate accepted state only after validation."""
+        raw_by_id = self._raw_by_id(chapter)
+        by_id = defaultdict(list)
+        for finding in findings:
+            identifier = finding.get("id")
+            if identifier not in raw_by_id:
+                raise QualityError(f"Chapter {chapter.number} has broad/unlocalized QA failure: {finding}")
+            by_id[identifier].append(finding)
+        for identifier, issues in by_id.items():
+            raw = raw_by_id[identifier]
+            current = self._text_by_id(chapter, result, identifier)
+            attempt_name = f"repair-attempts/{chapter.key}/{identifier}.json"
+            attempt_fingerprint = digest({
+                "raw": raw, "current": current, "dictionary": relevant_entries(self.dictionary, raw),
+                "defects": issues, "policy": prompts.POLICY_VERSIONS["repair"],
+            })
+            previous_attempt = self.store.read(attempt_name)
+            if previous_attempt and previous_attempt.get("fingerprint") == attempt_fingerprint:
+                raise QualityError(f"Chapter {chapter.number} repair for {identifier} already failed; manual review required")
             payload = {
-                "CHAPTER CONTEXT": {
-                    **chapter_identity(raw),
-                    "raw_title": raw.title,
-                    "vp_title": vp.title,
-                },
-                "PREVIOUS CONTEXT": {
-                    "instruction": "CONTEXT ONLY. Do not translate again.",
-                    "paragraphs": [segment.text[-800:] for segment in segments[-2:]],
-                },
-                "RAW TO TRANSLATE": chunk["raw"],
-                "VIETPHRASE REFERENCE": chunk["vp"],
-                "TERMINOLOGY": chunk_terms,
-                "dictionary_hash": self.frozen_hash,
+                "chapter": chapter.number, "id": identifier,
+                "raw": raw, "current_vietnamese": current,
+                "confirmed_defects": issues,
+                "dictionary": relevant_entries(self.dictionary, raw),
             }
-            chunk_hash = digest({"payload": payload, "pipeline_input_hash": self.input_hash})
-            checkpoint = self.store.read(f"chunks/{key}-{index}.json")
-            checkpoint_reusable = checkpoint and (
-                checkpoint.get("input_hash") == chunk_hash
-                or checkpoint.get("dictionary_hash") in self.compatible_frozen_hashes
-            )
-            if checkpoint_reusable:
-                translated = Translation.model_validate(checkpoint["translation"])
+            self.event("REPAIR_REQUEST", chapter=chapter.number, paragraph_id=identifier,
+                       defects=[item["kind"] for item in issues])
+            repaired = await self.request("REPAIR_REQUEST", prompts.REPAIR,
+                                          payload, Repair, chapter.number)
+            self.store.write(attempt_name, {"fingerprint": attempt_fingerprint,
+                                            "status": "response_received"})
+            if repaired.id != identifier:
+                rejection = [{"kind": "repair_wrong_id", "expected": identifier,
+                              "actual": repaired.id}]
             else:
-                translated = await self.ai(
-                    f"chapter:{key}:chunk:{index}:translate",
-                    prompts.TRANSLATE,
-                    payload,
-                    Translation,
-                    operation="translation",
-                    reason="Translate RAW with frozen confirmed terminology",
-                )
-            translated = await self.validate_and_repair(
-                f"chapter:{key}:chunk:{index}",
-                {
-                    **chunk,
-                    "raw_title": raw.title,
-                    "vp_title": vp.title,
-                    "location": {"chapter": raw.number, "chunk": index},
-                    "terminology": chunk_terms,
-                },
-                translated,
-            )
-            self.store.write(
-                f"chunks/{key}-{index}.json",
-                {
-                    "input_hash": chunk_hash,
-                    "dictionary_hash": self.frozen_hash,
-                    "translation": translated.model_dump(),
-                },
-            )
-            segments.extend(translated.segments)
-            title = title or translated.title
+                rejection = repair_integrity_findings(identifier, raw, current,
+                                                      repaired.text, self.dictionary)
+            if rejection:
+                self.store.write(attempt_name, {"fingerprint": attempt_fingerprint,
+                                                "status": "rejected", "findings": rejection})
+                self.event("REPAIR_VALIDATION_FAIL", chapter=chapter.number,
+                           paragraph_id=identifier, findings=rejection)
+                self.event("REPAIR_REJECTED_KEEPING_ORIGINAL", chapter=chapter.number,
+                           paragraph_id=identifier)
+                self.store.write(f"validation-failures/{chapter.key}.json", {
+                    "chapter": chapter.number, "final_status": "manual_review_required",
+                    "paragraph_id": identifier, "findings": rejection,
+                    "original_text": current,
+                })
+                raise QualityError(f"Chapter {chapter.number} repair for {identifier} was incomplete; original preserved")
+            candidate = copy.deepcopy(result)
+            self._set_text_by_id(chapter, candidate, identifier, repaired.text.strip())
+            remaining_for_id = [finding for finding in self._local_findings(chapter, candidate)
+                                if finding.get("id") == identifier and finding["kind"]
+                                not in ("suspicious_length_ratio",)]
+            if remaining_for_id:
+                self.store.write(attempt_name, {"fingerprint": attempt_fingerprint,
+                                                "status": "rejected", "findings": remaining_for_id})
+                self.event("REPAIR_VALIDATION_FAIL", chapter=chapter.number,
+                           paragraph_id=identifier, findings=remaining_for_id)
+                self.event("REPAIR_REJECTED_KEEPING_ORIGINAL", chapter=chapter.number,
+                           paragraph_id=identifier)
+                raise QualityError(f"Chapter {chapter.number} repair for {identifier} failed validation")
+            history_name = f"revisions/{chapter.key}/{identifier}.json"
+            history = self.store.read(history_name, []) or []
+            if not history:
+                history.append({"revision": 0, "text": current, "kind": "initial"})
+            history.append({"revision": len(history), "text": repaired.text.strip(),
+                            "kind": "repair", "model": getattr(repaired, "_request_meta", {}).get("actual_model")})
+            self.store.write(history_name, history)
+            self._set_text_by_id(chapter, result, identifier, repaired.text.strip())
+            self.store.write(attempt_name, {"fingerprint": attempt_fingerprint,
+                                            "status": "accepted", "revision": len(history) - 1})
+            self.event("REPAIR_VALIDATION_PASS", chapter=chapter.number,
+                       paragraph_id=identifier,
+                       actual_model=getattr(repaired, "_request_meta", {}).get("actual_model"))
+            self.store.write(f"pending-chapters/{chapter.key}.json", {
+                "raw_hash": digest((chapter.title, chapter.paragraphs)),
+                "pre_dictionary_hash": self.pre_hash,
+                "state": "validated_repair_pending_commit",
+                "translation": result.model_dump(),
+                "request_metadata": request_meta or [],
+            })
+            self.event("CHECKPOINT_SAVED", chapter=chapter.number, stage="accepted_repair")
 
-        merged = await self.validate_and_repair(
-            f"chapter:{key}:full",
-            whole,
-            Translation(title=title, segments=segments),
-            allow_repair=False,
-        )
-        self.store.write(
-            f"chapters/{key}.json",
-            {
-                "dictionary_hash": self.frozen_hash,
-                "pipeline_input_hash": self.input_hash,
-                **chapter_identity(raw),
-                "translation": merged.model_dump(),
-            },
-        )
-        self.activity.pop(key, None)
-        self.progress(
-            "Translating",
-            active_chapters=dict(self.activity),
-            completed_chapters=sum(
-                self.store.read(f"chapters/{chapter.key}.json") is not None
-                for chapter, _ in self.pairs
-            ),
-        )
+    async def _validate_and_repair(self, chapter, result, request_meta):
+        findings = self._local_findings(chapter, result)
+        structural = [finding for finding in findings if finding["kind"] in
+                      ("duplicate_id", "missing_id", "unexpected_id", "out_of_order_id", "empty_segment")]
+        if structural:
+            raise QualityError(f"Chapter {chapter.number} has structural defects: {structural}")
+        hard = deterministic_defects(findings)
+        suspicion = semantic_suspicions(findings)
+        audited_ids = []
+        confirmed = []
+        if suspicion:
+            confirmed, audited_ids = await self._audit_suspicions(chapter, result, suspicion)
+        defects = hard + confirmed
+        if defects:
+            self.event("TRANSLATION_VALIDATION_FAIL", chapter=chapter.number, findings=defects)
+            await self.repair_findings(chapter, result, defects, request_meta)
+        remaining = self._local_findings(chapter, result)
+        remaining = [finding for finding in remaining
+                     if not (finding["kind"] in SEMANTIC_SUSPICIONS
+                             and finding.get("id") in audited_ids
+                             and finding.get("id") not in {item["id"] for item in confirmed})]
+        if remaining:
+            self.store.write(f"validation-failures/{chapter.key}.json", {
+                "chapter": chapter.number, "final_status": "manual_review_required",
+                "findings": remaining,
+            })
+            raise QualityError(f"Chapter {chapter.number} failed final local QA: {remaining[:3]}")
+        self.event("TRANSLATION_VALIDATION_PASS", chapter=chapter.number)
+        return audited_ids
+
+    async def translate_chapter(self, chapter, previous_context=""):
+        existing = self._valid_checkpoint(chapter)
+        if existing:
+            self.event("CHECKPOINT_SAVED", chapter=chapter.number, reused=True)
+            return existing
+        self.progress(f"Translating Chapter {chapter.number}", current_chapter=chapter.number)
+        pending = self.store.read(f"pending-chapters/{chapter.key}.json")
+        request_meta = []
+        if (pending and pending.get("raw_hash") == digest((chapter.title, chapter.paragraphs))
+                and pending.get("pre_dictionary_hash") == self.pre_hash
+                and pending.get("state") in ("generated_unvalidated", "validated_repair_pending_commit")):
+            result = Translation.model_validate(pending["translation"])
+            request_meta = pending.get("request_metadata", [])
+            self.event("CHECKPOINT_SAVED", chapter=chapter.number, reused_pending=True)
+        else:
+            limit = int(os.getenv("TRANSLATION_MAX_RAW_CHARS", "9000"))
+            output_token_limit = int(os.getenv("TRANSLATION_MAX_ESTIMATED_OUTPUT_TOKENS", "12000"))
+            if limit < 500:
+                raise ValueError("TRANSLATION_MAX_RAW_CHARS must be at least 500")
+            if output_token_limit < 1000:
+                raise ValueError("TRANSLATION_MAX_ESTIMATED_OUTPUT_TOKENS must be at least 1000")
+            units = _units(chapter, min(limit, max(500, output_token_limit // 2)))
+            groups = _groups(units, limit, output_token_limit=output_token_limit)
+            by_original = defaultdict(list)
+            title = ""
+            tail = [previous_context] if previous_context else []
+            request_meta = []
+            for group_number, group in enumerate(groups):
+                next_source = groups[group_number + 1][0][1] if group_number + 1 < len(groups) else ""
+                responses = await self._translate_group_with_recovery(
+                    chapter, group, group_number, tail, next_source, group_number == 0)
+                for response, meta, locally_accepted in responses:
+                    request_meta.append(meta)
+                    if group_number == 0 and not title:
+                        title = response.title
+                    for segment in response.segments:
+                        original_id = segment.id.split(".F", 1)[0]
+                        by_original[original_id].append(segment.text.strip())
+                    if locally_accepted:
+                        tail = (tail + [segment.text for segment in response.segments])[-4:]
+            result = Translation(
+                title=title,
+                segments=[TranslatedSegment(id=identifier,
+                                            text=" ".join(by_original[identifier]))
+                          for identifier in chapter.paragraph_ids],
+            )
+            self.store.write(f"pending-chapters/{chapter.key}.json", {
+                "raw_hash": digest((chapter.title, chapter.paragraphs)),
+                "pre_dictionary_hash": self.pre_hash,
+                "state": "generated_unvalidated",
+                "translation": result.model_dump(),
+                "request_metadata": request_meta,
+            })
+            self.event("CHECKPOINT_SAVED", chapter=chapter.number, stage="generated_unvalidated")
+        audited_ids = await self._validate_and_repair(chapter, result, request_meta)
+        manual_ids = accepted_review_ids(self.store, chapter, result, self.dictionary)
+        self.store.write(f"chapters/{chapter.key}.json", {
+            "raw_hash": digest((chapter.title, chapter.paragraphs)),
+            "pre_dictionary_hash": self.pre_hash,
+            "translation": result.model_dump(),
+            "request_metadata": request_meta,
+            "qa_status": "manual_override" if manual_ids else "pass", "state": "committed",
+            "pipeline_version": PIPELINE_VERSION,
+            "audited_ids": audited_ids,
+            "manual_review_ids": manual_ids,
+        })
+        (self.store.path / f"pending-chapters/{chapter.key}.json").unlink(missing_ok=True)
+        self.event("CHECKPOINT_SAVED", chapter=chapter.number, stage="chapter_committed")
+        self.event("CHAPTER_COMPLETED", chapter=chapter.number)
+        self._remember_ratios(chapter, result)
+        self.progress("Translating", current_chapter=None)
+        return result
+
+    async def post_dictionary(self):
+        saved = self.store.read("post-dictionary.json")
+        if saved and saved.get("input_hash") == self.input_hash and saved.get("pre_hash") == self.pre_hash:
+            self.dictionary = load_dictionary(saved["dictionary"])
+            self.unresolved = load_unresolved({"unresolved": saved.get("unresolved", [])})
+            return
+        scanned = scan(self.chapters, self.dictionary, (), post=True)
+        known = validate_dictionary(self.dictionary)
+        unresolved = {item["source"]: item for item in self.unresolved}
+        candidates = []
+        for item in scanned:
+            source = item["source"]
+            if source in known:
+                continue
+            old = unresolved.get(source)
+            if old and not (set(item["evidence"]) - set(old.get("evidence", []))):
+                continue
+            candidates.append(item)
+        self.event("POST_SCAN_COMPLETED", candidates=len(candidates))
+        partial = self.store.read("post-dictionary-progress.json")
+        offset = 0
+        if (partial and partial.get("input_hash") == self.input_hash
+                and partial.get("pre_hash") == self.pre_hash):
+            self.dictionary = load_dictionary(partial["dictionary"])
+            self.unresolved = load_unresolved({"unresolved": partial.get("unresolved", [])})
+            offset = partial["offset"]
+        if candidates:
+            self.progress("Post-dictionary review", candidate_count=len(candidates))
+            await self.resolve(candidates[offset:], "post", offset)
+        else:
+            self.event("POST_DICTIONARY_SKIPPED")
+        self.store.write("post-dictionary.json", {
+            "input_hash": self.input_hash, "pre_hash": self.pre_hash,
+            "dictionary": self.dictionary, "unresolved": self.unresolved,
+        })
+        self.store.write("unresolved.json", self.unresolved)
+        self.event("CHECKPOINT_SAVED", stage="post_dictionary")
+
+    def _chapter_metrics(self, chapter, translated, saved):
+        stats = self.store.read(f"chapter-request-statistics/{chapter.key}.json", {}) or {}
+        actual_models = sorted({model for bucket in stats.values()
+                                for model in bucket.get("actual_models", [])})
+        accepted_models = sorted({metadata.get("actual_model")
+                                  for metadata in saved.get("request_metadata", [])
+                                  if metadata.get("actual_model")})
+        for identifier in (*chapter.paragraph_ids, chapter.title_id):
+            history = self.store.read(f"revisions/{chapter.key}/{identifier}.json", []) or []
+            if history and history[-1].get("model"):
+                accepted_models = sorted(set(accepted_models) | {history[-1]["model"]})
+        findings = self._local_findings(chapter, translated)
+        return {
+            "chapter": chapter.number,
+            "raw_chars": sum(map(len, chapter.paragraphs)),
+            "raw_paragraphs": len(chapter.paragraphs),
+            "translation_chars": sum(len(item.text) for item in translated.segments),
+            "translated_paragraphs": len(translated.segments),
+            "translation_requests": stats.get("translation", {}).get("logical_calls", 0),
+            "qa_requests": stats.get("qa", {}).get("logical_calls", 0),
+            "repair_requests": stats.get("repair", {}).get("logical_calls", 0),
+            "technical_retries": sum(bucket.get("technical_retries", 0) for bucket in stats.values()),
+            "fallbacks": sum(bucket.get("fallbacks", 0) for bucket in stats.values()),
+            "actual_models": actual_models,
+            "accepted_models": accepted_models,
+            "cjk_findings": sum(item["kind"] == "chinese_residue" for item in findings),
+            "numeric_findings": sum(item["kind"] in ("numeric_mismatch", "suspicious_numeric_mismatch")
+                                    for item in findings),
+            "terminology_findings": sum(item["kind"] == "locked_term_missing" for item in findings),
+            "final_status": saved.get("qa_status", "unknown"),
+        }
 
     async def run(self):
         inputs = self.store.read("inputs.json")
-        self.input_hash = pipeline_identity(inputs, self.policy.model_dump())
-        self.progress(
-            "Local parsing",
-            error=None,
-            error_detail=None,
-            active_chapters={},
-            dictionary_frozen=False,
+        if not inputs or "raw" not in inputs:
+            raise QualityError("Missing RAW input checkpoint")
+        self.input_hash = digest({"raw": inputs["raw"], "dictionary": inputs.get("dictionary")})
+        try:
+            self.chapters = parse_chapters(inputs["raw"])
+        except ChapterValidationError as exc:
+            self.event("RAW_VALIDATION_FAILED", detail=exc.detail)
+            raise
+        note_policy = author_note_policy()
+        saved_note_policy = self.store.read("author-note-policy.json")
+        if saved_note_policy and saved_note_policy.get("policy") != note_policy:
+            raise QualityError("Author-note policy changed for this checkpoint; start a new job")
+        self.store.write("author-note-policy.json", {"policy": note_policy})
+        previous_parsed = (self.store.read("legacy-parsed-chapters.json")
+                           or self.store.read("parsed-chapters.json") or {})
+        if "pairs" in previous_parsed:
+            self.store.write("legacy-parsed-chapters.json", previous_parsed)
+            self.legacy_raw = {
+                str(pair[0]["number"]): pair[0] for pair in previous_parsed["pairs"]
+                if pair and isinstance(pair[0], dict) and "number" in pair[0]
+            }
+        self.store.write("parsed-chapters.json", {
+            "input_hash": self.input_hash, "parser_version": PARSER_VERSION,
+            "chapters": [{"number": chapter.number, "title": chapter.title,
+                          "source_line": chapter.source_line,
+                          "paragraph_ids": list(chapter.paragraph_ids),
+                          "paragraphs": len(chapter.paragraphs)}
+                         for chapter in self.chapters],
+        })
+        source_findings = source_quality_findings(self.chapters)
+        self.store.write("source-quality.json", source_findings)
+        if source_findings:
+            self.event("SOURCE_QUALITY_FINDING", count=len(source_findings))
+        self.event("JOB_STARTED", chapters=len(self.chapters))
+        self.event("RAW_PARSED", chapters=len(self.chapters))
+        self.event("CHECKPOINT_SAVED", stage="raw_parsed")
+        self.progress("Parsing RAW")
+        await self.pre_dictionary(inputs)
+        self.progress("Translating")
+        previous = ""
+        width = self.scheduler.concurrency
+        for start in range(0, len(self.chapters), width):
+            wave = self.chapters[start:start + width]
+            baseline = (tuple(self.ratio_baseline), tuple(self.paragraph_ratio_baseline))
+            for chapter in wave:
+                self.validation_baselines[chapter.number] = baseline
+            results = await asyncio.gather(*(
+                self.translate_chapter(chapter, previous if index == 0 else "")
+                for index, chapter in enumerate(wave)
+            ), return_exceptions=True)
+            errors = [result for result in results if isinstance(result, BaseException)]
+            if errors:
+                raise errors[0]
+            previous = "\n".join(segment.text for segment in results[-1].segments)[-600:]
+        await self.post_dictionary()
+        translations = []
+        separate_notes = []
+        for chapter in self.chapters:
+            saved = self.store.read(f"chapters/{chapter.key}.json")
+            if not saved or saved.get("qa_status") not in ("pass", "manual_override"):
+                raise QualityError(f"Chapter {chapter.number} has no accepted checkpoint")
+            translated = Translation.model_validate(saved["translation"])
+            findings = self._local_findings(chapter, translated)
+            audited = set(saved.get("audited_ids", []))
+            findings = [item for item in findings
+                        if not (item["kind"] in SEMANTIC_SUSPICIONS
+                                and item.get("id") in audited)]
+            if findings:
+                self.event("TRANSLATION_VALIDATION_FAIL", chapter=chapter.number,
+                           stage="post_dictionary", findings=findings)
+                new_audited = await self._validate_and_repair(
+                    chapter, translated, saved.get("request_metadata", []))
+                saved["translation"] = translated.model_dump()
+                saved["audited_ids"] = sorted(audited.union(new_audited))
+            manual_ids = accepted_review_ids(self.store, chapter, translated, self.dictionary)
+            qa_status = "manual_override" if manual_ids else "pass"
+            if (saved.get("manual_review_ids") != manual_ids
+                    or saved.get("qa_status") != qa_status or findings):
+                saved["manual_review_ids"] = manual_ids
+                saved["qa_status"] = qa_status
+                self.store.write(f"chapters/{chapter.key}.json", saved)
+                if findings:
+                    self.event("CHECKPOINT_SAVED", chapter=chapter.number,
+                               stage="post_dictionary_repair")
+            metrics = self._chapter_metrics(chapter, translated, saved)
+            self.store.write(f"metrics/{chapter.key}.json", metrics)
+            note_ids = [identifier for identifier, raw in chapter.paragraph_items
+                        if is_author_note(raw)]
+            reader_paragraphs = [item.text for item in translated.segments
+                                 if note_policy == "preserve" or item.id not in note_ids]
+            if note_policy == "separate" and note_ids:
+                separate_notes.append({
+                    "number": chapter.number,
+                    "notes": [item.text for item in translated.segments if item.id in note_ids],
+                })
+            translations.append({
+                "number": chapter.number, "title": translated.title,
+                "segments": [item.model_dump() for item in translated.segments],
+                "paragraphs": reader_paragraphs,
+                "author_note_ids": note_ids,
+                "qa_status": saved["qa_status"], "metrics": metrics,
+            })
+        output = "\n\n".join(
+            f"Chương {item['number']}" + (f": {item['title']}" if item["title"] else "")
+            + "\n" + "\n\n".join(item["paragraphs"])
+            for item in translations
         )
-        parsed = self.store.read("parsed-chapters.json")
-        if parsed and parsed.get("input_hash") == self.input_hash:
-            self.pairs = [
-                (Chapter.model_validate(pair[0]), Chapter.model_validate(pair[1]))
-                for pair in parsed["pairs"]
-            ]
-        else:
-            self.pairs = validate_inputs(inputs["raw"], inputs["vietphrase"])
-            self.store.write(
-                "parsed-chapters.json",
-                {
-                    "input_hash": self.input_hash,
-                    "pairs": [[raw.model_dump(), vp.model_dump()] for raw, vp in self.pairs],
-                },
+        self.store.write("translated.json", {"chapters": translations})
+        self.store.write("translated.txt", output + "\n")
+        if note_policy == "separate":
+            note_output = "\n\n".join(
+                f"Chương {item['number']} — Ghi chú tác giả\n" + "\n\n".join(item["notes"])
+                for item in separate_notes
             )
-        self.progress(
-            "Local parsing",
-            total_chapters=len(self.pairs),
-            chapter_start=min((raw.number for raw, _ in self.pairs), default=None),
-            chapter_end=max((raw.number for raw, _ in self.pairs), default=None),
-        )
-        self.store.write("parser-version.json", {"version": PARSER_VERSION})
-        await self.parallel(self.pairs, self.align)
-        self.local("alignment", "RAW/VietPhrase structural alignment passed")
-        self.local("chunk_construction", "Aligned chunks constructed locally")
-
-        frozen = self.store.read("frozen-dictionary.json")
-        if frozen:
-            try:
-                self.freeze(frozen["dictionary"])
-            except (KeyError, TypeError, ValueError, QualityError):
-                if frozen.get("input_hash") == self.input_hash:
-                    raise
-                frozen = None
-            else:
-                if frozen.get("input_hash") != self.input_hash:
-                    self.compatible_input_hashes.add(frozen.get("input_hash"))
-                if frozen.get("dictionary_hash") != self.frozen_hash:
-                    self.compatible_frozen_hashes.add(frozen.get("dictionary_hash"))
-                if (
-                    frozen.get("input_hash") != self.input_hash
-                    or frozen.get("dictionary_hash") != self.frozen_hash
-                ):
-                    self.store.write(
-                        "frozen-dictionary.json",
-                        {
-                            "input_hash": self.input_hash,
-                            "dictionary_hash": self.frozen_hash,
-                            "dictionary": export_dictionary(self.terms),
-                        },
-                    )
-        if not frozen:
-            await self.prepare_dictionary(inputs)
-        if not self.ignored:
-            saved_ignored = self.store.read("ignored_dictionary.json")
-            saved_candidates = (saved_ignored or {}).get("candidates", [])
-            if not saved_candidates:
-                audit = self.store.read("dictionary-audit.json")
-                if audit is not None:
-                    saved_candidates = audit.get("ignored", [])
-                    saved_ignored = audit
-                    if "ignored" not in audit:
-                        self.ignored_source_available = False
-            if saved_ignored is None and not saved_candidates:
-                self.ignored_source_available = False
-            elif isinstance(saved_ignored, dict) and saved_ignored.get("available") is False:
-                self.ignored_source_available = False
-            for item in saved_candidates:
-                source = item.get("source")
-                if source:
-                    self.ignored[source] = {
-                        "source": source,
-                        "state": "IGNORE",
-                        "reason": item.get("reason", "Ignored candidate"),
-                        "entity_class": item.get("candidate_type", "unknown"),
-                        "raw_occurrences": item.get("occurrence_count", 0),
-                        "competing_identities": item.get("competing_identities", []),
-                        "evidence": item.get("evidence", []),
-                        "proposed_canonical": item.get("proposed_canonical"),
-                        "proposed_translation": item.get("proposed_translation"),
-                        "resolver_used": item.get("resolver_used", False),
-                    }
-        self.assert_frozen()
-        self.refresh_style()
-        self.store.write("dictionary-resolution-report.json", self.dictionary_report())
-        await self.parallel(self.pairs, self.chapter)
-        self.assert_frozen()
-
-        self.progress("Local final global audit")
-        chapters, seen = [], set()
-        for raw, _ in self.pairs:
-            saved = self.store.read(f"chapters/{raw.key}.json")
-            if not saved:
-                raise QualityError(f"Missing completed chapter {raw.key}")
-            if raw.key in seen:
-                raise QualityError(f"Duplicate chapter {raw.key} in final assembly")
-            seen.add(raw.key)
-            if saved["dictionary_hash"] != self.frozen_hash:
-                raise QualityError(f"Chapter {raw.key} does not use the frozen dictionary")
-            translation = saved["translation"]
-            if not translation["title"].strip():
-                raise QualityError(f"Empty translated title for chapter {raw.key}")
-            chapters.append(
-                {
-                    **chapter_identity(raw),
-                    "title": translation["title"],
-                    "text": "\n\n".join(segment["text"] for segment in translation["segments"]),
-                }
-            )
-        self.local("final_global_audit", f"{len(chapters)} chapters passed final integrity audit")
-        self.store.write("translated.json", {"chapters": chapters})
-        self.store.write(
-            "translated.txt",
-            "\n\n".join(
-                f"{chapter['title']}\n{chapter['text']}" for chapter in chapters
-            )
-            + ("\n" if chapters else ""),
-        )
-        self.store.write(
-            "dictionary.json",
-            {
-                **export_dictionary(self.terms),
-                "dictionary_hash": self.frozen_hash,
-                # The confirmed dictionary is a runtime artifact.  Detailed
-                # ignored candidates live in ignored_dictionary.json instead
-                # of being smuggled back into this namespace.
-                "resolution_summary": self.dictionary_report()["summary"],
-            },
-        )
-        self.write_ignored_dictionary(complete=True, batch_status="DONE")
+            self.store.write("author-notes.txt", note_output + "\n" if note_output else "")
+        self.store.write("dictionary.json", {
+            "version": self.dictionary["version"],
+            "entries": self.dictionary["entries"],
+            "unresolved": self.unresolved,
+        })
+        self.store.write("unresolved.json", self.unresolved)
+        self.store.write("pipeline-version.json", {"version": PIPELINE_VERSION})
+        self.event("CHECKPOINT_SAVED", stage="batch_complete")
+        self.event("BATCH_COMPLETED", chapters=len(self.chapters),
+                   dictionary_entries=len(self.dictionary["entries"]))
         self.store.progress(
-            "done",
-            stage="Complete",
-            completed_chapters=len(chapters),
-            total_chapters=len(chapters),
-            active_chapters={},
-            dictionary_frozen=True,
-            dictionary_hash=self.frozen_hash,
-            confirmed_terms=len(self.terms),
-            ignored_candidates=len(self.ignored),
-            request_statistics=self.store.request_statistics(),
+            "done", stage="Complete", total_chapters=len(self.chapters),
+            completed_chapters=len(self.chapters), chapters_finalized=len(self.chapters),
+            confirmed_terms=len(self.dictionary["entries"]), unresolved_terms=len(self.unresolved),
+            dictionary_hash=digest(self.dictionary), request_statistics=self.store.request_statistics(),
+            error=None, error_detail=None,
         )

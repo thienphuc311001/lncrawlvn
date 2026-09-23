@@ -1,272 +1,55 @@
 # Chinese → Vietnamese translation pipeline
 
-The translation pipeline is deliberately two-phase:
+The active pipeline accepts UTF-8 RAW Chinese and an optional cumulative locked book dictionary. RAW is semantic truth; the dictionary is terminology truth. The application owns structure, state, and merges. Gemini proposes terminology, translates, and handles only targeted QA and repair. No VietPhrase text participates in translation.
 
-```text
-RAW + VietPhrase
-  → parse and structurally align
-  → extract/filter RAW candidates
-  → use aligned VietPhrase as evidence
-  → canonicalize and resolve plausible ambiguity
-  → freeze CONFIRMED dictionary
-  → translate RAW chunks with aligned VietPhrase hints
-  → deterministic validation
-  → zero or one targeted repair per chunk
-  → final global audit and export
-```
+## Architecture and stages
 
-## Source priority
+1. Parse numbered `第N章` headings locally, preserving order, source lines, and paragraph boundaries. Gaps are valid; duplicate, backwards, malformed, and empty chapters are errors with `input`, `chapter`, `line`, `previous_line`, and `reason` diagnostics. Assign stable `P0142_0001` IDs from chapter number and source paragraph order. Evident source censorship or broken punctuation is recorded separately in `source-quality.json`; RAW is never reconstructed.
+2. Load the cumulative dictionary, migrate supported older schemas, and scan the active RAW batch. Exact canonical/alias matches are removed from the candidate list. Candidate records carry frequency, chapters, and evidence snippets. Action fragments and known generic forms are filtered locally.
+3. Resolve only remaining candidates in book-level requests. A batch splits when its serialized evidence exceeds about 32,000 characters. Gemini returns `add_entry`, `add_alias`, and unresolved proposals under [REST structured output](https://ai.google.dev/gemini-api/docs/generate-content/structured-output). The transport sends Google's supported JSON Schema subset; local Pydantic validation retains stricter constraints. Local code validates every patch, rejects unproven or conflicting operations, and atomically checkpoints the full merged dictionary. Unresolved records stay separate and never block translation.
+4. Translate an ordinary chapter in one request when its source and estimated output fit configured budgets. Longer chapters group roughly up to 40 source paragraphs, preserving paragraph IDs. Extreme individual paragraphs split at sentence or clause punctuation into stable fragment IDs and merge back into their original ID. Each group receives the relevant full locked dictionary entries, up to four preceding locally accepted Vietnamese segments, and one following RAW unit as read-only lookahead. The title is translated with the first group.
+5. Reject provider responses without a `STOP` finish reason, valid JSON, and complete schema. Local validation requires exact IDs/order, non-empty text, no unwanted CJK, locked mappings, numeric preservation where unambiguous, no wrappers/duplicate output, and truncation signals. Obvious unfinished endings are hard defects. Only locally suspicious complete text receives targeted Gemini semantic QA. Confirmed defects receive one full-paragraph repair with local validation before replacement.
+6. Atomically commit a chapter after validation. A post-scan finds newly evidenced candidates; it skips Gemini if none exist. New dictionary entries cause a final local recheck and targeted repair of affected paragraphs.
+7. Publish `translated.json`, reader `translated.txt`, full merged `dictionary.json`, and `unresolved.json`. The dictionary object contains the full locked `entries` and carry-forward `unresolved` metadata, so it can be supplied unchanged to the next batch. The `done` status is written only after all artifacts and the pipeline-version marker are durable.
 
-The sources have fixed roles:
+Download links and HTTP attachment names use the uploaded RAW file's basename (for example, `0141-0150.txt` produces `0141-0150-translated.txt`, `0141-0150-dictionary.json`, and `0141-0150-unresolved.json`). Internal artifact names remain stable for checkpointing and resume. Preserved outputs retain the same download names after a batch is removed.
 
-1. The frozen confirmed dictionary is the terminology authority.
-2. RAW Chinese is the semantic/source-of-meaning authority.
-3. VietPhrase is auxiliary evidence for readings, segmentation and wording.
-4. Model judgment produces natural Vietnamese where the first three do not decide.
+## Dictionary schema and migration
 
-Consequently, a confirmed mapping always overrides VietPhrase wording, and RAW
-meaning always overrides a bad VietPhrase interpretation. VietPhrase is never
-scanned independently to invent Chinese dictionary keys and is never used as a
-mandatory reference translation.
+Canonical schema version 10 has exactly `source`, `translation`, `type`, `gender`, `status`, and `aliases` for every entry; aliases have `source` and `translation`. `status` is always `locked`. Types are `character`, `location`, `institution`, `book_title`, `memorial`, `book_section`, and `term`. Non-characters use `gender: "not_applicable"`; characters use `male`, `female`, or `unknown` according to evidence.
 
-## Parsing and alignment
+An older versioned dictionary or flat input list can migrate `organization`/`faction` to `institution` and `ability`/`technique`/`item`/`artifact`/`weapon`/`concept` to `term`. The job records these transformations in `dictionary-migration.json`. A dictionary explicitly marked v10 cannot retain old type values or extra canonical fields. Locked canonical/alias ownership conflicts are fatal; different Chinese sources may share one Vietnamese rendering. The application never changes a locked mapping to match a model typo. `dictionary.json` exports `{ "version": 10, "entries": [...], "unresolved": [...] }`; flat arrays are input compatibility only.
 
-RAW and VietPhrase are parsed independently. Volume markers, chapter identities,
-order, complete bodies and normalized line endings are retained. Chapters pair by
-structural identity, including volume where available; a missing chapter does not
-silently shift every later pair. Paragraph alignment is monotonic and deterministic,
-with only proven adjacent split/merge recovery. Ambiguous structures fail with a
-concrete input error. Current RAW TXT exports carry blank safe-block boundaries
-(≤3000 characters per block) that the parser already treats as block boundaries,
-so no alignment change was needed for them.
+Terminology policy distinguishes native Chinese identities (project-consistent Sino-Vietnamese forms) from clearly identified foreign names transliterated into Chinese (recognized international/Vietnamese forms such as `费利佩二世` → `Felipe II`). Uncertain identity remains unresolved. Canonical entries retain their aliases; the relevant glossary sent to a request includes the complete matching entry rather than a flattened source/target pair.
 
-## Terminology
+## Models, retries, and request budget
 
-Candidate discovery starts from RAW spans. Structural noise, ordinary vocabulary,
-quantity fragments, malformed spans, timestamps and generic phrases are recorded in
-the audit as `IGNORE`; they are not resolver candidates, dictionary entries or
-validator constraints. Offsets remain metadata and can never become a source string.
+Terminology and translation request `gemini-3.1-flash-lite` first and may fall back to `gemini-3.5-flash-lite`; targeted QA and repair request `gemini-3.5-flash-lite` directly. Both models receive the same versioned policy for a given operation. Each attempt records requested and actual model, key slot, operation, retry, finish reason, and token usage when the provider reports it. Generation uses model sampling defaults; optional thinking budget is configured centrally with `TRANSLATION_THINKING_BUDGET`.
 
-Aligned VietPhrase text is attached to each RAW occurrence as evidence. It can
-support a stable reading, but it cannot confirm a generic word or prove an alias by
-itself. Canonicalization happens before insertion, so a proven full name and alias
-share one identity with Chinese-keyed address forms. Different Chinese identities
-may share the same Vietnamese target; only one source identity having contradictory
-targets is a conflict.
+The scheduler defaults to two workers and 300 ms start staggering. Three named key slots plus optional comma-separated extras are supported. A daily quota response disables only its key/model pair for this run. RPM/TPM responses cool that pair for at least 60 seconds; all-cooling workers wait for the next available pair. Transient transport/server/schema errors receive at most `TRANSLATION_RETRIES_PER_PAIR` technical retries per pair (default two). A complete but structurally invalid translation receives one fallback-model escalation; quality is never improved by a random retry loop. `MAX_TOKENS` causes the affected group to split and regenerate, with prior accepted groups retained.
 
-Character-reference confirmation is an explicit pre-freeze gate:
+Statistics separate `logical_call_count`, `api_attempt_count`, `technical_retry_count`, `fallback_count`, and `cache_hit_count`, with per-operation breakdown for pre-dictionary, translation, QA, repair, and post-dictionary. Per-chapter metrics include raw/translated size, paragraph counts, request counts, retries, fallbacks, models, local findings, and final status. A warning appears at the configurable logical-call threshold (default at least 20, scaled by chapter count); hard guards stop at the higher logical threshold (default at least 30) or the API-attempt threshold (default at least 60). Repair calls exceeding translation calls emit a severe health warning. Failed repairs retain the original text and are not repeated on every resume.
 
-```text
-direct RAW link → CONFIRMED
-two independent strong RAW signals, with no competing owner → CONFIRMED
-otherwise → IGNORE + audit
-```
+## Validation, repair, and resume
 
-Resolver evidence is structured (`DIRECT_*`, `INDIRECT_*` and `NEGATIVE_*`) and every
-cited excerpt is checked against RAW locally. VietPhrase may support an interpretation
-but can never prove ownership. Sanity runs only on the resulting confirmed namespace;
-uncertain titles, role-only references and unknown historical forms reduce coverage
-instead of stopping the batch. A form has one owner, and audit/terminology output is
-deduplicated by `(canonical, form)`.
+The provider's structured output must contain each requested ID exactly once and in order. Local validators detect missing/duplicate/unexpected IDs, empty segments, CJK residue, wrappers, duplicate generated text, locked terminology, numeric mismatches (including decimal comma/period equivalence, common Chinese numerals, and Chinese/Vietnamese magnitude words such as 万/triệu), punctuation imbalance, unfinished function-word endings, missing terminal punctuation, abnormal clause/length coverage, and suspicious corpus-relative length ratios. Locked phrase checks ignore capitalization throughout the phrase, but still distinguish spelling and Vietnamese diacritics. Length ratio alone is not a confirmed omission.
 
-Runtime terminology has exactly two decisions:
+Semantic QA receives only the suspicious complete RAW/VI paragraphs, their local findings, relevant dictionary entries, and immediate neighbor context. It reports evidence-supported defects, or an empty finding list. Deterministic hard defects can proceed directly to repair. The repair request receives exactly one complete RAW paragraph, its current Vietnamese paragraph, confirmed defects, and relevant locked entries. The response must use the same ID and provide one complete paragraph. Application code checks content loss, punctuation, numeric/term preservation, and all remaining local findings before changing that ID. Previous versions are recorded under `revisions/`; rejected candidates are logged, the original stays in pending state, and the chapter requires manual review rather than silently committing.
 
-```text
-CONFIRMED → enters the frozen dictionary and is strictly validated
-IGNORE    → diagnostics only; never blocks translation
-```
+When a failed paragraph needs manual review, whether it is in a pending translation or a committed chapter being checked against the final dictionary, the browser shows its RAW text, current Vietnamese text, and local findings. The reviewer can edit the complete Vietnamese paragraph and continue; the replacement must pass local integrity checks and is recorded in `revisions/`. Alternatively, the reviewer can explicitly keep the current text and continue, accepting only the displayed findings for that exact paragraph, RAW, translation, and relevant locked dictionary. This decision is logged under `manual-reviews/`, and the chapter is marked `manual_override` rather than a normal QA pass. A changed paragraph or relevant dictionary invalidates the override. Neither action deletes or skips source content.
 
-Legacy records are migrated conservatively. Locked, explicitly confirmed or trusted
-user mappings can become `CONFIRMED`; provisional, report-only, unresolved and
-ambiguous records become `IGNORE`. A resolver `REVIEW`, reject, malformed result or
-uncertain alias is `IGNORE`, not a provisional runtime mapping. The resolver is only
-called for plausible RAW candidates that survive local filtering.
+Atomic JSON/text writes and a cross-process execution lease protect checkpoints. Parsed RAW, pre/post dictionary, locally validated groups, generated pending chapters, accepted repairs, committed chapters, and final artifacts are persisted. A resumed run validates RAW/dictionary hashes and policy version, reuses clean committed chapters and locally accepted groups, and never treats an unvalidated pending repair as accepted. Unversioned pre-rebuild job directories can be located by exact RAW and input-dictionary equality, but a versioned RAW-only job from a different policy is never silently reused. Old integer segment IDs are converted to stable IDs only when the source chapter and current local validation pass. Existing `done` jobs without the current pipeline-version marker run through migration and validation before being considered current.
 
-Candidate confirmation is class-specific. The scan classifies a span as a character or
-character reference, location, named book/work, organization/faction, artifact,
-technique, honorific/official office, event, concept, generic phrase or malformed
-noise before resolution. Character references still require ownership evidence; named
-places, works and items use proper-name/stable-use evidence instead. Generic places such
-as `京城`, quantities and ordinary actions remain `IGNORE`, while historical reality by
-itself never promotes a term. Non-character confirmations retain structured
-`entity_evidence` such as title-marker/work context, location counts, organization
-stability, item-use context or technique-use context rather than borrowing character
-identity fields.
+AI results are cached by a fingerprint of operation, policy/schema version, RAW, relevant dictionary, context, requested model, generation configuration, and context strategy. Only structurally and locally accepted translation groups enter the translation checkpoint cache. A changed relevant dictionary or source/context invalidates the result; unrelated entries omitted from the relevant subset do not.
 
-The dictionary is sanity-checked before freeze for valid source/target text,
-duplicate canonical identities, alias ownership and contradictory mappings. The
-frozen artifact contains confirmed entries only. Its content hash is carried by
-every translation chunk and chapter. After freeze, no resolver call, alias merge,
-mapping change or dictionary mutation is permitted.
+Clearly marked author/platform notes are detected locally. `TRANSLATION_AUTHOR_NOTE_POLICY=preserve` (default) keeps them in reader output; `remove` omits them from reader output; `separate` writes them to `author-notes.txt`. All source IDs and translations remain in internal chapter segments for audit.
 
-Character aliases/forms are identity references, not context translations. Resolver
-metadata is cleaned before insertion: canonical-name-plus-predicate fragments such as
-`邱途来` and `邱途接` are removed, while independently supported title, honorific,
-kinship and nickname forms such as `邱科长`, `邱探员`, `唐姐` and `老邱` may remain. A
-form must be independently attested in RAW and have a reference shape or explicit
-co-reference evidence; a context window or VietPhrase phrase cannot become a form.
-Legacy frozen dictionaries and resolved-term checkpoints go through the same cleanup.
-Cleanup writes a concise audit and produces a new dictionary hash.
+## Changed modules and verification
 
-Historical references such as `冯大伴`, `张尚书`, `李帅`, `赵缇帅` and `张侍班`
-are recognized as identity forms when RAW proves the referenced person. They retain
-the configured Sino-Vietnamese register (`Đại bạn`, `Thượng thư`, `soái`, `Đề soái`
-and `Thị ban`) and are never separate canonical identities. A known title prefix such
-as `大司徒` may precede a complete personal name (`大司徒王国光`), but a prefix plus a
-partial name (`大司徒王国`) is a truncated extraction and is migrated to or quarantined
-under the full identity rather than entering the strict namespace. Reference ownership
-is deduplicated across aliases and forms so one canonical/form pair is inserted and
-reported only once.
+The active path is `lncrawl/translation/parsing.py` → `dictionary.py` → `pipeline.py` → `scheduler.py`/`validation.py` → `store.py`, with `models.py`, `prompts.py`, and `notes.py` defining contracts. `api.py`, `__main__.py`, and `frontend/components/translation-workspace.tsx` expose the same pipeline through browser and CLI. Obsolete VietPhrase alignment, preprocessing, style/polish, and repeated QA/repair execution paths have been removed from translation. The remaining `lncrawl/binder/vietphrase.py` supports a separate TXT export format and is not imported by the translation pipeline.
 
-## Translation style and address register
+Offline tests in `tests/test_translation_pipeline.py` and `tests/test_translation_safety.py` cover parser errors and IDs, dictionary migration/patch conflicts, glossary ownership, exact response IDs, CJK/numeric/truncation checks, finish reasons, technical retries and key rotation, fallback, two-chapter request pattern, repair rejection, accepted repair immutability, group split after `MAX_TOKENS`, cache fingerprints, resume, and legacy checkpoint reuse. Frontend tests verify the RAW-only inputs and output links. The provider transport uses complete non-streaming responses, so there is no partial-stream accumulation state. A live two-chapter historical fixture completed in two translation attempts with no dictionary, QA, repair, retry, or fallback calls under the supplied locked-name dictionary.
 
-A Chinese title, honorific, kinship-style address, rank or official form of address is
-an identity reference with a semantic function, not free prose. The resolver may not
-choose a Vietnamese rendering only because it is the most natural modern conversational
-wording. The fixed priority is:
+## Remaining operational risks
 
-```text
-1. preserve the canonical character identity
-2. preserve the semantic function of the title/address form
-3. preserve the novel's established Sino-Vietnamese style
-4. prefer consistency with existing confirmed terminology
-5. only then optimize for modern Vietnamese naturalness
-```
-
-Every confirmed Chinese reference form is classified as exactly one of
-`literal_kinship`, `social_honorific`, `official_title`, `rank`, `role_reference`,
-`nickname` or `alias`, so a new form is compared against confirmed forms of the same
-class. The batch register is `sino-vietnamese` by default
-(`TRANSLATION_DICTIONARY_REGISTER`); `modern` expects modern Vietnamese, and `auto`
-derives the register from confirmed terminology and falls back to the Sino-Vietnamese
-baseline. The register recorded by a frozen dictionary or by the confirmed terms
-outranks an auto-derived profile, so re-freezing a checkpoint stays a fixed point.
-
-```text
-inherited + locally confirmed + resolver-accepted terms
-        ↓ derive the class-scoped style profile (local, no model calls)
-batch register  →  resolver request (translation_style + per-candidate address_form)
-                →  deterministic guard before freeze
-                →  frozen dictionary + dictionary-style-profile.json
-```
-
-The guard only touches forms whose Chinese shape has a known address suffix. A form
-whose wording contradicts the batch register is rewritten to the deterministic
-established rendering when the shape is unambiguous (`唐姐` → `Đường tỷ`,
-`老秦` → `Lão Tần`, `秦四爷` → `Tần Tứ gia`, `邱科长` → `Khoa trưởng Khâu`,
-`邱长官` → `Trưởng quan Khâu`, `唐副署长` → `Phó thự trưởng Đường`), and otherwise
-dropped with an audit record instead of being guessed. The canonical identity and its
-canonical translation are never modified, `唐姐` is never promoted to its own character
-identity, and exactly one preferred Vietnamese rendering is kept per confirmed Chinese
-key. A surname-prefixed address form is never promoted into its own character identity:
-RAW that does not prove the full name keeps it a report-only `IGNORE` reference in
-candidate discovery, and a resolver result that returns it as a bare canonical source is
-rejected so it can only exist as a form of the proven identity (bare nicknames such as
-`老秦` and bare titles stay eligible, because they can be the only attested way a
-character is named). RAW alone decides whether a kinship word is
-a literal family relationship or only a social address form; that answer is recorded as
-a hint and never used to mix registers. Rewrites and drops are written to
-`dictionary-register-cleanup.json` and counted as `register_normalizations` and
-`register_conflicts` in the dictionary report.
-
-## Translation contract
-
-Each request receives only:
-
-```text
-RAW chunk                  meaning source
-matching VietPhrase chunk auxiliary hint
-relevant frozen mappings   mandatory terminology
-```
-
-The prompt requires complete RAW coverage, natural Vietnamese, no summary or
-invention, and no dictionary creation. VietPhrase is not copied mechanically.
-Provider retry/key rotation remains separate from semantic repair: an API success
-still has to pass local validation.
-
-## Validation and repair
-
-Local validation is small and deterministic:
-
-- non-empty title and segments with exact IDs and source order;
-- invalid Unicode/control text and obvious Chinese residue;
-- source-aware presence of each relevant confirmed mapping;
-- chapter/title shape, placeholders and proven length/order checks already supported
-  by the application.
-
-Every fatal local finding is a typed `ValidationFinding` with a validator origin,
-reason, chapter/chunk location, stable source-segment ID, RAW excerpt and the
-expected/actual evidence relevant to that finding type. Content coverage findings
-distinguish a genuinely missing source ID from an aligned VietPhrase region that is
-fully visible in a neighboring output segment (a conservative merged-output case).
-The failure renderer is type-specific and never fills unrelated terminology fields
-with `n/a`. A finding without actionable evidence is an internal validation error,
-not a reportable fatal finding.
-
-Differences from VietPhrase wording alone never fail validation. Terminology findings
-use exact confirmed canonical/alias/form keys only. Each occurrence preserves `start`,
-`end`, `matched_source`, and separate left/right context; the invariant
-`raw[start:end] == matched_source` is checked before a finding is emitted. Longest-match
-selection applies only among confirmed keys and never absorbs adjacent Chinese,
-punctuation, ASCII or numbers. Required Vietnamese text comes only from the frozen
-mapping. Findings include the exact RAW source, required Vietnamese wording, actual
-realization, reason and location. A failed translation chunk receives at most one
-targeted repair containing only the failed RAW IDs, their aligned VietPhrase region,
-typed findings and relevant confirmed mappings, plus narrowly bounded previous/current/
-next source and translated context for the affected IDs. The same deterministic validator runs once
-after repair. A persistent failure stops with the exact findings; there is no recursive
-repair or repair-time dictionary mutation. On resume, serialized findings are never
-trusted: the current RAW, frozen dictionary and translation recompute local findings
-before any repair. Full-chapter assembly is an audit, not a second repair loop.
-
-## Checkpoints and outputs
-
-Existing parsed chapters, alignments, frozen dictionaries, completed chunks and
-validated chapters are reused when their input and dictionary hashes remain
-compatible. Old non-confirmed terminology is quarantined as `IGNORE`; an incompatible
-or contradictory inherited confirmed mapping fails clearly rather than being guessed.
-When a compatible frozen dictionary is cleaned, completed chapters are revalidated
-against the new hash. Passing chapters are rewritten with the cleaned hash; failing
-chapters fall back to chunk-level checkpoint validation and repair, so unaffected work
-is reused. Old validation findings naming removed forms are overwritten by current
-RAW/dictionary/output findings.
-
-The job writes:
-
-- `translated.json` and the CLI's final Vietnamese TXT/export;
-- `dictionary.json` and `frozen-dictionary.json` containing confirmed entries only;
-- `ignored_dictionary.json`, a versioned, deterministically ordered manual-review
-  artifact containing every final `IGNORE` decision, bounded RAW evidence, reason
-  codes, occurrence/chapter metadata and empty manual-review fields. It is never
-  loaded as runtime terminology;
-- `dictionary-audit.json` and the existing resolution report for internal audits;
-- `dictionary-style-profile.json`, `dictionary-register-cleanup.json` and
-  `dictionary-form-cleanup.json` for the derived style and local cleanup audits;
-- parser, alignment, chunk, chapter and validation checkpoints.
-
-The translation workspace derives a human-readable batch label from optional book
-metadata and the parsed chapter range. Polling snapshots expose the current stage,
-finalized chapter/chunk counts, current chapter/chunk, confirmed and ignored
-terminology counts, repair count and failure location while retaining the opaque
-batch ID only as a secondary diagnostic field. Completed batches expose the TXT,
-confirmed dictionary and ignored dictionary as separate downloads.
-
-`DELETE /api/translation/jobs/{job_id}` is an explicit batch-management operation.
-It cancels active work before cleanup, removes the persisted batch/checkpoint state,
-never deletes the original user inputs, and preserves generated outputs by moving
-only known batch-owned artifacts to a separate output store unless
-`delete_outputs=true` is explicitly requested. Repeated deletion is safe and a
-deleted batch is absent from subsequent job listings and resume operations.
-
-Normal logs report parsed/aligned chapters, RAW candidates, ignored candidates,
-resolver candidates, confirmed terms, translated/validated chunks, repair attempts
-and final audit status without logging every ignored phrase.
-
-## Deliberately removed from the active path
-
-The production pipeline no longer uses provisional enforcement, report-only
-validation, semantic-conflict passes, resolver fallback mappings, repeated resolver
-corrections, repeated targeted repairs, whole-novel VietPhrase prompts, or runtime
-dictionary mutation. Compatibility schemas and legacy fields remain only where they
-are needed to read old checkpoints safely; they do not affect translation-time
-enforcement.
+Local checks cannot prove subtle semantic equivalence; clean chapters intentionally do not receive universal AI QA. Non-locked recurring idioms can still be phrased differently across simultaneously translated chapters. Automatically locking an ordinary idiom is riskier: in a live trial the model proposed an over-narrow meaning for one, so such phrases are not promoted by title repetition alone. Chinese numeral parsing is conservative and may flag unusual number constructions for review. The local terminology scanner favors precision and may leave low-evidence names unresolved. Production throughput and model-specific output limits should be measured on real book batches before raising concurrency or request-size budgets. The configured model IDs must be available to the Google AI project used by the deployment.

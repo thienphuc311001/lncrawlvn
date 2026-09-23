@@ -652,6 +652,11 @@ html { scroll-behavior: smooth; }
 .translation-config summary { cursor: pointer; margin-bottom: 16px; }
 .translation-config .settings-field { max-width: 420px; margin-bottom: 12px; }
 .translation-progress { border: 1px solid var(--border); border-radius: 12px; padding: 24px; margin-block: 24px; }
+.translation-manual-review { margin: 20px 0; padding: 20px; border: 1px solid #d99249; border-radius: 10px; background: #fffaf3; }
+.translation-manual-review h3 { margin: 0 0 12px; }
+.translation-review-raw { white-space: pre-wrap; overflow-wrap: anywhere; }
+.translation-manual-review textarea { box-sizing: border-box; width: 100%; max-width: 100%; padding: 12px; border: 1px solid var(--border); border-radius: 8px; font: inherit; line-height: 1.6; }
+.translation-review-actions { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 14px; }
 .translation-downloads { display: flex; flex-wrap: wrap; gap: 12px; }
 .translation-workspace p { margin-block: 12px; }
 /* Reuse the crawler terminal styles without its fixed bottom dock. */

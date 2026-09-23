@@ -1,0 +1,30 @@
+{
+  "version": 10,
+  "entries": [
+    {
+      "source": "张居正",
+      "translation": "Trương Cư Chính",
+      "type": "character",
+      "gender": "male",
+      "status": "locked",
+      "aliases": []
+    },
+    {
+      "source": "王崇古",
+      "translation": "Vương Sùng Cổ",
+      "type": "character",
+      "gender": "male",
+      "status": "locked",
+      "aliases": []
+    },
+    {
+      "source": "费利佩二世",
+      "translation": "Felipe II",
+      "type": "character",
+      "gender": "male",
+      "status": "locked",
+      "aliases": []
+    }
+  ],
+  "unresolved": []
+}

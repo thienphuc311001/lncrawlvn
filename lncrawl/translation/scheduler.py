@@ -13,7 +13,7 @@ from enum import Enum
 import httpx
 from pydantic import ValidationError
 
-from .models import MODELS
+from .models import FALLBACK_MODEL, MODELS, PRIMARY_MODEL
 
 
 class ErrorCategory(str, Enum):
@@ -22,6 +22,8 @@ class ErrorCategory(str, Enum):
     TPM_LIMIT = "TPM_LIMIT"
     TEMPORARY_PROVIDER_ERROR = "TEMPORARY_PROVIDER_ERROR"
     AUTHENTICATION_ERROR = "AUTHENTICATION_ERROR"
+    MODEL_FAILURE = "MODEL_FAILURE"
+    INCOMPLETE_GENERATION = "INCOMPLETE_GENERATION"
     UNKNOWN_ERROR = "UNKNOWN_ERROR"
 
 
@@ -88,10 +90,6 @@ def response_retry_delay(response):
 def response_error_category(response):
     """Classify provider responses without treating every 429 as daily quota."""
     code = response.status_code
-    if code in (400, 401, 403, 404):
-        return ErrorCategory.AUTHENTICATION_ERROR
-    if code in (408, 409) or code >= 500:
-        return ErrorCategory.TEMPORARY_PROVIDER_ERROR
     text = " ".join(
         [
             response.headers.get("x-ratelimit-limit", ""),
@@ -111,11 +109,48 @@ def response_error_category(response):
         return ErrorCategory.TPM_LIMIT
     if "requestsperminute" in normalized or "rpm" in normalized or "ratelimit" in normalized:
         return ErrorCategory.RPM_LIMIT
+    if code == 404:
+        return ErrorCategory.MODEL_FAILURE
+    if code in (400, 401, 403):
+        return ErrorCategory.AUTHENTICATION_ERROR
+    if code in (408, 409) or code >= 500:
+        return ErrorCategory.TEMPORARY_PROVIDER_ERROR
     return ErrorCategory.UNKNOWN_ERROR
 
 
 def response_daily_quota(response):
     return response_error_category(response) is ErrorCategory.DAILY_QUOTA_EXHAUSTED
+
+
+def provider_json_schema(schema):
+    """Emit only Gemini's documented JSON Schema subset; validate fully locally."""
+    raw = schema.model_json_schema()
+    scalar = {"$id", "$ref", "$anchor", "type", "format", "title", "description",
+              "enum", "minItems", "maxItems", "minimum", "maximum", "required"}
+    maps = {"properties", "$defs"}
+    nested = {"items", "additionalProperties"}
+    arrays = {"prefixItems", "anyOf", "oneOf"}
+
+    def clean(node):
+        if not isinstance(node, dict):
+            return node
+        result = {}
+        for key, value in node.items():
+            if key == "const":
+                result["enum"] = [value]
+            elif key in maps and isinstance(value, dict):
+                result[key] = {name: clean(child) for name, child in value.items()}
+            elif key in nested:
+                result[key] = clean(value)
+            elif key in arrays and isinstance(value, list):
+                result[key] = [clean(child) for child in value]
+            elif key in scalar:
+                result[key] = value
+        if "$ref" in result:
+            return {"$ref": result["$ref"]}
+        return result
+
+    return clean(raw)
 
 
 class Scheduler:
@@ -142,13 +177,15 @@ class Scheduler:
         self.keys = self.keys or [None]
         self.pairs = [(model, key_slot) for model in MODELS for key_slot in range(len(self.keys))]
         self.daily_exhausted, self.cooldowns, self.disabled_keys = set(), {}, set()
+        self.max_attempts_per_pair = max(1, int(os.getenv("TRANSLATION_RETRIES_PER_PAIR", "2")) + 1)
 
     @staticmethod
     def _pair_label(pair):
         return f"{pair[0]} [key slot {pair[1] + 1}]"
 
-    async def _next_pair(self, excluded, preferred=None, after=None):
+    async def _next_pair(self, excluded, preferred=None, after=None, ordered_pairs=None):
         """Choose a ready pair; wait only when all otherwise valid pairs are cooling."""
+        ordered_pairs = ordered_pairs or self.pairs
         async with self.state_lock:
             now = time.monotonic()
             self.cooldowns = {pair: until for pair, until in self.cooldowns.items() if until > now}
@@ -160,10 +197,10 @@ class Scheduler:
                 and preferred[1] not in self.disabled_keys
             ):
                 return preferred, 0
-            start = 0 if after is None else (self.pairs.index(after) + 1) % len(self.pairs)
-            for offset in range(len(self.pairs)):
-                index = (start + offset) % len(self.pairs)
-                pair = self.pairs[index]
+            start = 0 if after is None else (ordered_pairs.index(after) + 1) % len(ordered_pairs)
+            for offset in range(len(ordered_pairs)):
+                index = (start + offset) % len(ordered_pairs)
+                pair = ordered_pairs[index]
                 if (
                     pair not in excluded
                     and pair not in self.daily_exhausted
@@ -174,7 +211,7 @@ class Scheduler:
             waits = [
                 until - now
                 for pair, until in self.cooldowns.items()
-                if pair not in excluded
+                if pair in ordered_pairs and pair not in excluded
                 and pair not in self.daily_exhausted
                 and pair[1] not in self.disabled_keys
             ]
@@ -185,25 +222,38 @@ class Scheduler:
             if error.category is ErrorCategory.DAILY_QUOTA_EXHAUSTED:
                 self.daily_exhausted.add(pair)
             elif error.category in (ErrorCategory.RPM_LIMIT, ErrorCategory.TPM_LIMIT):
-                self.cooldowns[pair] = time.monotonic() + self.RATE_LIMIT_COOLDOWN
+                self.cooldowns[pair] = time.monotonic() + max(self.RATE_LIMIT_COOLDOWN, error.retry_after)
             elif error.category is ErrorCategory.AUTHENTICATION_ERROR:
                 self.disabled_keys.add(pair[1])
 
-    async def request(self, operation, payload, schema, record):
+    async def request(self, operation, payload, schema, record,
+                      requested_model=PRIMARY_MODEL, allow_fallback=True):
+        if requested_model not in MODELS:
+            raise ValueError(f"Unsupported configured model {requested_model!r}")
+        model_order = ([PRIMARY_MODEL, FALLBACK_MODEL] if requested_model == PRIMARY_MODEL
+                       and allow_fallback else [requested_model])
+        ordered_pairs = [(model, slot) for model in model_order for slot in range(len(self.keys))]
+        generation_config = {
+            "responseMimeType": "application/json",
+            "responseJsonSchema": provider_json_schema(schema),
+        }
+        if os.getenv("TRANSLATION_THINKING_BUDGET"):
+            generation_config["thinkingConfig"] = {
+                "thinkingBudget": int(os.environ["TRANSLATION_THINKING_BUDGET"])
+            }
         body = {
             "systemInstruction": {"parts": [{"text": operation}]},
             "contents": [
                 {"role": "user", "parts": [{"text": json.dumps(payload, ensure_ascii=False)}]}
             ],
-            "generationConfig": {
-                "responseMimeType": "application/json",
-                "responseJsonSchema": schema.model_json_schema(),
-                "temperature": 0.15,
-            },
+            "generationConfig": generation_config,
         }
         attempts, pair_attempts, excluded, failures, preferred, after = 0, {}, set(), {}, None, None
+        failure_categories = {}
+        previous_pair = None
+        previous_failure_category = None
         while True:
-            pair, wait = await self._next_pair(excluded, preferred, after)
+            pair, wait = await self._next_pair(excluded, preferred, after, ordered_pairs)
             preferred = None
             if pair is None:
                 if wait:
@@ -220,10 +270,14 @@ class Scheduler:
                 summary = "; ".join(
                     f"{self._pair_label(item)}: {reason}" for item, reason in failures.items()
                 )
+                category = (ErrorCategory.INCOMPLETE_GENERATION
+                            if failures and all(value is ErrorCategory.INCOMPLETE_GENERATION
+                                                for value in failure_categories.values())
+                            else ErrorCategory.UNKNOWN_ERROR)
                 raise ProviderError(
                     f"No usable Gemini model/API-key combination remains: {summary}"
-                    if summary
-                    else "No usable Gemini model/API-key combination is configured"
+                    if summary else "No usable Gemini model/API-key combination is configured",
+                    category=category,
                 )
             model, key_slot = pair
             attempts += 1
@@ -233,22 +287,38 @@ class Scheduler:
                 "key_slot": key_slot + 1,
                 "retry_count": attempts - 1,
                 "attempt": pair_attempts[pair],
+                "key_rotated": previous_pair is not None and previous_pair[1] != key_slot,
+                "model_changed": previous_pair is not None and previous_pair[0] != model,
+                "requested_model": requested_model,
+                "technical_retry": previous_failure_category in (
+                    ErrorCategory.RPM_LIMIT, ErrorCategory.TPM_LIMIT,
+                    ErrorCategory.TEMPORARY_PROVIDER_ERROR,
+                ),
+                "model_fallback_started": model != requested_model
+                and (previous_pair is None or previous_pair[0] != model),
             }
-            record({**metadata, "status": "queued"})
             try:
                 async with self.slots:
                     async with self.gate:
                         await asyncio.sleep(max(0, self.next_start - time.monotonic()))
                         self.next_start = time.monotonic() + self.spacing
                     record({**metadata, "status": "running"})
+                    previous_pair = pair
                     result = await asyncio.wait_for(
                         self.transport(model, body)
                         if self.transport
                         else self._send(model, body, self.keys[key_slot]),
                         timeout=self.timeout,
                     )
+                    response_meta = {}
+                    if isinstance(result, dict) and "__response_meta__" in result:
+                        result = dict(result)
+                        response_meta = result.pop("__response_meta__")
                     parsed = schema.model_validate(result)
-                record({**metadata, "status": "success"})
+                    object.__setattr__(parsed, "_request_meta", {**metadata, **response_meta,
+                        "requested_model": requested_model, "actual_model": model,
+                        "generation_config": generation_config})
+                record({**metadata, **response_meta, "status": "success"})
                 return parsed
             except asyncio.CancelledError:
                 record({**metadata, "status": "cancelled"})
@@ -270,6 +340,8 @@ class Scheduler:
             except ProviderError as exc:
                 error = exc
             failures[pair] = str(error)
+            failure_categories[pair] = error.category
+            previous_failure_category = error.category
             record(
                 {
                     **metadata,
@@ -316,7 +388,7 @@ class Scheduler:
                 )
                 after = pair
                 continue
-            if error.retryable and pair_attempts[pair] < 2:
+            if error.retryable and pair_attempts[pair] < self.max_attempts_per_pair:
                 delay = max(
                     error.retry_after + 1 if error.retry_after else 0,
                     1.0 * 2 ** (pair_attempts[pair] - 1),
@@ -334,8 +406,6 @@ class Scheduler:
                     self.next_start = max(self.next_start, time.monotonic() + delay)
                 preferred = pair
                 continue
-            if error.category is ErrorCategory.UNKNOWN_ERROR and not error.retryable:
-                raise error
             excluded.add(pair)
             after = pair
 
@@ -371,10 +441,13 @@ class Scheduler:
             candidate = data["candidates"][0]
             reason = candidate.get("finishReason")
             if reason in ("SAFETY", "BLOCKLIST", "PROHIBITED_CONTENT", "RECITATION"):
-                raise ProviderError(f"Gemini blocked response: {reason}")
+                raise ProviderError(f"Gemini blocked response: {reason}", category=ErrorCategory.MODEL_FAILURE)
+            if reason == "MAX_TOKENS":
+                raise ProviderError("Gemini incomplete response: MAX_TOKENS",
+                                    category=ErrorCategory.INCOMPLETE_GENERATION)
             if reason != "STOP":
                 raise ProviderError(
-                    "Provider response interrupted",
+                    f"Provider response interrupted: {reason}",
                     True,
                     category=ErrorCategory.TEMPORARY_PROVIDER_ERROR,
                 )
@@ -385,7 +458,15 @@ class Scheduler:
             )
             if not text.strip():
                 raise ValueError("Empty response")
-            return json.loads(text)
+            value = json.loads(text)
+            if not isinstance(value, dict):
+                raise ValueError("Structured response must be an object")
+            value["__response_meta__"] = {
+                "finish_reason": reason,
+                "input_token_count": data.get("usageMetadata", {}).get("promptTokenCount"),
+                "output_token_count": data.get("usageMetadata", {}).get("candidatesTokenCount"),
+            }
+            return value
         except (KeyError, IndexError, ValueError, TypeError) as exc:
             raise ProviderError(
                 "Invalid/empty provider response",

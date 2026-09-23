@@ -1,419 +1,333 @@
-"""Concrete local output findings; successful translations need no provider review."""
+"""Deterministic structural, terminology, numeric, and truncation validation."""
 
+from __future__ import annotations
+
+import os
 import re
+import unicodedata
 from collections import Counter
+from decimal import Decimal
 
-from .dictionary import terminology_findings
-from .models import Issue
-from .parsing import HAN, parse_chapter_heading
+from .dictionary import locked_matches
+from .models import Translation
 
-PLACEHOLDER = re.compile(
-    r"\{\{[^{}\n]+\}\}|\{[^{}\n]+\}|<[/\w][^<>\n]*>|%\([^)]+\)[sd]|\$\{[^}\n]+\}"
+HAN = re.compile(r"[\u3400-\u9fff]")
+ARABIC_NUMBER = re.compile(r"(?<![0-9A-Za-z])\d+(?:[.,]\d+)*(?![0-9A-Za-z])")
+CHINESE_CONTEXT_NUMBER = re.compile(
+    r"(?<![0-9.,])([零〇一二两三四五六七八九十百千万亿]+)(?="
+    r"个|人|名|位|年|月|日|天|时|点|分|秒|章|回|卷|页|号|次|遍|斤|两|银|钱|克|米|里|倍|成|层|岁|件|本|册|枚|颗|条|匹|辆|艘|万|亿)"
+)
+WRAPPERS = re.compile(
+    r"^\s*(?:```|#\s|<(?:translation|chapter)>|\{\s*\"(?:title|segments)\")", re.I
+)
+TITLE_WRAPPER = re.compile(r"^\s*(?:Chương|Chapter)\s*\d+\s*[:：.\-]?\s*", re.I)
+TERMINAL_SOURCE = re.compile(r"[。！？!?…」』”）】]$")
+TERMINAL_VI = re.compile(r"[.!?…:;”’\"')\]]$")
+FUNCTION_ENDING = re.compile(
+    r"(?:\b(?:và|hoặc|nhưng|mà|vì|bởi|để|với|của|rằng|thì|là|đã|đang|sẽ|"
+    r"không|chẳng|chưa|mới|vừa|bị|được|từ|đến|trong|ngoài|trên|dưới|như|nếu|khi|"
+    r"bắt đầu|không phải)\s*)$",
+    re.I,
+)
+CLAUSES = re.compile(r"[，,；;：:。.!！？?]")
+SEMANTIC_SUSPICIONS = {"suspicious_length_ratio", "suspicious_truncation",
+                       "suspicious_numeric_mismatch"}
+SOURCE_CENSORSHIP = re.compile(r"(?<=[\u3400-\u9fff])\*+(?=[\u3400-\u9fff])|\*{2,}")
+VI_SCALE = re.compile(r"^\s*(nghìn|ngàn|triệu|tỷ|tỉ|vạn)\b", re.I)
+VI_SCALE_VALUES = {"nghìn": 1_000, "ngàn": 1_000, "triệu": 1_000_000,
+                   "tỷ": 1_000_000_000, "tỉ": 1_000_000_000, "vạn": 10_000}
+ZH_SCALE_VALUES = {"万": 10_000, "亿": 100_000_000}
+VI_WORD_NUMBERS = {"một": "1", "hai": "2", "ba": "3", "bốn": "4", "năm": "5",
+                   "sáu": "6", "bảy": "7", "tám": "8", "chín": "9", "mười": "10"}
+VI_NUMBER_WORD_CONTEXT = re.compile(
+    r"\b(?:bậc|thứ|căn|mũ|số)\s+(một|hai|ba|bốn|năm|sáu|bảy|tám|chín|mười)\b", re.I
 )
 
 
-def _location(payload):
-    location = payload.get("location") or {}
-    return location.get("chapter"), location.get("chunk")
+def _normalize_number(value, source=False, scaled=False):
+    """Return a decimal value, distinguishing common grouping from fractions."""
+    separators = re.findall(r"[.,]", value)
+    if len(separators) > 1:
+        groups = re.split(r"[.,]", value)
+        if len(set(separators)) == 1 and all(len(group) == 3 for group in groups[1:]):
+            value = "".join(groups)
+        else:
+            value = "".join(groups[:-1]) + "." + groups[-1]
+    elif separators:
+        separator = separators[0]
+        before, after = value.split(separator)
+        grouping = (len(after) == 3 and not scaled
+                    and ((source and separator == ",") or (not source and separator == ".")))
+        value = before + after if grouping else before + "." + after
+    return Decimal(value)
 
 
-def _source_segment_id(payload, paragraph_id, paragraph=None):
-    paragraph = paragraph or {}
-    if paragraph.get("source_segment_id"):
-        return paragraph["source_segment_id"]
-    chapter, chunk = _location(payload)
-    if chapter is not None and chunk is not None:
-        return f"c{chapter}-k{chunk}-s{paragraph_id}"
-    if chapter is not None:
-        return f"c{chapter}-s{paragraph_id}"
-    return f"s{paragraph_id}"
+def _number_key(value):
+    if not value:
+        return "0"
+    rendered = format(value.normalize(), "f")
+    return rendered.rstrip("0").rstrip(".") if "." in rendered else rendered
 
 
-def _finding(
-    payload,
-    paragraph,
-    *,
-    kind,
-    finding_type,
-    reason,
-    explanation,
-    expected=None,
-    actual=None,
-    translated_excerpt=None,
-    details=None,
-    validator=None,
-    **fields,
-):
-    paragraph = paragraph or {}
-    chapter, chunk = _location(payload)
-    source_text = paragraph.get("text", "")
-    return Issue(
-        segment_id=paragraph.get("id", -1),
-        kind=kind,
-        type=finding_type,
-        reason=reason,
-        explanation=explanation,
-        severity="FATAL",
-        validator=validator,
-        chapter_number=chapter,
-        chunk_index=chunk,
-        source_segment_id=_source_segment_id(payload, paragraph.get("id", -1), paragraph),
-        source_line=paragraph.get("source_line", paragraph.get("line")),
-        source_excerpt=source_text or None,
-        expected=expected,
-        actual=actual,
-        translated_excerpt=translated_excerpt,
-        details=details,
-        **fields,
-    )
-
-
-def _normalized_words(value):
-    return [
-        word.casefold()
-        for word in re.findall(r"[\wÀ-ỹĐđ]+", value or "", re.UNICODE)
-        if len(word) > 1
-    ]
-
-
-def _merged_output_region(payload, paragraph_id, segments):
-    """Recognize a missing ID as merged only with visible VP support."""
-    vp_by_id = {item.get("id"): item.get("text", "") for item in payload.get("vp", [])}
-    expected_words = _normalized_words(vp_by_id.get(paragraph_id, ""))
-    # One isolated word (often a name or a shared function word) cannot prove
-    # that an entire source paragraph was merged into a neighbor.
-    if len(expected_words) < 2:
+def _chinese_integer(value):
+    digits = {"零": 0, "〇": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
+              "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+    units = {"十": 10, "百": 100, "千": 1000, "万": 10_000, "亿": 100_000_000}
+    if re.search(r"[百千万亿][一二三四五六七八九]$", value) and "零" not in value:
+        # Colloquial forms such as 一万二 and 一百二 are context dependent.
         return None
-    for segment in segments:
-        output_words = set(_normalized_words(segment.text))
-        matched = [word for word in expected_words if word in output_words]
-        # A shared dictionary/name token is not proof that the missing source
-        # was merged into this output paragraph.  Suppress a missing-ID
-        # finding only when the complete aligned VP word set is visible;
-        # partial overlap remains a real coverage failure.
-        if len(matched) == len(expected_words):
-            return {
-                "output_segment_id": segment.id,
-                "matched_words": matched,
-                "coverage_status": "merged_with_neighbor",
-            }
+    if all(char in digits for char in value):
+        return int("".join(str(digits[char]) for char in value))
+    total = section = number = 0
+    for char in value:
+        if char in digits:
+            number = digits[char]
+            continue
+        unit = units.get(char)
+        if unit is None:
+            return None
+        if unit < 10_000:
+            section += (number or 1) * unit
+        else:
+            section = (section + number) * unit
+            total += section
+            section = 0
+        number = 0
+    return total + section + number
+
+
+def numeric_values(text, source=False, source_literals=()):
+    values = Counter()
+    for match in ARABIC_NUMBER.finditer(text):
+        tail = text[match.end():]
+        if source:
+            scale = ZH_SCALE_VALUES.get(tail[:1], 1)
+        else:
+            unit = VI_SCALE.match(tail)
+            scale = VI_SCALE_VALUES[unit[1].lower()] if unit else 1
+        same_literal = not source and scale == 1 and match[0] in source_literals
+        value = _normalize_number(match[0], source=source or same_literal, scaled=scale != 1)
+        values[_number_key(value * scale)] += 1
+    return values
+
+
+def vietnamese_numeric_allowances(text):
+    return Counter(VI_WORD_NUMBERS[match[1].lower()]
+                   for match in VI_NUMBER_WORD_CONTEXT.finditer(text))
+
+
+def chinese_numeric_allowances(text):
+    values = Counter()
+    ambiguous = False
+    for match in CHINESE_CONTEXT_NUMBER.finditer(text):
+        value = _chinese_integer(match[1])
+        if value is not None:
+            values[str(value)] += 1
+        else:
+            ambiguous = True
+    return values, ambiguous
+
+
+def numeric_mismatch(raw, translated):
+    """Return missing/extra values while allowing digits rendered from Chinese numerals."""
+    source = numeric_values(raw, source=True)
+    source_literals = {
+        match[0] for match in ARABIC_NUMBER.finditer(raw)
+        if raw[match.end():match.end() + 1] not in ZH_SCALE_VALUES
+    }
+    target = numeric_values(translated, source_literals=source_literals)
+    missing = source - target
+    missing -= vietnamese_numeric_allowances(translated)
+    extras = target - source
+    allowances, ambiguous = chinese_numeric_allowances(raw)
+    extras -= allowances
+    if missing or extras:
+        return {"missing": dict(missing), "extra": dict(extras), "ambiguous": ambiguous}
     return None
 
 
-def validate_findings(issues):
-    """Reject anonymous fatal findings before they reach logs or repair."""
-    for issue in issues:
-        if issue.severity != "FATAL":
-            continue
-        if not issue.type or not issue.validator:
-            raise ValueError(
-                "Validation finding invariant failed: fatal finding lacks "
-                f"type/validator (segment={issue.source_segment_id!r})"
-            )
-        actionable = any(
-            value not in (None, "", [], {})
-            for value in (
-                issue.source,
-                issue.source_excerpt,
-                issue.translated_excerpt,
-                issue.actual_text,
-                issue.details,
-            )
-        )
-        if not actionable:
-            raise ValueError(
-                "Validation finding invariant failed: "
-                f"validator={issue.validator!r}, type={issue.type!r}, "
-                f"segment={issue.source_segment_id!r} has no actionable evidence"
-            )
-    return issues
+def _locked_target_present(target, text):
+    """Ignore capitalization without ignoring spelling or Vietnamese marks."""
+    target = unicodedata.normalize("NFC", target).casefold()
+    text = unicodedata.normalize("NFC", text).casefold()
+    return target in text
 
 
-def _deduplicate_findings(issues):
-    """Keep one diagnostic for each concrete validator/source observation."""
-    result, seen = [], set()
-    for issue in issues:
-        if issue.type == "terminology":
-            key = (
-                issue.type,
-                issue.segment_id,
-                issue.canonical_source,
-                issue.source,
-                issue.required_translation,
-            )
-        else:
-            key = (
-                issue.type,
-                issue.segment_id,
-                issue.reason,
-                issue.expected,
-                issue.actual,
-            )
-        if key in seen:
-            continue
-        seen.add(key)
-        result.append(issue)
+def _balanced(text):
+    for left, right in (("“", "”"), ("‘", "’"), ("「", "」"), ("『", "』"),
+                        ("(", ")"), ("[", "]"), ("（", "）"), ("【", "】"), ("«", "»")):
+        if text.count(left) != text.count(right):
+            return False
+    if text.count('"') % 2:
+        return False
+    return True
+
+
+def structural_findings(expected_ids, segments):
+    """Validate the response envelope without an AI call."""
+    actual = [segment.id for segment in segments]
+    expected = list(expected_ids)
+    findings = []
+    duplicates = sorted(value for value, count in Counter(actual).items() if count > 1)
+    if duplicates:
+        findings.append({"kind": "duplicate_id", "ids": duplicates})
+    missing = [value for value in expected if value not in actual]
+    unexpected = [value for value in actual if value not in expected]
+    if missing:
+        findings.append({"kind": "missing_id", "ids": missing})
+    if unexpected:
+        findings.append({"kind": "unexpected_id", "ids": unexpected})
+    if not missing and not unexpected and actual != expected:
+        findings.append({"kind": "out_of_order_id", "expected": expected, "actual": actual})
+    for segment in segments:
+        if not segment.text.strip():
+            findings.append({"kind": "empty_segment", "id": segment.id})
+    return findings
+
+
+def _truncation_signals(raw, vi):
+    if not raw or not vi:
+        return []
+    signals = []
+    ratio = len(vi) / max(1, len(raw))
+    if len(raw) >= 24 and ratio < 0.34:
+        signals.append("very_low_length_ratio")
+    if len(raw) >= 45 and len(CLAUSES.findall(vi)) + 1 < max(2, (len(CLAUSES.findall(raw)) + 1) * 0.4):
+        signals.append("clause_loss")
+    if _balanced(raw) and not _balanced(vi):
+        signals.append("unmatched_punctuation")
+    if TERMINAL_SOURCE.search(raw.rstrip()) and not TERMINAL_VI.search(vi.rstrip()):
+        signals.append("missing_terminal_punctuation")
+    if FUNCTION_ENDING.search(vi.rstrip(" \t\n,;:")):
+        signals.append("function_word_ending")
+    return signals
+
+
+def _segment_findings(identifier, raw, vi, dictionary, duplicate=False, check_truncation=True):
+    findings = []
+    vi = vi.strip()
+    if not vi:
+        return [{"kind": "empty_segment", "id": identifier}]
+    if WRAPPERS.search(vi):
+        findings.append({"kind": "malformed_wrapper", "id": identifier})
+    if HAN.search(vi):
+        findings.append({"kind": "chinese_residue", "id": identifier})
+    if len(raw) > 80 and raw in vi:
+        findings.append({"kind": "raw_copied", "id": identifier})
+    if duplicate:
+        findings.append({"kind": "duplicate_output", "id": identifier})
+    mismatch = numeric_mismatch(raw, vi)
+    if mismatch:
+        findings.append({"kind": "suspicious_numeric_mismatch" if mismatch["ambiguous"]
+                         else "numeric_mismatch", "id": identifier, **mismatch})
+    for _, source, target in locked_matches(dictionary, raw):
+        if not _locked_target_present(target, vi):
+            findings.append({
+                "kind": "locked_term_missing", "id": identifier,
+                "source": source, "required": target,
+            })
+    signals = _truncation_signals(raw, vi) if check_truncation else []
+    obvious = ("function_word_ending" in signals
+               or (len(raw) >= 20 and "missing_terminal_punctuation" in signals))
+    if obvious:
+        findings.append({"kind": "obvious_truncation", "id": identifier,
+                         "signals": signals})
+    elif {"very_low_length_ratio", "unmatched_punctuation"}.intersection(signals) or len(signals) >= 2:
+        findings.append({
+            "kind": "suspicious_truncation", "id": identifier,
+            "signals": signals, "ratio": round(len(vi) / max(1, len(raw)), 3),
+        })
+    return findings
+
+
+def local_findings(chapter, result: Translation, dictionary, ratio_baseline=None,
+                   paragraph_ratio_baseline=None):
+    """Return deterministic defects and conservative semantic suspicions."""
+    findings = []
+    expected = chapter.paragraph_ids
+    structural = structural_findings(expected, result.segments)
+    if structural:
+        return structural
+    if chapter.title and not result.title.strip():
+        findings.append({"kind": "empty_title", "id": chapter.title_id})
+    raw_total = sum(len(text) for text in chapter.paragraphs)
+    vi_total = sum(len(item.text) for item in result.segments)
+    ratio = vi_total / max(1, raw_total)
+    min_ratio = float(os.getenv("TRANSLATION_MIN_LENGTH_RATIO", "0.30"))
+    if ratio < min_ratio or (ratio_baseline and len(ratio_baseline) >= 5
+                             and ratio < sorted(ratio_baseline)[len(ratio_baseline) // 2] * 0.45):
+        low_ids = [identifier for identifier, raw, segment in zip(
+            expected, chapter.paragraphs, result.segments
+        ) if len(segment.text) / max(1, len(raw)) < 0.40]
+        for identifier in low_ids or list(expected):
+            findings.append({"kind": "suspicious_length_ratio", "id": identifier,
+                             "chapter_ratio": round(ratio, 3)})
+    if paragraph_ratio_baseline and len(paragraph_ratio_baseline) >= 20:
+        baseline = sorted(paragraph_ratio_baseline)[len(paragraph_ratio_baseline) // 2]
+        for identifier, raw, segment in zip(expected, chapter.paragraphs, result.segments):
+            paragraph_ratio = len(segment.text) / max(1, len(raw))
+            if len(raw) >= 40 and paragraph_ratio < baseline * 0.35:
+                findings.append({"kind": "suspicious_length_ratio", "id": identifier,
+                                 "paragraph_ratio": round(paragraph_ratio, 3),
+                                 "corpus_median": round(baseline, 3)})
+    translated_counts = Counter(item.text.strip() for item in result.segments if item.text.strip())
+    raw_by_output = {}
+    for identifier, raw, segment in zip(expected, chapter.paragraphs, result.segments):
+        duplicate = (len(segment.text.strip()) > 30 and translated_counts[segment.text.strip()] > 1
+                     and raw_by_output.get(segment.text.strip(), raw) != raw)
+        findings.extend(_segment_findings(identifier, raw, segment.text, dictionary, duplicate))
+        raw_by_output.setdefault(segment.text.strip(), raw)
+    if chapter.title:
+        if TITLE_WRAPPER.match(result.title):
+            findings.append({"kind": "malformed_title_wrapper", "id": chapter.title_id})
+        findings.extend(_segment_findings(chapter.title_id, chapter.title, result.title,
+                                          dictionary, check_truncation=False))
+    unique = []
+    seen = set()
+    for finding in findings:
+        key = (finding["kind"], finding.get("id"))
+        if key not in seen:
+            seen.add(key)
+            unique.append(finding)
+    return unique
+
+
+def repair_integrity_findings(identifier, raw, original, candidate, dictionary):
+    """Reject a fragment before it can replace a complete accepted paragraph."""
+    is_title = identifier.startswith("C") and identifier.endswith("_TITLE")
+    findings = _segment_findings(identifier, raw, candidate, dictionary,
+                                 check_truncation=not is_title)
+    candidate = candidate.strip()
+    original = original.strip()
+    if original and len(original) >= 20 and len(candidate) < max(12, int(len(original) * 0.55)):
+        findings.append({
+            "kind": "repair_content_loss", "id": identifier,
+            "original_chars": len(original), "candidate_chars": len(candidate),
+        })
+    if _balanced(original) and not _balanced(candidate):
+        findings.append({"kind": "repair_unbalanced_punctuation", "id": identifier})
+    if TERMINAL_VI.search(original) and not TERMINAL_VI.search(candidate):
+        findings.append({"kind": "repair_unterminated", "id": identifier})
+    return findings
+
+
+def semantic_suspicions(findings):
+    return [finding for finding in findings if finding["kind"] in SEMANTIC_SUSPICIONS]
+
+
+def deterministic_defects(findings):
+    return [finding for finding in findings if finding["kind"] not in SEMANTIC_SUSPICIONS]
+
+
+def source_quality_findings(chapters):
+    """Record evident RAW damage without reconstructing or changing source text."""
+    result = []
+    for chapter in chapters:
+        for identifier, raw in chapter.paragraph_items:
+            if SOURCE_CENSORSHIP.search(raw):
+                result.append({"chapter": chapter.number, "id": identifier,
+                               "kind": "asterisk_censorship"})
+            if not _balanced(raw):
+                result.append({"chapter": chapter.number, "id": identifier,
+                               "kind": "unbalanced_source_punctuation"})
     return result
-
-
-def local_findings(payload, translation):
-    expected = [paragraph["id"] for paragraph in payload["raw"]]
-    ids = [segment.id for segment in translation.segments]
-    unknown = set(ids) - set(expected)
-    if unknown:
-        raise ValueError(
-            f"Provider returned unexpected paragraph IDs {sorted(unknown)}; output cannot be paired safely"
-        )
-    issues = []
-    missing_ids = set()
-    if ids != expected:
-        for paragraph_id in expected:
-            paragraph = next(item for item in payload["raw"] if item["id"] == paragraph_id)
-            if paragraph_id not in ids:
-                missing_ids.add(paragraph_id)
-                merged = _merged_output_region(payload, paragraph_id, translation.segments)
-                if not merged:
-                    issues.append(
-                        _finding(
-                            payload,
-                            paragraph,
-                            kind="missing",
-                            finding_type="content_missing",
-                            reason="missing_source_segment_translation",
-                            explanation="RAW segment has no corresponding translated output segment",
-                            expected="Translated content corresponding to this RAW segment",
-                            actual="No matching translated segment found",
-                            details={
-                                "coverage_status": "missing",
-                                "matching_output_region": None,
-                                "coverage_score": 0.0,
-                            },
-                            validator="content_coverage",
-                        )
-                    )
-            elif ids.count(paragraph_id) > 1:
-                issues.append(
-                    _finding(
-                        payload,
-                        paragraph,
-                        kind="duplicate",
-                        finding_type="duplicate_content",
-                        reason="duplicate_output_segment_id",
-                        explanation="Output contains the same source segment ID more than once",
-                        expected="One translated segment for this source segment",
-                        actual=str(ids.count(paragraph_id)),
-                        details={"occurrences": ids.count(paragraph_id)},
-                        validator="structure",
-                    )
-                )
-        if len(ids) == len(expected) and set(ids) == set(expected):
-            for index, paragraph_id in enumerate(expected):
-                if ids[index] != paragraph_id:
-                    issues.append(
-                        _finding(
-                            payload,
-                            next(item for item in payload["raw"] if item["id"] == paragraph_id),
-                            kind="order",
-                            finding_type="ordering",
-                            reason="source_order_mismatch",
-                            explanation="Output paragraph order differs from RAW",
-                            expected=str(expected),
-                            actual=str(ids),
-                            details={"expected_order": expected, "actual_order": ids},
-                            validator="structure",
-                        )
-                    )
-    segments = {segment.id: segment.text for segment in translation.segments}
-    paragraphs = [{"id": -1, "text": payload.get("raw_title", "")}, *payload["raw"]]
-    for paragraph in paragraphs:
-        paragraph_id, raw = paragraph["id"], paragraph["text"]
-        text = translation.title if paragraph_id == -1 else segments.get(paragraph_id, "")
-        if paragraph_id in missing_ids:
-            # The source-aware missing-ID finding above is the single report.
-            continue
-        if not text.strip():
-            issues.append(
-                _finding(
-                    payload,
-                    paragraph,
-                    kind="missing",
-                    finding_type="content_missing",
-                    reason="missing_translation_region",
-                    explanation="Translated output region is empty",
-                    expected="A non-empty Vietnamese representation of the RAW segment",
-                    actual="Translated output region is empty",
-                    translated_excerpt="",
-                    details={
-                        "coverage_status": "missing",
-                        "matching_output_region": None,
-                        "coverage_score": 0.0,
-                    },
-                    validator="content_coverage",
-                )
-            )
-            continue
-        if re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f\ufffd\ud800-\udfff]", text):
-            issues.append(
-                _finding(
-                    payload,
-                    paragraph,
-                    kind="invented",
-                    finding_type="format",
-                    reason="invalid_output_characters",
-                    explanation="Invalid Unicode/control characters in output",
-                    actual=text,
-                    translated_excerpt=text,
-                    validator="format",
-                )
-            )
-        residue = len(HAN.findall(text))
-        if paragraph_id == -1:
-            source_heading = parse_chapter_heading(raw)
-            output_heading = parse_chapter_heading(text)
-            if source_heading and output_heading and source_heading.number != output_heading.number:
-                issues.append(
-                    _finding(
-                        payload,
-                        paragraph,
-                        kind="number",
-                        finding_type="chapter_heading",
-                        reason="chapter_number_mismatch",
-                        explanation="Translated title changes the chapter number",
-                        expected=str(source_heading.number),
-                        actual=str(output_heading.number),
-                        translated_excerpt=text,
-                        validator="chapter_heading",
-                    )
-                )
-        if paragraph_id == -1 and ("\n" in text.strip() or len(text) > max(200, len(raw) * 9)):
-            issues.append(
-                _finding(
-                    payload,
-                    paragraph,
-                    kind="name",
-                    finding_type="format",
-                    reason="malformed_chapter_heading",
-                    explanation="Malformed title: multiple lines or excessive length",
-                    actual=text,
-                    translated_excerpt=text,
-                    validator="chapter_heading",
-                )
-            )
-        if residue >= 4 or residue / max(1, len(text)) > 0.02:
-            issues.append(
-                _finding(
-                    payload,
-                    paragraph,
-                    kind="missing",
-                    finding_type="untranslated_chinese",
-                    reason="untranslated_chinese_residue",
-                    explanation="Output contains excessive untranslated Chinese residue",
-                    expected="Vietnamese rendering without substantial Chinese residue",
-                    actual=text,
-                    translated_excerpt=text,
-                    details={"chinese_character_count": residue},
-                    validator="untranslated_chinese",
-                )
-            )
-        han_count = len(HAN.findall(raw))
-        if paragraph_id != -1 and (
-            han_count >= 12 and len(text) < han_count * 0.4 or len(text) > max(200, len(raw) * 9)
-        ):
-            issues.append(
-                _finding(
-                    payload,
-                    paragraph,
-                    kind="missing",
-                    finding_type="content_coverage",
-                    reason="content_length_anomaly",
-                    explanation="Suspicious translated/source length anomaly; verify complete RAW coverage",
-                    expected="Complete semantic coverage of the RAW segment",
-                    actual=text,
-                    translated_excerpt=text,
-                    details={
-                        "coverage_status": "ambiguous",
-                        "matching_output_region": {"output_segment_id": paragraph_id},
-                        "raw_length": len(raw),
-                        "translated_length": len(text),
-                        "chinese_character_count": han_count,
-                    },
-                    validator="content_coverage",
-                )
-            )
-        if Counter(PLACEHOLDER.findall(raw)) != Counter(PLACEHOLDER.findall(text)):
-            issues.append(
-                _finding(
-                    payload,
-                    paragraph,
-                    kind="name",
-                    finding_type="format",
-                    reason="placeholder_mismatch",
-                    explanation="Literal placeholders/markup changed or added",
-                    expected=str(Counter(PLACEHOLDER.findall(raw))),
-                    actual=str(Counter(PLACEHOLDER.findall(text))),
-                    translated_excerpt=text,
-                    validator="format",
-                )
-            )
-        for finding in terminology_findings(
-            payload.get("terminology", []), raw, text, payload.get("location")
-        ):
-            issues.append(
-                _finding(
-                    payload,
-                    paragraph,
-                    kind="terminology",
-                    finding_type="terminology",
-                    reason=finding["reason"],
-                    explanation=(
-                        f"RAW contains {finding['source']}; frozen mapping requires "
-                        f"{finding['required_translation']!r}, but the translated text "
-                        f"contains {finding['actual_text'] or 'no matching realization'!r} "
-                        f"({finding['reason']})"
-                    ),
-                    actual=finding["actual_text"],
-                    validator="terminology",
-                    source=finding["source"],
-                    matched_source=finding["matched_source"],
-                    canonical_source=finding["canonical_source"],
-                    required_translation=finding["required_translation"],
-                    actual_text=finding["actual_text"],
-                    start=finding["start"],
-                    end=finding["end"],
-                    left_context=finding["left_context"],
-                    right_context=finding["right_context"],
-                    context=finding["context"],
-                    source_spans=finding["source_spans"],
-                    source_occurrences=finding["source_occurrences"],
-                    expected_occurrences=finding["expected_occurrences"],
-                    matched_occurrences=finding["matched_occurrences"],
-                    location=finding["location"],
-                )
-            )
-    # Equal RAW repetitions are legitimate; unrelated long paragraphs repeated
-    # verbatim are suspicious. Short recurring dialogue is deliberately exempt.
-    owners = {}
-    for paragraph in payload["raw"]:
-        text = segments.get(paragraph["id"], "")
-        if (
-            len(paragraph["text"]) >= 40
-            and text in owners
-            and owners[text]["text"] != paragraph["text"]
-        ):
-            issues.append(
-                _finding(
-                    payload,
-                    paragraph,
-                    kind="duplicate",
-                    finding_type="duplicate_content",
-                    reason="duplicate_translated_content",
-                    explanation="Unrelated RAW paragraphs have identical long output",
-                    expected="Distinct source paragraphs should not share identical long output",
-                    actual=text,
-                    translated_excerpt=text,
-                    details={"previous_source_excerpt": owners[text]["text"]},
-                    validator="duplicate_content",
-                )
-            )
-        owners[text] = paragraph
-    return validate_findings(_deduplicate_findings(issues))

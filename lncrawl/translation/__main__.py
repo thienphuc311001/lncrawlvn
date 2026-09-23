@@ -1,5 +1,5 @@
-"""Run the same translation pipeline from UTF-8 files: python -m lncrawl.translation."""
-
+"""Run the RAW-only translation pipeline from UTF-8 files."""
+from __future__ import annotations
 import argparse
 import asyncio
 import json
@@ -9,198 +9,58 @@ import sys
 from pathlib import Path
 
 from ..context import APP_DIR
-from .dictionary import load_legacy
-from .models import PARSER_VERSION, Inputs
-from .parsing import deterministic_alignment, parse_chapters, validate_inputs
+from .dictionary import load_dictionary, load_unresolved
+from .models import PARSER_VERSION, PIPELINE_VERSION, Inputs
+from .parsing import parse_chapters
 from .pipeline import Pipeline
 from .scheduler import Scheduler, api_keys
 from .store import Store
 
-
 class ConsoleStore(Store):
     def progress(self, status="running", **fields):
         result = super().progress(status, **fields)
-        print(
-            json.dumps(
-                {
-                    key: value
-                    for key, value in result.items()
-                    if key
-                    in (
-                        "status",
-                        "stage",
-                        "aligned",
-                        "total_chapters",
-                        "completed_chapters",
-                        "scanned_chapter",
-                        "candidate_count",
-                        "current_term",
-                        "resolved_candidates",
-                        "reconciliation_round",
-                        "active_chapters",
-                        "error",
-                        "dictionary_hash",
-                        "dictionary_frozen",
-                        "dictionary_summary",
-                        "request_statistics",
-                    )
-                },
-                ensure_ascii=False,
-            ),
-            flush=True,
-        )
+        print(json.dumps({k: v for k, v in result.items() if k in (
+            "status", "stage", "total_chapters", "completed_chapters",
+            "current_chapter", "candidate_count", "error", "request_statistics",
+        )}, ensure_ascii=False), flush=True)
         return result
 
     def diagnostic(self, metadata):
         super().diagnostic(metadata)
         print(json.dumps(metadata, ensure_ascii=False), flush=True)
 
-
 def parser():
-    arguments = argparse.ArgumentParser(
-        description="Translate Chinese RAW + external VietPhrase into Vietnamese using server-side Gemini."
-    )
-    arguments.add_argument("--raw", type=Path, required=True)
-    arguments.add_argument("--vietphrase", type=Path, required=True)
-    arguments.add_argument("--dictionary", type=Path)
-    arguments.add_argument("--output", type=Path, default=Path("translation-output"))
-    arguments.add_argument(
-        "--workers", type=int, choices=(1, 2, 3), default=int(os.getenv("TRANSLATION_WORKERS", "2"))
-    )
-    arguments.add_argument(
-        "--first", type=int, help="Test only the first N chapters; omit for the full batch."
-    )
-    arguments.add_argument(
-        "--check-inputs",
-        action="store_true",
-        help="Parse and pair the complete files without any API requests.",
-    )
-    return arguments
+    args = argparse.ArgumentParser(description="Translate Chinese RAW chapters into Vietnamese.")
+    args.add_argument("--raw", type=Path, required=True)
+    args.add_argument("--dictionary", type=Path)
+    args.add_argument("--output", type=Path, default=Path("translation-output"))
+    args.add_argument("--workers", type=int, choices=(1, 2, 3),
+                      default=int(os.getenv("TRANSLATION_WORKERS", "2")))
+    args.add_argument("--first", type=int, help="Translate only the first N chapters.")
+    args.add_argument("--check-inputs", action="store_true", help="Validate RAW without API requests.")
+    return args
 
-
-def first_chapters(text, count, label):
-    diagnostics = []
-    chapters = parse_chapters(text, label, diagnostics)
+def first_chapters(text, count, label="RAW"):
+    chapters = parse_chapters(text, label)
+    if count < 1:
+        raise ValueError("--first must be positive")
     if count >= len(chapters):
         return text
-    end = chapters[count].source_line
-    # A following chapter owns its preceding structural volume marker. Do not
-    # accidentally append that marker to the final selected chapter's prose.
-    for diagnostic in diagnostics:
-        if diagnostic["reason"] in ("volume_boundary_detected", "repeated_volume_label"):
-            line = diagnostic["line"]
-            if chapters[count - 1].source_line < line < end:
-                end = line
-    return "\n".join(text.splitlines()[: end - 1])
-
-
-def find_compatible_translation_job(root, inputs):
-    """Find an unfinished legacy dictionary-stage job for exact CLI resumption."""
-    if not root.exists():
-        return None
-    matches = []
-    for input_path in root.glob("*/inputs.json"):
-        try:
-            if json.loads(input_path.read_text(encoding="utf-8")) != inputs:
-                continue
-            job_path = input_path.parent
-            progress = json.loads((job_path / "progress.json").read_text(encoding="utf-8"))
-            if (
-                progress.get("status") != "done"
-                and not (job_path / "frozen-dictionary.json").exists()
-                and (job_path / "resolved-terms.json").exists()
-            ):
-                matches.append(job_path)
-        except (OSError, ValueError, TypeError):
-            continue
-    return max(matches, key=lambda path: path.stat().st_mtime).name if matches else None
-
-
-async def translate(arguments):
-    raw = arguments.raw.read_text(encoding="utf-8-sig")
-    vp = arguments.vietphrase.read_text(encoding="utf-8-sig")
-    dictionary = (
-        json.loads(arguments.dictionary.read_text(encoding="utf-8-sig"))
-        if arguments.dictionary
-        else None
-    )
-    pairs = validate_inputs(raw, vp)
-    for raw_chapter, vp_chapter in pairs:
-        deterministic_alignment(raw_chapter, vp_chapter)
-    load_legacy(dictionary)
-    print(f"Validated {len(pairs)} chapter pairs.", flush=True)
-    if arguments.check_inputs:
-        for r, v in pairs:
-            print(
-                f"Chapter {r.key}: RAW {len(r.paragraphs)} paragraphs / VP {len(v.paragraphs)} paragraphs"
-            )
-        return 0
-    if arguments.first is not None:
-        if arguments.first < 1:
-            raise ValueError("--first must be positive")
-        raw = first_chapters(raw, arguments.first, "RAW")
-        vp = first_chapters(vp, arguments.first, "VIETPHRASE")
-    if not api_keys():
-        raise ValueError("Set GOOGLE_AI_API_KEY in the project-root .env file")
-    inputs = Inputs(
-        raw=raw,
-        vietphrase=vp,
-        dictionary=dictionary,
-        book_title=arguments.raw.stem,
-        source_name=arguments.raw.name,
-    )
-    translation_root = APP_DIR / "translations"
-    input_data = inputs.model_dump()
-    legacy_job = find_compatible_translation_job(translation_root, input_data)
-    store = (
-        ConsoleStore(translation_root, job_id=legacy_job)
-        if legacy_job
-        else ConsoleStore(translation_root, inputs=input_data)
-    )
-    store.write("parser-version.json", {"version": PARSER_VERSION})
-    print(f"Checkpoint: {store.path}", flush=True)
-    with store.execution():
-        await run_owned(store, arguments.workers)
-    arguments.output.mkdir(parents=True, exist_ok=True)
-    for name in (
-        "translated.json",
-        "translated.txt",
-        "dictionary.json",
-        "ignored_dictionary.json",
-    ):
-        target = arguments.output / name
-        if target.exists() and target.read_bytes() != (store.path / name).read_bytes():
-            raise ValueError(
-                f"Output already exists with different content: {target}; choose another --output directory"
-            )
-    for name in (
-        "translated.json",
-        "translated.txt",
-        "dictionary.json",
-        "ignored_dictionary.json",
-    ):
-        shutil.copyfile(store.path / name, arguments.output / name)
-    print(
-        f"Completed translation, dictionary, and ignored review artifacts in {arguments.output.resolve()}",
-        flush=True,
-    )
-    return 0
-
+    return "\n".join(text.splitlines()[:chapters[count].source_line - 1])
 
 async def run_owned(store, workers):
     store.write("cancel-request.json", {"requested": False})
     runner = asyncio.current_task()
-
     async def watch_cancellation():
         while True:
             await asyncio.sleep(0.3)
             if store.read("cancel-request.json", {}).get("requested"):
                 runner.cancel()
                 return
-
     watcher = asyncio.create_task(watch_cancellation())
     try:
-        if store.read("progress.json", {}).get("status") != "done":
+        if (store.read("progress.json", {}).get("status") != "done"
+                or store.read("pipeline-version.json", {}).get("version") != PIPELINE_VERSION):
             await Pipeline(store, Scheduler(concurrency=workers)).run()
     except asyncio.CancelledError:
         store.progress("cancelled", stage="Cancelled; checkpoints preserved")
@@ -212,6 +72,41 @@ async def run_owned(store, workers):
         watcher.cancel()
         await asyncio.gather(watcher, return_exceptions=True)
 
+async def translate(arguments):
+    raw = arguments.raw.read_text(encoding="utf-8-sig")
+    dictionary = json.loads(arguments.dictionary.read_text(encoding="utf-8-sig")) if arguments.dictionary else None
+    chapters = parse_chapters(raw)
+    load_dictionary(dictionary)
+    load_unresolved(dictionary)
+    if arguments.first is not None:
+        raw = first_chapters(raw, arguments.first)
+        chapters = parse_chapters(raw)
+    print(f"Validated {len(chapters)} RAW chapters.", flush=True)
+    if arguments.check_inputs:
+        for chapter in chapters:
+            print(f"Chapter {chapter.number}: {len(chapter.paragraphs)} paragraphs")
+        return 0
+    if not api_keys():
+        raise ValueError("Set GOOGLE_AI_API_KEY in the project-root .env file")
+    inputs = Inputs(raw=raw, dictionary=dictionary, book_title=arguments.raw.stem,
+                    source_name=arguments.raw.name).model_dump()
+    store = ConsoleStore(APP_DIR / "translations", inputs=inputs)
+    store.write("parser-version.json", {"version": PARSER_VERSION})
+    print(f"Checkpoint: {store.path}", flush=True)
+    with store.execution():
+        await run_owned(store, arguments.workers)
+    arguments.output.mkdir(parents=True, exist_ok=True)
+    for name in ("translated.json", "translated.txt", "dictionary.json", "unresolved.json",
+                 "author-notes.txt"):
+        source = store.path / name
+        if not source.exists():
+            continue
+        target = arguments.output / name
+        if target.exists() and target.read_bytes() != source.read_bytes():
+            raise ValueError(f"Output already exists with different content: {target}")
+        shutil.copyfile(source, target)
+    print(f"Completed translation and full merged dictionary in {arguments.output.resolve()}", flush=True)
+    return 0
 
 def main():
     try:
@@ -225,7 +120,6 @@ def main():
     except (OSError, ValueError, RuntimeError) as exc:
         print(str(exc), file=sys.stderr)
         return 1
-
 
 if __name__ == "__main__":
     sys.exit(main())
