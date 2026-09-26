@@ -70,6 +70,13 @@ class Library:
     def _chapter_path(self, book_id: str, chapter_id: int) -> Path:
         return self._book_dir(book_id) / self.chapter_rel_path(chapter_id)
 
+    def _translated_chapter_path(self, book_id: str, chapter_id: int) -> Path:
+        chapter_path = self._guarded_book_dir(book_id) / self.chapter_rel_path(chapter_id)
+        return chapter_path.with_name(chapter_path.stem + "_translated.json")
+
+    def _translation_state_path(self, book_id: str) -> Path:
+        return self._guarded_book_dir(book_id) / "translation-state.json"
+
     def cover_path(self, book_id: str) -> Path:
         return self._book_dir(book_id) / "cover.jpg"
 
@@ -112,10 +119,12 @@ class Library:
         the TOC. Cover, exports, and other chapters are untouched. Returns
         False when there was no saved file to delete.
         """
-        path = self._guarded_book_dir(book_id) / self.chapter_rel_path(chapter_id)
+        book_dir = self._guarded_book_dir(book_id)
+        path = book_dir / self.chapter_rel_path(chapter_id)
         if not path.is_file():
             return False
         path.unlink()
+        self._translated_chapter_path(book_id, chapter_id).unlink(missing_ok=True)
         logger.info("Deleted chapter %s of book %s", chapter_id, book_id)
         return True
 
@@ -131,6 +140,34 @@ class Library:
         with atomic_write(meta_path, "w") as f:
             json.dump(meta, f, ensure_ascii=False, indent=2)
         return book_id
+
+    def update_chapter_titles(self, book_id: str, titles: Dict[int, str]) -> None:
+        """Replace TOC titles and any saved chapter titles in one metadata update."""
+        book_dir = self._guarded_book_dir(book_id)
+        meta = self._read_meta(book_id)
+        if meta is None:
+            raise LNException(f"Book not found in library: {book_id}")
+        toc = meta.get("toc") or []
+        known_ids = {int(chapter["id"]) for chapter in toc}
+        if not titles or not set(titles).issubset(known_ids):
+            raise LNException("Title updates must reference chapters in the book")
+        for chapter in toc:
+            chapter_id = int(chapter["id"])
+            if chapter_id in titles:
+                chapter["title"] = titles[chapter_id]
+                chapter_path = book_dir / self.chapter_rel_path(chapter_id)
+                if chapter_path.is_file():
+                    try:
+                        chapter_data = json.loads(chapter_path.read_text(encoding="utf-8"))
+                    except (json.JSONDecodeError, OSError):
+                        logger.warning("Corrupted chapter file: %s", chapter_path)
+                        continue
+                    chapter_data["title"] = titles[chapter_id]
+                    with atomic_write(chapter_path, "w") as f:
+                        json.dump(chapter_data, f, ensure_ascii=False)
+        meta["toc"] = toc
+        with atomic_write(book_dir / "book.json", "w") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
 
     def save_chapter(
         self, book_id: str, chapter: Dict[str, Any], overwrite: bool = False
@@ -158,6 +195,20 @@ class Library:
         with atomic_write(path, "w") as f:
             json.dump(payload, f, ensure_ascii=False)
         return True
+
+    def save_translation_state(self, book_id: str, state: Dict[str, Any]) -> None:
+        if self._read_meta(book_id) is None:
+            raise LNException(f"Book not found in library: {book_id}")
+        with atomic_write(self._translation_state_path(book_id), "w") as f:
+            json.dump(state, f, ensure_ascii=False)
+
+    def save_translated_chapter(
+        self, book_id: str, chapter_id: int, translated: Dict[str, Any]
+    ) -> None:
+        if self.load_chapter(book_id, chapter_id) is None:
+            raise LNException(f"Chapter not saved yet: {chapter_id}")
+        with atomic_write(self._translated_chapter_path(book_id, chapter_id), "w") as f:
+            json.dump(translated, f, ensure_ascii=False)
 
     # ------------------------------------------------------------------ #
     # Reads
@@ -237,6 +288,32 @@ class Library:
         except (json.JSONDecodeError, OSError):
             logger.warning("Corrupted chapter file: %s", path)
             return None
+
+    def load_translation_state(self, book_id: str) -> Optional[Dict[str, Any]]:
+        path = self._translation_state_path(book_id)
+        if not path.is_file():
+            return None
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            raise LNException(f"Invalid translation state for book {book_id}") from exc
+        if not isinstance(value, dict):
+            raise LNException(f"Invalid translation state for book {book_id}")
+        return value
+
+    def load_translated_chapter(
+        self, book_id: str, chapter_id: int
+    ) -> Optional[Dict[str, Any]]:
+        path = self._translated_chapter_path(book_id, chapter_id)
+        if not path.is_file():
+            return None
+        try:
+            value = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError) as exc:
+            raise LNException(f"Invalid translated chapter {chapter_id}") from exc
+        if not isinstance(value, dict):
+            raise LNException(f"Invalid translated chapter {chapter_id}")
+        return value
 
     def missing_chapter_ids(self, book_id: str) -> List[int]:
         book = self.load_book(book_id)

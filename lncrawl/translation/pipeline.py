@@ -958,8 +958,20 @@ class Pipeline:
             }
             self.event("REPAIR_REQUEST", chapter=chapter.number, paragraph_id=identifier,
                        defects=[item["kind"] for item in issues])
-            repaired = await self.request("REPAIR_REQUEST", prompts.REPAIR,
-                                          payload, Repair, chapter.number)
+            try:
+                repaired = await self.request("REPAIR_REQUEST", prompts.REPAIR,
+                                              payload, Repair, chapter.number)
+            except ProviderError as exc:
+                if "Gemini blocked response:" not in str(exc):
+                    raise
+                self.store.write(f"validation-failures/{chapter.key}.json", {
+                    "chapter": chapter.number, "final_status": "manual_review_required",
+                    "paragraph_id": identifier, "findings": issues, "original_text": current,
+                })
+                raise QualityError(
+                    f"Chapter {chapter.number} repair for {identifier} blocked by Gemini; "
+                    "manual review required"
+                ) from exc
             self.store.write(attempt_name, {"fingerprint": attempt_fingerprint,
                                             "status": "response_received"})
             if repaired.id != identifier:

@@ -118,7 +118,10 @@ class Store:
                 continue
             if not isinstance(old, dict):
                 continue
-            if (path.parent / "pipeline-version.json").exists():
+            # Modern API jobs record the parser version on creation, even if the
+            # translation later fails before writing a final pipeline version.
+            if ((path.parent / "pipeline-version.json").exists()
+                    or (path.parent / "parser-version.json").exists()):
                 continue
             if old.get("raw") != inputs.get("raw") or old.get("dictionary") != inputs.get("dictionary"):
                 continue

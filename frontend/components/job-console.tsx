@@ -39,15 +39,18 @@ type Job = {
   failed_count: number;
   saved_count?: number;
   error: string | null;
+  started_at: number;
   first_log_index?: number;
   logs: { t: number; level: string; message: string }[];
   chapters: JobChapter[];
 };
 
-function toLine(log: { t: number; level: string; message: string }): LogLine {
+function toLine(log: { t: number; level: string; message: string }, startedAt: number): LogLine {
   const level = log.level as LogLine['level'];
-  return { text: `[${log.t.toFixed(1)}s] ${log.message}`, level };
+  const timestamp = new Date((startedAt + log.t) * 1000).toLocaleTimeString();
+  return { text: `[${timestamp}] ${log.message}`, level };
 }
+
 
 function summaryLines(job: Job): LogLine[] {
   const lines: LogLine[] = [
@@ -141,7 +144,7 @@ export default function JobConsole() {
               : Math.min(renderedAbsolute, lastAbs); // guard against log eviction
           const fresh: LogLine[] = [];
           for (let abs = start; abs < lastAbs; abs += 1) {
-            const line = toLine(jobData.logs[abs - first]);
+            const line = toLine(jobData.logs[abs - first], jobData.started_at);
             if (abs === first) line.style = { marginTop: '12px' };
             fresh.push(line);
           }

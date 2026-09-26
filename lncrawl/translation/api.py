@@ -50,15 +50,43 @@ def _failure_detail_for_error(store, error):
     failure = store.read(f"validation-failures/{int(match[1])}.json") or {}
     return failure if failure.get("paragraph_id") == match[2] else None
 
+def _blocked_repair_location(store, error):
+    """Recover the targeted paragraph from pre-review blocked-response job logs."""
+    if (not str(error).startswith("No usable Gemini model/API-key combination remains:")
+            or "Gemini blocked response:" not in str(error)):
+        return None
+    logs = store.logs()
+    failed = next((event for event in reversed(logs) if event.get("status") == "failed"
+                   and event.get("event") == "REPAIR_REQUEST"), None)
+    if not failed or "Gemini blocked response:" not in failed.get("error", ""):
+        return None
+    request = None
+    for event in reversed(logs):
+        if event.get("status") not in ("repair_request", "qa_request",
+                                       "translation_request", "pre_dictionary_request",
+                                       "post_dictionary_request"):
+            continue
+        if event["status"] != "repair_request":
+            return None
+        if event.get("paragraph_id"):
+            request = event
+            break
+    if (not request or not isinstance(request.get("chapter"), int)
+            or not re.fullmatch(r"P\d{4,}_\d{4}", str(request.get("paragraph_id")))):
+        return None
+    return request["chapter"], request["paragraph_id"]
+
 
 def _manual_review_context(store, progress=None):
     progress = progress or store.read("progress.json", {}) or {}
     if progress.get("status") != "failed":
         return None
     match = re.search(r"Chapter\s+(\d+).*?(P\d{4,}_\d{4})", str(progress.get("error", "")))
-    if not match:
+    location = ((int(match[1]), match[2]) if match else
+                _blocked_repair_location(store, progress.get("error")))
+    if not location:
         return None
-    number, identifier = int(match[1]), match[2]
+    number, identifier = location
     inputs = store.read("inputs.json") or {}
     if not isinstance(inputs.get("raw"), str):
         return None
@@ -512,6 +540,8 @@ async def cancel(job_id: str):
         store.progress("cancelled", stage="Cancelled; completed checkpoints preserved")
     elif store.is_active():
         store.write("cancel-request.json", {"requested": True})
+    elif store.read("progress.json", {}).get("status") != "done":
+        store.progress("cancelled", stage="Cancelled; completed checkpoints preserved")
     return snapshot(store)
 
 

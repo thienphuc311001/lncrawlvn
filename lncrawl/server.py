@@ -27,12 +27,15 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
+from .book_translation import router as book_translation_router
 from .context import APP_DIR, ctx
 from .core import Novel
 from .exceptions import LNException
-from .library import DEFAULT_EXPORT_CHUNK, LIBRARY, MAX_EXPORT_CHUNK
+from .library import CHAPTERS_PER_FOLDER, DEFAULT_EXPORT_CHUNK, LIBRARY, MAX_EXPORT_CHUNK
 from .translation.api import router as translation_router
+from .translation.api import scheduler as translation_scheduler
 from .translation.api import shutdown as shutdown_translation
+from .translation.scheduler import ProviderError, api_keys
 
 logger = logging.getLogger(__name__)
 
@@ -87,6 +90,23 @@ class ChapterContent(BaseModel):
     body: str = ""
     fetched_at: float = 0.0
 
+
+class TitleTranslationChapter(BaseModel):
+    id: int = Field(gt=0)
+    title: str
+
+
+class TitleTranslationRequest(BaseModel):
+    chapters: List[TitleTranslationChapter] = Field(min_length=1, max_length=CHAPTERS_PER_FOLDER)
+
+
+class TranslatedChapterTitle(BaseModel):
+    id: int = Field(gt=0)
+    title: str = Field(min_length=1)
+
+
+class TitleTranslationResponse(BaseModel):
+    chapters: List[TranslatedChapterTitle]
 
 class Job(BaseModel):
     job_id: str
@@ -257,6 +277,7 @@ app = FastAPI(
 )
 
 app.include_router(translation_router)
+app.include_router(book_translation_router)
 
 app.add_middleware(
     CORSMiddleware,
@@ -335,6 +356,46 @@ def get_book(book_id: str) -> BookDetail:
     if book is None:
         raise HTTPException(status_code=404, detail="Book not found in library")
     return BookDetail(**book)
+
+
+@app.post("/api/books/{book_id}/translate-titles", response_model=TitleTranslationResponse)
+async def translate_book_titles(book_id: str, request: TitleTranslationRequest):
+    """Translate one 100-chapter TOC folder in one structured Gemini request."""
+    book = LIBRARY.load_book(book_id)
+    if book is None:
+        raise HTTPException(status_code=404, detail="Book not found in library")
+    if JOBS.has_active_for_book(book_id):
+        raise HTTPException(status_code=409, detail="A crawl job is still running for this book")
+    if not api_keys():
+        raise HTTPException(status_code=503, detail="Set GOOGLE_AI_API_KEY on the server")
+
+    chapters = request.chapters
+    ids = [chapter.id for chapter in chapters]
+    start = ((ids[0] - 1) // CHAPTERS_PER_FOLDER) * CHAPTERS_PER_FOLDER + 1
+    expected = {
+        chapter["id"] for chapter in book["chapters"]
+        if start <= chapter["id"] < start + CHAPTERS_PER_FOLDER
+    }
+    if len(ids) != len(set(ids)) or set(ids) != expected:
+        raise HTTPException(status_code=422, detail="Provide every TOC title from exactly one chapter section")
+
+    try:
+        result = await translation_scheduler().request(
+            "Translate each web-novel chapter title into natural Vietnamese; keep titles already "
+            "in Vietnamese unchanged. Preserve names, numbers, and meaning. "
+            "Return exactly one translated title for every input ID, with no extra text.",
+            {"chapters": [chapter.model_dump() for chapter in chapters]},
+            TitleTranslationResponse,
+            lambda _event: None,
+        )
+        translated = {chapter.id: chapter.title.strip() for chapter in result.chapters}
+        if (len(translated) != len(result.chapters) or set(translated) != set(ids)
+                or any(not title for title in translated.values())):
+            raise ValueError("The title response did not contain exactly one non-empty title per chapter")
+        LIBRARY.update_chapter_titles(book_id, translated)
+    except (ProviderError, ValueError, LNException) as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    return result
 
 
 @app.get("/api/books/{book_id}/cover")

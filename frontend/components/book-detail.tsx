@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useState, type FormEvent } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, type FormEvent } from 'react';
 
 import { useJobRunner } from './job-runner';
 
@@ -30,6 +30,41 @@ type ChapterContent = { id: number; title: string; url: string; body: string };
 
 type ReaderState = { loading: boolean; chapter: ChapterContent | null; error: string };
 
+type ChapterTranslation = {
+  status: string;
+  translated: { title: string; paragraphs: string[] } | null;
+  job: {
+    job_id: string;
+    status: string;
+    stage?: string;
+    stage_label?: string;
+    error?: string;
+    error_detail?: unknown;
+    manual_review?: {
+      chapter: number; paragraph_id: string; fingerprint: string;
+      raw: string; current_text: string; findings: unknown[];
+    };
+  } | null;
+  error: string | null;
+  stale: boolean;
+  entry_count: number;
+  active_chapter_id: number | null;
+};
+
+type BookDictionaryInfo = { entry_count: number; imported: boolean; active_chapter_id: number | null };
+
+function readerError(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  return typeof error === 'string' ? error : JSON.stringify(error) ?? String(error);
+}
+
+async function readerRequest<T>(path: string, options?: RequestInit): Promise<T> {
+  const response = await fetch(`${API_BASE}${path}`, options);
+  const data = await response.json().catch(() => null);
+  if (!response.ok) throw new Error(readerError(data?.detail ?? `API returned ${response.status}`));
+  return data as T;
+}
+
 function folderRange(chapterId: number): { start: number; end: number } {
   const start = Math.floor((chapterId - 1) / FOLDER_SIZE) * FOLDER_SIZE + 1;
   return { start, end: start + FOLDER_SIZE - 1 };
@@ -48,9 +83,94 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
   const [exportDialog, setExportDialog] = useState<'epub' | 'txt' | null>(null);
   const [perFileInput, setPerFileInput] = useState(String(DEFAULT_EXPORT_PER_FILE));
   const [dialogError, setDialogError] = useState('');
+  const [translatingGroup, setTranslatingGroup] = useState<number | null>(null);
+  const [titleError, setTitleError] = useState('');
   const [deleting, setDeleting] = useState(false);
   const [deletingChapter, setDeletingChapter] = useState(false);
+  const [translation, setTranslation] = useState<ChapterTranslation | null>(null);
+  const [dictionaryInfo, setDictionaryInfo] = useState<BookDictionaryInfo | null>(null);
+  const [readerView, setReaderView] = useState<'raw' | 'translated'>('raw');
+  const [readerInfoError, setReaderInfoError] = useState('');
+  const [readerBusy, setReaderBusy] = useState(false);
+  const readerEpoch = useRef(0);
+  const readerRequestId = useRef(0);
+  const lastTranslationStatus = useRef<string | null>(null);
+  const reviewTextRef = useRef<HTMLTextAreaElement | null>(null);
+  const bookPath = `/api/books/${encodeURIComponent(bookId)}`;
 
+  const closeReader = useCallback(() => {
+    readerEpoch.current++;
+    readerRequestId.current++;
+    lastTranslationStatus.current = null;
+    setReader({ loading: false, chapter: null, error: '' });
+    setTranslation(null);
+    setDictionaryInfo(null);
+    setReaderInfoError('');
+    setReaderBusy(false);
+    setReaderView('raw');
+  }, []);
+
+  useEffect(() => () => {
+    readerEpoch.current++;
+    readerRequestId.current++;
+  }, [bookId]);
+
+  const applyTranslation = useCallback((result: ChapterTranslation) => {
+    if (result.status === 'done' && !result.stale && lastTranslationStatus.current !== 'done') {
+      setReaderView('translated');
+    }
+    if (result.stale || (result.job && result.status !== 'done')) setReaderView('raw');
+    lastTranslationStatus.current = result.status;
+    setTranslation(result);
+    setDictionaryInfo(current => current && ({
+      ...current, entry_count: result.entry_count, active_chapter_id: result.active_chapter_id,
+    }));
+    setReaderInfoError('');
+  }, []);
+
+  const refreshTranslation = useCallback(async (chapterId: number, epoch: number, isLive: () => boolean = () => true) => {
+    const requestId = ++readerRequestId.current;
+    try {
+      const result = await readerRequest<ChapterTranslation>(`${bookPath}/chapters/${chapterId}/translation`);
+      if (readerEpoch.current === epoch && readerRequestId.current === requestId && isLive()) applyTranslation(result);
+    } catch (e) {
+      if (readerEpoch.current === epoch && readerRequestId.current === requestId && isLive()) {
+        setReaderInfoError(readerError(e));
+      }
+    }
+  }, [applyTranslation, bookPath]);
+
+  const loadReaderInfo = useCallback(async (chapterId: number, epoch: number) => {
+    const requestId = ++readerRequestId.current;
+    try {
+      const [dictionary, result] = await Promise.all([
+        readerRequest<BookDictionaryInfo>(`${bookPath}/dictionary`),
+        readerRequest<ChapterTranslation>(`${bookPath}/chapters/${chapterId}/translation`),
+      ]);
+      if (readerEpoch.current !== epoch || readerRequestId.current !== requestId) return;
+      setDictionaryInfo(dictionary);
+      applyTranslation(result);
+    } catch (e) {
+      if (readerEpoch.current === epoch && readerRequestId.current === requestId) {
+        setReaderInfoError(readerError(e));
+      }
+    }
+  }, [applyTranslation, bookPath]);
+
+  useEffect(() => {
+    const chapterId = reader.chapter?.id;
+    if (chapterId === undefined || readerBusy || !translation ||
+        !(['pending', 'running'].includes(translation.status) || translation.active_chapter_id !== null)) return;
+    const epoch = readerEpoch.current;
+    let live = true;
+    let polling = false;
+    const timer = window.setInterval(() => {
+      if (polling) return;
+      polling = true;
+      void refreshTranslation(chapterId, epoch, () => live).finally(() => { polling = false; });
+    }, 1500);
+    return () => { live = false; window.clearInterval(timer); };
+  }, [reader.chapter?.id, readerBusy, translation?.status, translation?.active_chapter_id, refreshTranslation]);
   const load = useCallback(async () => {
     try {
       const res = await fetch(`${API_BASE}/api/books/${encodeURIComponent(bookId)}`);
@@ -85,19 +205,105 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
 
   const openChapter = useCallback(
     async (chapterId: number) => {
+      const epoch = ++readerEpoch.current;
+      readerRequestId.current++;
+      lastTranslationStatus.current = null;
       setReader({ loading: true, chapter: null, error: '' });
+      setTranslation(null);
+      setDictionaryInfo(null);
+      setReaderView('raw');
+      setReaderBusy(false);
+      setReaderInfoError('');
       try {
-        const res = await fetch(
-          `${API_BASE}/api/books/${encodeURIComponent(bookId)}/chapters/${chapterId}`,
-        );
-        if (!res.ok) throw new Error(`API returned ${res.status}`);
-        setReader({ loading: false, chapter: await res.json(), error: '' });
+        const chapter = await readerRequest<ChapterContent>(`${bookPath}/chapters/${chapterId}`);
+        if (readerEpoch.current !== epoch) return;
+        setReader({ loading: false, chapter, error: '' });
+        void loadReaderInfo(chapterId, epoch);
       } catch (e) {
-        setReader({ loading: false, chapter: null, error: e instanceof Error ? e.message : String(e) });
+        if (readerEpoch.current === epoch) {
+          setReader({ loading: false, chapter: null, error: readerError(e) });
+        }
       }
     },
-    [bookId],
+    [bookPath, loadReaderInfo],
   );
+
+  const importDictionary = useCallback(async (event: ChangeEvent<HTMLInputElement>) => {
+    const file = event.currentTarget.files?.[0];
+    event.currentTarget.value = '';
+    const chapterId = reader.chapter?.id;
+    if (!file || chapterId === undefined || readerBusy) return;
+    const epoch = readerEpoch.current;
+    setReaderInfoError('');
+    setReaderBusy(true);
+    try {
+      const dictionary = JSON.parse(await file.text()) as unknown;
+      if (readerEpoch.current !== epoch) return;
+      if (dictionaryInfo && (dictionaryInfo.imported || dictionaryInfo.entry_count > 0) && !window.confirm(
+        'Import sẽ thay toàn bộ dictionary hiện tại của truyện (bao gồm thuật ngữ đã tích lũy). Tiếp tục?',
+      )) return;
+      await readerRequest(`${bookPath}/dictionary`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ dictionary }),
+      });
+      if (readerEpoch.current === epoch) await loadReaderInfo(chapterId, epoch);
+    } catch (e) {
+      if (readerEpoch.current === epoch) setReaderInfoError(readerError(e));
+    } finally {
+      if (readerEpoch.current === epoch) setReaderBusy(false);
+    }
+  }, [bookPath, dictionaryInfo?.imported, loadReaderInfo, reader.chapter?.id, readerBusy]);
+
+  const translateReaderChapter = useCallback(async (forceRefresh = false) => {
+    const chapterId = reader.chapter?.id;
+    if (chapterId === undefined || readerBusy || translation?.active_chapter_id !== null &&
+        translation?.active_chapter_id !== undefined) return;
+    const epoch = readerEpoch.current;
+    readerRequestId.current++;
+    setReaderBusy(true);
+    setReaderInfoError('');
+    setReaderView('raw');
+    try {
+      await readerRequest(`${bookPath}/chapters/${chapterId}/translate`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ refresh: forceRefresh || Boolean(translation?.translated) }),
+      });
+      if (readerEpoch.current === epoch) await refreshTranslation(chapterId, epoch);
+    } catch (e) {
+      if (readerEpoch.current === epoch) setReaderInfoError(readerError(e));
+    } finally {
+      if (readerEpoch.current === epoch) setReaderBusy(false);
+    }
+  }, [bookPath, reader.chapter?.id, readerBusy, refreshTranslation, translation]);
+
+  const readerJobAction = useCallback(async (action: 'resume' | 'cancel' | 'review', decision?: 'accept' | 'replace', text?: string) => {
+    const chapterId = reader.chapter?.id;
+    const job = translation?.job;
+    if (chapterId === undefined || !job || readerBusy) return;
+    if (decision === 'accept' && !window.confirm(
+      'Giữ nguyên đoạn dịch dù còn lỗi được liệt kê? Quyết định này sẽ được ghi nhận.',
+    )) return;
+    const epoch = readerEpoch.current;
+    readerRequestId.current++;
+    setReaderBusy(true);
+    setReaderInfoError('');
+    try {
+      const review = job.manual_review;
+      await readerRequest(`/api/translation/jobs/${encodeURIComponent(job.job_id)}/${action}`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(action === 'review' && review ? {
+          chapter: review.chapter, paragraph_id: review.paragraph_id,
+          fingerprint: review.fingerprint, action: decision,
+          ...(decision === 'replace' ? { text: text ?? '' } : {}),
+        } : {}),
+      });
+      if (readerEpoch.current === epoch) await refreshTranslation(chapterId, epoch);
+    } catch (e) {
+      if (readerEpoch.current === epoch) setReaderInfoError(readerError(e));
+    } finally {
+      if (readerEpoch.current === epoch) setReaderBusy(false);
+    }
+  }, [reader.chapter?.id, readerBusy, refreshTranslation, translation?.job]);
 
   const startFetchMissing = useCallback(async () => {
     setExportError('');
@@ -128,6 +334,38 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
       setFetching(false);
     }
   }, [bookId, book?.title, load, trackJob]);
+
+  const translateTitles = useCallback(async (group: { start: number; chapters: TocChapter[] }) => {
+    setTranslatingGroup(group.start);
+    setTitleError('');
+    try {
+      const res = await fetch(
+        `${API_BASE}/api/books/${encodeURIComponent(bookId)}/translate-titles`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            chapters: group.chapters.map(({ id, title }) => ({ id, title })),
+          }),
+        },
+      );
+      const data = await res.json();
+      if (!res.ok) throw new Error(data?.detail || `API returned ${res.status}`);
+      const titles = new Map<number, string>(
+        data.chapters.map((chapter: { id: number; title: string }) => [chapter.id, chapter.title]),
+      );
+      setBook((current) => current && ({
+        ...current,
+        chapters: current.chapters.map((chapter) => (
+          titles.has(chapter.id) ? { ...chapter, title: titles.get(chapter.id)! } : chapter
+        )),
+      }));
+    } catch (e) {
+      setTitleError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setTranslatingGroup(null);
+    }
+  }, [bookId]);
 
   const exportBook = useCallback(
     async (format: 'epub' | 'txt', chaptersPerFile: number) => {
@@ -253,7 +491,7 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
           throw new Error(detail?.detail || `API returned ${res.status}`);
         }
         // Close the reader and refresh the TOC so the chapter shows as missing.
-        setReader({ loading: false, chapter: null, error: '' });
+        closeReader();
         await load();
       } catch (e) {
         setExportError(e instanceof Error ? e.message : String(e));
@@ -261,7 +499,7 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
         setDeletingChapter(false);
       }
     },
-    [bookId, deletingChapter, load],
+    [bookId, closeReader, deletingChapter, load],
   );
 
   if (error && !book) {
@@ -291,6 +529,9 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
   const pct =
     book.total_chapters > 0 ? Math.round((book.saved_count / book.total_chapters) * 100) : 0;
   const reading = reader.chapter;
+  const activeChapter = translation?.active_chapter_id ?? dictionaryInfo?.active_chapter_id ?? null;
+  const showingTranslation = readerView === 'translated' && !!translation?.translated &&
+    !translation.stale && activeChapter !== reading?.id;
 
   return (
     <section className="section">
@@ -393,22 +634,37 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
                   <span className="pull">{open ? '▾' : '▸'}</span>
                 </button>
                 {open && (
-                  <div className="toc-list">
-                    {group.chapters.map((ch) => (
+                  <>
+                    <div className="toc-folder-actions">
                       <button
                         type="button"
-                        key={ch.id}
-                        className={`toc-item${ch.saved ? ' saved' : ' missing'}`}
-                        disabled={!ch.saved}
-                        title={ch.saved ? 'Open chapter' : 'Not downloaded yet — use Fetch missing'}
-                        onClick={() => void openChapter(ch.id)}
+                        className="btn btn-ghost"
+                        disabled={translatingGroup !== null}
+                        onClick={() => void translateTitles(group)}
                       >
-                        <span className="toc-dot">{ch.saved ? '✓' : '·'}</span>
-                        <span className="toc-num">{ch.id}.</span>
-                        <span className="toc-title">{ch.title}</span>
+                        {translatingGroup === group.start ? 'Đang dịch title…' : 'Dịch title mục này'}
                       </button>
-                    ))}
-                  </div>
+                      {titleError && translatingGroup === null && (
+                        <span className="error-text" role="alert">{titleError}</span>
+                      )}
+                    </div>
+                    <div className="toc-list">
+                      {group.chapters.map((ch) => (
+                        <button
+                          type="button"
+                          key={ch.id}
+                          className={`toc-item${ch.saved ? ' saved' : ' missing'}`}
+                          disabled={!ch.saved}
+                          title={ch.saved ? 'Open chapter' : 'Not downloaded yet — use Fetch missing'}
+                          onClick={() => void openChapter(ch.id)}
+                        >
+                          <span className="toc-dot">{ch.saved ? '✓' : '·'}</span>
+                          <span className="toc-num">{ch.id}.</span>
+                          <span className="toc-title">{ch.title}</span>
+                        </button>
+                      ))}
+                    </div>
+                  </>
                 )}
               </div>
             );
@@ -486,7 +742,7 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
             <div className="reader-panel">
               <div className="reader-head">
                 <h3>
-                  #{reading.id} — {reading.title}
+                  #{reading.id} — {showingTranslation ? translation?.translated?.title : reading.title}
                 </h3>
                 <div className="reader-head-actions">
                   <button
@@ -500,15 +756,99 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
                   <button
                     type="button"
                     className="btn btn-ghost"
-                    onClick={() => setReader({ loading: false, chapter: null, error: '' })}
+                    onClick={closeReader}
                   >
                     ✕ Close
                   </button>
                 </div>
               </div>
-              {/* Chapter bodies come from our own crawler pipeline (sanitized by
-                  the source cleaner), so this is trusted content, not user input. */}
-              <div className="reader-body" dangerouslySetInnerHTML={{ __html: reading.body }} />
+              <div className="reader-controls">
+                <div className="reader-controls-row">
+                  <label className="reader-import">
+                    <span>Import dictionary cho truyện (.json)</span>
+                    <input type="file" accept=".json,application/json"
+                      disabled={readerBusy || activeChapter !== null || !dictionaryInfo}
+                      onChange={(event) => void importDictionary(event)} />
+                  </label>
+                  <span className="muted">
+                    {dictionaryInfo ? `${translation?.entry_count ?? dictionaryInfo.entry_count} thuật ngữ` : 'Đang tải dictionary…'}
+                    {dictionaryInfo?.imported ? ' · Đã import (file mới sẽ thay thế)' : ''}
+                  </span>
+                </div>
+                <div className="reader-controls-row">
+                  <button type="button" className="btn btn-primary"
+                    disabled={readerBusy || !translation || activeChapter !== null}
+                    onClick={() => void translateReaderChapter()}>
+                    {readerBusy ? 'Đang xử lý…' : translation?.translated ? 'Dịch lại' : 'Dịch chương'}
+                  </button>
+                  <div className="reader-view-switch" role="group" aria-label="Chế độ đọc">
+                    <button type="button" className={`btn ${!showingTranslation ? 'btn-primary' : 'btn-secondary'}`}
+                      aria-pressed={!showingTranslation} onClick={() => setReaderView('raw')}>RAW</button>
+                    <button type="button" className={`btn ${showingTranslation ? 'btn-primary' : 'btn-secondary'}`}
+                      aria-pressed={showingTranslation}
+                      disabled={!translation?.translated || translation.stale || activeChapter === reading.id}
+                      onClick={() => setReaderView('translated')}>Dịch</button>
+                  </div>
+                </div>
+                {activeChapter !== null && activeChapter !== reading.id &&
+                  <p className="reader-status">Đang xử lý chương {activeChapter}. Hoàn tất hoặc hủy job đó trước khi dịch/import.</p>}
+                {translation?.stale && <p className="reader-status">
+                  Bản dịch cũ không còn khớp RAW hoặc thuật ngữ hiện tại. Đang hiển thị RAW; chọn Dịch lại để cập nhật.
+                </p>}
+                {translation?.job && <div className="reader-job-status">
+                  <span role="status">Dịch chương: {translation.job.status} · {translation.job.stage_label ?? translation.job.stage ?? 'Đang chuẩn bị'}</span>
+                  {['pending', 'running', 'failed', 'interrupted'].includes(translation.job.status) &&
+                    <button type="button" className="btn btn-ghost" disabled={readerBusy}
+                      onClick={() => void readerJobAction('cancel')}>Hủy job</button>}
+                  {['failed', 'interrupted'].includes(translation.job.status) && !translation.job.manual_review &&
+                    <button type="button" className="btn btn-primary" disabled={readerBusy}
+                      onClick={() => void readerJobAction('resume')}>Tiếp tục</button>}
+                </div>}
+                {(readerInfoError || translation?.error || translation?.job?.error) &&
+                  <p className="error-text" role="alert">
+                    {readerInfoError || translation?.error || translation?.job?.error}
+                    {translation?.job?.error_detail ? ` · ${readerError(translation.job.error_detail)}` : ''}
+                  </p>}
+                {readerInfoError && !translation &&
+                  <div className="reader-controls-row">
+                    <button type="button" className="btn btn-ghost"
+                      onClick={() => void loadReaderInfo(reading.id, readerEpoch.current)}>
+                      Tải lại trạng thái dịch
+                    </button>
+                    <button type="button" className="btn btn-secondary" disabled={readerBusy}
+                      onClick={() => void translateReaderChapter(true)}>
+                      Thử dịch lại
+                    </button>
+                  </div>}
+                {translation?.job?.manual_review && ['failed', 'interrupted'].includes(translation.job.status) &&
+                  <section className="reader-review" aria-label="Duyệt đoạn dịch thủ công">
+                    <h4>Duyệt chương {translation.job.manual_review.chapter} · {translation.job.manual_review.paragraph_id}</h4>
+                    <p>RAW</p>
+                    <p className="reader-review-text">{translation.job.manual_review.raw}</p>
+                    <p>Phát hiện cần xử lý</p>
+                    <pre>{JSON.stringify(translation.job.manual_review.findings, null, 2)}</pre>
+                    <label htmlFor="reader-review-text">Bản dịch hiện tại (sửa toàn đoạn hoặc chấp nhận giữ nguyên)</label>
+                    <textarea id="reader-review-text" key={translation.job.manual_review.fingerprint}
+                      ref={reviewTextRef} defaultValue={translation.job.manual_review.current_text} rows={5} disabled={readerBusy} />
+                    <div className="reader-controls-row">
+                      <button type="button" className="btn btn-primary" disabled={readerBusy}
+                        onClick={() => void readerJobAction('review', 'replace', reviewTextRef.current?.value ?? '')}>
+                        Lưu bản sửa và tiếp tục
+                      </button>
+                      <button type="button" className="btn btn-secondary" disabled={readerBusy}
+                        onClick={() => void readerJobAction('review', 'accept')}>
+                        Giữ nguyên và tiếp tục
+                      </button>
+                    </div>
+                  </section>}
+              </div>
+              {showingTranslation
+                ? <div className="reader-body reader-translated">
+                    {translation?.translated?.paragraphs.map((paragraph, index) =>
+                      <p key={index}>{paragraph}</p>)}
+                  </div>
+                : /* Chapter bodies come from our crawler pipeline (sanitized by the source cleaner). */
+                  <div className="reader-body" dangerouslySetInnerHTML={{ __html: reading.body }} />}
               <div className="reader-nav">
                 <button
                   type="button"

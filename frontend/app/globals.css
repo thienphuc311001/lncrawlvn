@@ -565,6 +565,8 @@ html { scroll-behavior: smooth; }
 }
 .toc-folder-head:hover { background: var(--surface-2, rgba(128, 128, 128, 0.1)); }
 .toc-folder-head .pull { color: var(--muted); }
+.toc-folder-actions { display: flex; align-items: center; gap: 12px; padding: 8px 16px; }
+.toc-folder-actions .error-text { font-size: 12px; }
 .toc-list { display: flex; flex-direction: column; border-top: 1px solid var(--border); }
 .toc-item {
   display: flex;
@@ -640,6 +642,46 @@ html { scroll-behavior: smooth; }
   justify-content: space-between;
   padding: 12px 20px;
   border-top: 1px solid var(--border);
+}
+
+.reader-controls {
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--border);
+  overflow-y: auto;
+  max-height: 48vh;
+  flex-shrink: 0;
+  font-size: 13px;
+}
+.reader-controls-row, .reader-job-status {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 14px;
+  margin-block: 6px;
+}
+.reader-import { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.reader-import input { max-width: 100%; font: inherit; }
+.reader-view-switch { display: flex; gap: 6px; }
+.reader-controls .btn { padding: 7px 12px; font-size: 13px; }
+.reader-controls .btn-secondary, .reader-controls .btn-ghost, .reader-nav .btn-ghost { color: #e0e0e0; }
+.reader-controls .muted, .reader-status { color: #a3a3a3; }
+.reader-controls .btn:disabled, .reader-nav .btn:disabled { opacity: 0.55; }
+.reader-status { margin: 8px 0; }
+.reader-job-status span { overflow-wrap: anywhere; }
+.reader-review { border: 1px solid var(--border); border-radius: 8px; padding: 12px; margin-top: 12px; }
+.reader-review h4, .reader-review p { margin: 0 0 8px; }
+.reader-review-text, .reader-review pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+.reader-review pre { max-height: 120px; overflow-y: auto; }
+.reader-review textarea { display: block; box-sizing: border-box; width: 100%; padding: 10px; margin-top: 8px; font: inherit; }
+.reader-body { min-height: 0; }
+.reader-translated p { margin: 0 0 1em; white-space: pre-wrap; overflow-wrap: anywhere; }
+@media (max-width: 600px) {
+  .reader-overlay { padding: 8px; }
+  .reader-panel { max-height: 96dvh; }
+  .reader-head { align-items: flex-start; flex-wrap: wrap; padding: 10px 12px; }
+  .reader-head-actions { margin-left: auto; }
+  .reader-controls, .reader-body { padding: 12px; }
+  .reader-nav { padding: 8px 12px; }
 }
 
 

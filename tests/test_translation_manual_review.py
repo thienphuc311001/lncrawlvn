@@ -12,8 +12,8 @@ from fastapi import HTTPException
 from lncrawl.translation import api
 from lncrawl.translation.models import PIPELINE_VERSION, Translation, TranslatedSegment
 from lncrawl.translation.parsing import parse_chapters
-from lncrawl.translation.pipeline import Pipeline
-from lncrawl.translation.scheduler import Scheduler
+from lncrawl.translation.pipeline import Pipeline, QualityError
+from lncrawl.translation.scheduler import ErrorCategory, ProviderError, Scheduler
 from lncrawl.translation.store import Store, digest
 
 
@@ -163,6 +163,63 @@ class ManualReviewTests(unittest.IsolatedAsyncioTestCase):
             pipeline = Pipeline(store, Scheduler(concurrency=1, spacing=0, keys=[None]))
             pipeline.dictionary = DICTIONARY
             self.assertTrue(pipeline._local_findings(chapter, result))
+
+    async def test_blocked_repair_requires_review_and_preserves_pending_translation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = failed_store(Path(directory))
+            chapter = parse_chapters(RAW)[0]
+            pending = store.read("pending-chapters/145.json")
+            result = Translation.model_validate(pending["translation"])
+
+            async def blocked(*args):
+                raise ProviderError("Gemini blocked response: PROHIBITED_CONTENT",
+                                    category=ErrorCategory.MODEL_FAILURE)
+
+            pipeline = Pipeline(store, Scheduler(concurrency=1, spacing=0,
+                                                 transport=blocked, keys=[None]))
+            pipeline.dictionary = DICTIONARY
+            pipeline.pre_hash = digest(DICTIONARY)
+            with self.assertRaises(QualityError) as caught:
+                await pipeline.repair_findings(chapter, result, [
+                    {"kind": "locked_term_missing", "id": chapter.paragraph_ids[0],
+                     "source": "会试", "required": "hội thí"},
+                ])
+            self.assertIn("manual review required", str(caught.exception))
+            self.assertEqual(store.read("pending-chapters/145.json"), pending)
+            self.assertEqual(store.read("validation-failures/145.json")["paragraph_id"],
+                             chapter.paragraph_ids[0])
+            store.progress("failed", error=str(caught.exception))
+            self.assertEqual(api.snapshot(store)["manual_review"]["current_text"], ORIGINAL)
+            await self._decide(store, "replace", REPLACEMENT)
+            await self._run_without_provider(store)
+            self.assertEqual(store.read("progress.json")["status"], "done")
+            self.assertEqual(store.read("translated.json")["chapters"][0]["segments"][0]["text"],
+                             REPLACEMENT)
+
+    async def test_existing_blocked_job_recovers_manual_review_from_logs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = failed_store(Path(directory))
+            store.log({"event": "REPAIR_REQUEST", "status": "repair_request",
+                       "chapter": 145, "paragraph_id": "P0145_0001"})
+            store.log({"event": "REPAIR_REQUEST", "status": "repair_request",
+                       "chapter": 145, "requested_model": "gemini-3.5-flash-lite"})
+            store.log({"event": "REPAIR_REQUEST", "status": "failed",
+                       "error": "Gemini blocked response: PROHIBITED_CONTENT"})
+            store.progress("failed", error=(
+                "No usable Gemini model/API-key combination remains: "
+                "gemini-3.5-flash-lite [key slot 1]: "
+                "Gemini blocked response: PROHIBITED_CONTENT"
+            ))
+            self.assertEqual(api.snapshot(store)["manual_review"]["paragraph_id"],
+                             "P0145_0001")
+            await self._decide(store, "accept")
+            await self._run_without_provider(store)
+            self.assertEqual(store.read("chapters/145.json")["qa_status"], "manual_override")
+
+            store.progress("failed", error="No usable Gemini model/API-key combination remains: "
+                           "Gemini blocked response: PROHIBITED_CONTENT")
+            store.log({"event": "QA_REQUEST", "status": "qa_request", "chapter": 145})
+            self.assertIsNone(api.snapshot(store).get("manual_review"))
 
     async def test_semantic_repair_failure_without_local_findings_is_reviewable(self):
         with tempfile.TemporaryDirectory() as directory:
