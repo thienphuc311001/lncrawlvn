@@ -223,7 +223,7 @@ class QbmFxsCrawler(SoupTemplate):
             if current is None:
                 break
         else:
-            logger.warning(f"Split walk exceeded {MAX_SPLITS} pages for {url}")
+            raise LNException(f"Split walk exceeded {MAX_SPLITS} pages for {url}")
 
         assembled = self.scraper.make_soup(f"<div>{''.join(raws)}</div>")
         chapter.body = self.cleaner.extract_contents(assembled.select_one("div"))
@@ -249,9 +249,9 @@ class QbmFxsCrawler(SoupTemplate):
         id differs.
         """
         anchor = page.select_one("a#next[href]")
-        if anchor is None:
-            # The mobile template leaves its pagination links unnamed; both
-            # templates label the split-chain link with 下一页.
+        if not anchor:
+            # The mobile template has no #next link and select_one returns
+            # PageSoup(empty), not None. Both templates label it 下一页.
             for candidate in page.select("a[href]"):
                 if "下一页" in (candidate.get_text(strip=True) or ""):
                     anchor = candidate

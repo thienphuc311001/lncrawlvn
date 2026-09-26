@@ -69,6 +69,12 @@ Options:
 Only the crawlers under `sources/zh/` and `sources/vi/` are loaded. Every other
 source corpus from the original project is intentionally absent.
 
+On qbmfxs.com, chapters can span linked `/2`, `/3`, ... pages; the crawler
+combines their visible text and encoded `p_key` remainder before saving. Books
+downloaded before this fix may contain truncated chapters: on a book's detail
+page, choose **Re-crawl & overwrite** next to **Fetch missing** to replace all
+saved chapters. The equivalent API call is `/api/extract` with `"overwrite": true`.
+
 ## How it stays simple
 
 - **No `ctx` service graph** — just a logger, one shared scraper state, one source registry.

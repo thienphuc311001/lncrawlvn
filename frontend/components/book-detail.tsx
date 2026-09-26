@@ -19,6 +19,7 @@ type Book = {
   title: string;
   author: string;
   cover_url: string;
+  url: string;
   total_chapters: number;
   saved_count: number;
   synopsis: string;
@@ -76,7 +77,7 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
   const [error, setError] = useState('');
   const [openFolders, setOpenFolders] = useState<Set<number>>(() => new Set());
   const [reader, setReader] = useState<ReaderState>({ loading: false, chapter: null, error: '' });
-  const [fetching, setFetching] = useState(false);
+  const [crawlMode, setCrawlMode] = useState<'missing' | 'overwrite' | null>(null);
   const [exportError, setExportError] = useState('');
   const [exporting, setExporting] = useState<'epub' | 'txt' | null>(null);
   /** Format whose "chapters per file" dialog is open, if any. */
@@ -305,22 +306,34 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
     }
   }, [reader.chapter?.id, readerBusy, refreshTranslation, translation?.job]);
 
-  const startFetchMissing = useCallback(async () => {
+  const startCrawl = useCallback(async (mode: 'missing' | 'overwrite') => {
+    if (crawlMode || !book) return;
+    if (mode === 'overwrite' && !window.confirm(
+      `Tải lại toàn bộ ${book.total_chapters} chương của "${book.title}" và ghi đè các chương đã lưu?`,
+    )) return;
     setExportError('');
-    setFetching(true);
+    setCrawlMode(mode);
     try {
       const res = await fetch(
-        `${API_BASE}/api/books/${encodeURIComponent(bookId)}/fetch-missing`,
-        { method: 'POST' },
+        mode === 'overwrite'
+          ? `${API_BASE}/api/extract`
+          : `${API_BASE}/api/books/${encodeURIComponent(bookId)}/fetch-missing`,
+        mode === 'overwrite'
+          ? { method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ url: book.url, overwrite: true }) }
+          : { method: 'POST' },
       );
       const data = await res.json();
       if (!res.ok) throw new Error(data?.detail || `API returned ${res.status}`);
       // Console dock polls and streams this job's logs from anywhere in the UI.
-      trackJob(data.job_id, `Fetch missing — ${book?.title || bookId}`);
+      trackJob(data.job_id, `${mode === 'overwrite' ? 'Re-crawl & overwrite' : 'Fetch missing'} — ${book.title}`);
 
       let status: string = data.status;
+      if (status === 'failed' && data.error) setExportError(data.error);
       while (status === 'running' || status === 'pending') {
-        await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
+        const { promise, resolve } = Promise.withResolvers<void>();
+        setTimeout(resolve, POLL_INTERVAL_MS);
+        await promise;
         const poll = await fetch(`${API_BASE}/api/jobs/${data.job_id}`);
         if (!poll.ok) throw new Error(`Job poll returned ${poll.status}`);
         const job = await poll.json();
@@ -331,9 +344,9 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
     } catch (e) {
       setExportError(e instanceof Error ? e.message : String(e));
     } finally {
-      setFetching(false);
+      setCrawlMode(null);
     }
-  }, [bookId, book?.title, load, trackJob]);
+  }, [book, bookId, crawlMode, load, trackJob]);
 
   const translateTitles = useCallback(async (group: { start: number; chapters: TocChapter[] }) => {
     setTranslatingGroup(group.start);
@@ -573,10 +586,19 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
               <button
                 type="button"
                 className="btn btn-primary"
-                disabled={missingCount === 0 || fetching}
-                onClick={() => void startFetchMissing()}
+                disabled={missingCount === 0 || crawlMode !== null}
+                onClick={() => void startCrawl('missing')}
               >
-                {fetching ? 'Fetching…' : `Fetch missing (${missingCount})`}
+                {crawlMode === 'missing' ? 'Fetching…' : `Fetch missing (${missingCount})`}
+              </button>
+              <button
+                type="button"
+                className="btn btn-ghost"
+                disabled={!book.url || book.total_chapters === 0 || crawlMode !== null}
+                title="Tải lại toàn bộ chương và ghi đè nội dung đã lưu"
+                onClick={() => void startCrawl('overwrite')}
+              >
+                {crawlMode === 'overwrite' ? 'Re-crawling…' : 'Re-crawl & overwrite'}
               </button>
               <button
                 type="button"
@@ -597,7 +619,7 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
               <button
                 type="button"
                 className="btn btn-danger"
-                disabled={deleting || fetching || exporting !== null}
+                disabled={deleting || crawlMode !== null || exporting !== null}
                 onClick={() => void deleteBook()}
               >
                 {deleting ? 'Deleting…' : '🗑 Delete book'}
@@ -748,7 +770,7 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
                   <button
                     type="button"
                     className="btn btn-danger"
-                    disabled={deletingChapter || fetching}
+                    disabled={deletingChapter || crawlMode !== null}
                     onClick={() => void deleteChapter(reading)}
                   >
                     {deletingChapter ? 'Đang xóa…' : '🗑 Xóa chương'}
