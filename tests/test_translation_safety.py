@@ -42,12 +42,26 @@ class ParsingAndDictionarySafetyTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(first[0].paragraph_ids, ("P0141_0001", "P0141_0002"))
         self.assertEqual(first[1].paragraph_ids, ("P0143_0001",))
+        inline_chapter = parse_chapters("第四十一章 好电影 李迩微微点头，道：在这方面，我确实也希望你们作为家长。")
+        self.assertEqual(inline_chapter[0].number, 41)
+        self.assertEqual(inline_chapter[0].title, "好电影")
+        self.assertEqual(inline_chapter[0].paragraphs, ("李迩微微点头，道：在这方面，我确实也希望你们作为家长。",))
         with self.assertRaises(ChapterValidationError) as caught:
-            parse_chapters("第1章 开始\n甲。\n第十章 错误\n乙。")
+            parse_chapters("第1章 开始\n甲。\n第abc章 错误\n乙。")
         self.assertEqual(caught.exception.detail["error_type"], "malformed_heading")
         self.assertEqual(caught.exception.detail["input"], "RAW")
         self.assertEqual(caught.exception.detail["line"], 3)
         self.assertTrue(caught.exception.detail["reason"])
+
+    def test_null_locked_character_gender_normalizes_to_unknown(self):
+        migrations = []
+        loaded = load_dictionary({"version": 10, "entries": [
+            {**entry("李昱", "Lý Dục"), "gender": None},
+        ]}, migrations)
+        self.assertEqual(loaded["entries"][0]["gender"], "unknown")
+        self.assertIn({
+            "source": "李昱", "field": "gender", "from": None, "to": "unknown",
+        }, migrations)
 
     def test_legacy_types_migrate_to_one_versioned_schema(self):
         old = {"version": 9, "entries": [
@@ -55,14 +69,22 @@ class ParsingAndDictionarySafetyTests(unittest.TestCase):
             entry("神术", "thần thuật", "ability"),
             entry("法器", "pháp khí", "item"),
             entry("道心", "đạo tâm", "concept"),
+            entry("天工开物", "Thiên Công Khai Vật", "work"),
+            entry("洛阳", "Lạc Dương", "place"),
         ]}
         migrations = []
         loaded = load_dictionary(old, migrations)
         self.assertEqual(loaded["version"], 10)
         self.assertEqual([item["type"] for item in loaded["entries"]],
-                         ["institution", "term", "term", "term"])
+                         ["institution", "term", "term", "term", "book_title", "location"])
         self.assertTrue(all(item["gender"] == "not_applicable" for item in loaded["entries"]))
         self.assertEqual(migrations[0], {"field": "version", "from": 9, "to": 10})
+        self.assertIn({
+            "source": "天工开物", "field": "type", "from": "work", "to": "book_title",
+        }, migrations)
+        self.assertIn({
+            "source": "洛阳", "field": "type", "from": "place", "to": "location",
+        }, migrations)
         with self.assertRaises(DictionaryConflict):
             load_dictionary({"version": 10, "entries": old["entries"]})
 
@@ -127,6 +149,23 @@ class ParsingAndDictionarySafetyTests(unittest.TestCase):
         self.assertEqual(numeric_mismatch("有两个人。", "Có 2 người."), None)
         self.assertEqual(numeric_mismatch("有2个人。", "Có 3 người.")["missing"], {"2": 1})
         self.assertTrue(numeric_mismatch("来了 一万二人。", "Có 12.000 người.")["ambiguous"])
+        annotation_raw = "第1章 数目\n他沉沦下去。15 从李迩家出来？1 两口子等10年再去。"
+        annotation_chapter = parse_chapters(annotation_raw)[0]
+        annotation_vi = "Ông dần sa sút. Rời khỏi nhà Lý Nhĩ. Hai vợ chồng đợi 10 năm nữa rồi đi."
+        self.assertIsNone(numeric_mismatch(annotation_chapter.paragraphs[0], annotation_vi))
+        annotation_result = Translation(title="Số phận", segments=[{
+            "id": annotation_chapter.paragraph_ids[0], "text": annotation_vi,
+        }])
+        annotation_findings = local_findings(annotation_chapter, annotation_result, load_dictionary(None))
+        self.assertNotIn("numeric_mismatch", {finding["kind"] for finding in annotation_findings})
+        annotation_result.segments[0].text = (
+            "Ông dần sa sút. Rời khỏi nhà Lý Nhĩ. Hai vợ chồng đợi đến năm 2010 rồi đi."
+        )
+        numeric_finding = next(finding for finding in local_findings(
+            annotation_chapter, annotation_result, load_dictionary(None)
+        ) if finding["kind"] == "numeric_mismatch")
+        self.assertEqual(numeric_finding["missing"], {"10": 1})
+        self.assertEqual(numeric_finding["extra"], {"2010": 1})
         self.assertEqual(numeric_mismatch("国帑入库162.5万两。",
                                           "Quốc khố nhập 1,625 triệu lượng."), None)
         self.assertEqual(numeric_mismatch("国帑入库162.5万两。",

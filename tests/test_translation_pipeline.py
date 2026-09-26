@@ -98,10 +98,18 @@ class DictionaryTests(unittest.TestCase):
             merge_patch(dictionary, {"confirmed": [
                 {"operation": "add_entry", "entry": entry("邱途笑", "Sai")},
             ]}, "邱途笑")
-        with self.assertRaises(DictionaryConflict):
-            merge_patch(dictionary, {"confirmed": [
-                {"operation": "add_entry", "entry": entry("邱探员", "Sai")},
-            ]}, "邱探员")
+        titled = merge_patch(dictionary, {"confirmed": [
+            {"operation": "add_entry", "entry": entry("邱探员", "Thám viên Khâu")},
+        ]}, "邱探员见到邱途。")
+        self.assertIn("邱探员", {item["source"] for item in titled["entries"]})
+
+    def test_locked_dictionary_accepts_title_character_canonical(self):
+        dictionary = load_dictionary({"version": 10, "entries": [
+            entry("袁老师", "Thầy Viên"),
+        ]})
+        self.assertEqual(dictionary["entries"][0]["source"], "袁老师")
+        self.assertEqual(dictionary["entries"][0]["type"], "character")
+
 
     def test_same_vietnamese_wording_is_allowed(self):
         merged = merge_patch(load_dictionary(None), {"confirmed": [

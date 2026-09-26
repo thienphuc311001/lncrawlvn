@@ -3,10 +3,41 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
-HEADING = re.compile(r"^\s*第\s*(\d+)\s*章\s*(.*)\s*$")
+CHINESE_DIGITS = {"零": 0, "〇": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
+                  "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+CHINESE_UNITS = {"十": 10, "百": 100, "千": 1_000, "万": 10_000, "亿": 100_000_000}
+CHINESE_NUMBER = r"零〇一二三四五六七八九十百千万亿两"
+HEADING = re.compile(rf"^\s*第\s*(\d+|[{CHINESE_NUMBER}]+)\s*章\s*(.*)\s*$")
 HEADING_LIKE = re.compile(r"^\s*第\s*([^\s章]+)\s*章")
 REFERENCE = re.compile(r"^(?:中|里|里面)(?:记载|提到|描述|说过|写道)|^(?:所述|提到|说过)")
 SEPARATOR = re.compile(r"-{20,}")
+
+INLINE_SENTENCE_PUNCTUATION = re.compile(r"[，。！？；：,.!?;:]")
+
+def split_inline_body(title: str) -> tuple[str, str | None]:
+    parts = title.split(maxsplit=1)
+    if len(parts) == 2 and INLINE_SENTENCE_PUNCTUATION.search(parts[1]):
+        return parts[0], parts[1]
+    return title, None
+
+
+def chapter_number(value: str) -> int:
+    if value.isdecimal():
+        return int(value)
+    total = section = number = 0
+    for character in value:
+        if character in CHINESE_DIGITS:
+            number = CHINESE_DIGITS[character]
+            continue
+        unit = CHINESE_UNITS[character]
+        if unit < 10_000:
+            section += (number or 1) * unit
+            number = 0
+        else:
+            section += number
+            total += (section or 1) * unit
+            section = number = 0
+    return total + section + number
 
 class ChapterValidationError(ValueError):
     def __init__(self, error_type, chapter=None, line=None, previous_line=None, message=None,
@@ -75,7 +106,7 @@ def parse_chapters(text: str, label: str = "RAW", diagnostics=None) -> list[Chap
                 reason=f"Heading-like line is not a valid numbered chapter: {line[:120]}",
             )
         if heading:
-            number = int(heading[1])
+            number = chapter_number(heading[1])
             if number in seen:
                 raise ChapterValidationError("duplicate_chapter", number, line_number, seen[number], input_name=label)
             if current is not None:
@@ -85,9 +116,13 @@ def parse_chapters(text: str, label: str = "RAW", diagnostics=None) -> list[Chap
             if chapters and number < chapters[-1].number:
                 raise ChapterValidationError("backwards_chapter", number, line_number, chapters[-1].source_line,
                                              input_name=label)
-            current = (number, heading[2].strip(), line_number)
+            title, inline_body = split_inline_body(heading[2].strip())
+            current = (number, title, line_number)
             seen[number] = line_number
             paragraphs, paragraph_lines = [], []
+            if inline_body:
+                paragraphs.append(inline_body)
+                paragraph_lines.append(line_number)
         elif line:
             if current is None:
                 raise ChapterValidationError("content_before_chapter", line=line_number, input_name=label)

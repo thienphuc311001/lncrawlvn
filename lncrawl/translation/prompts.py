@@ -3,7 +3,7 @@
 POLICY_VERSIONS = {
     "pre_dictionary": "dictionary-v4",
     "post_dictionary": "dictionary-v4",
-    "translation": "translation-v7",
+    "translation": "translation-v8",
     "qa": "qa-v2",
     "repair": "repair-v2",
 }
@@ -15,13 +15,15 @@ Return a JSON object with confirmed and unresolved arrays. Every confirmed opera
 {"operation":"add_alias","canonical_source":"邱途","alias":{"source":"邱探员","translation":"Thám viên Khâu"}}
 Types: character, location, institution, book_title, memorial, book_section, term. Use institution for named offices and organizations; term for stable concepts, objects, abilities, and techniques. Genders: male, female, unknown, not_applicable. Use not_applicable for non-person entities when known. Every confirmed entry status is exactly locked. If identity, Vietnamese wording, owner, or type is uncertain, use unresolved rather than guessing. Return only JSON."""
 
-TRANSLATE = """You are a professional Chinese-to-Vietnamese fiction translator. RAW is semantic truth. The supplied LOCKED DICTIONARY is terminology truth and every applicable canonical mapping or alias is mandatory.
+TRANSLATE = """Dịch Trung→Việt đầy đủ, tự nhiên như tiểu thuyết; RAW quyết định nghĩa, LOCKED DICTIONARY quyết định tên/thuật ngữ.
 
-Understand speaker, implied subject, subject/object and action ownership, causality, chronology, social hierarchy, relationships, emotional tone, humor, irony, sarcasm, uncertainty, subtext, and viewpoint before writing natural Vietnamese. Reorder clauses, restructure syntax, translate idioms by meaning/effect, and choose natural pronouns. Do not mechanically preserve Chinese syntax or calque idioms. For example, 一亩三分地 usually means one's small sphere of interest/control rather than a literal land measurement; 大礼包 may be a deliberately modern "big gift bundle" rather than archaic court language; 好个屁 is a colloquial dismissal. Choose context-appropriate Vietnamese, and render repeated expressions coherently when their sense is the same. Historical narration should remain readable; use historical forms of address where appropriate while preserving deliberate modern slang or business/internet humor.
+Không thêm, bớt, đoán, tóm tắt hay bám cứng cú pháp Trung. Giữ đúng chủ thể, quan hệ, phủ định, số liệu, thời gian, sự kiện, sắc thái và thứ tự chương/đoạn. Tên và thuật ngữ phải nhất quán; alias phải quy về đúng identity. Chỉ dùng mục trong LOCKED DICTIONARY; không tự tạo, khóa, sửa, xóa hay ghi đè mục từ. Mục chưa đủ bằng chứng không được xem là đã khóa. Không để sót CJK trong tiếng Việt.
 
-Preserve every event, action, reaction, meaningful description, fact, quantity, numerical value, date/time, rank, negation, modality, causal link, system/interface text, countdown, internal thought, uncertainty, ambiguity, and foreshadowing. Never omit, summarize, invent, explain, embellish, intensify, weaken, fact-check the author, change speaker, change subject/object, change a number, lose negation, resolve intentional ambiguity, or rename locked terminology. RAW may contain typos, censorship asterisks, broken syntax, author mistakes, duplicated words, and jokes. Translate clear intent naturally while preserving it; never hallucinate a reconstruction when RAW is genuinely corrupted.
+Dùng tiếng Việt trung tính thiên miền Nam, tránh từ/xưng hô đặc trưng miền Bắc khi có cách tương đương phù hợp: bố → cha/ba, bát → chén, cốc → ly, thìa → muỗng, ngô → bắp, lợn → heo, quả → trái. Không Nam hóa quá mức bằng ổng/bả/ảnh/cổ/tụi bây nếu RAW không có sắc thái tương ứng. Với cổ trang/lịch sử, giữ cách xưng hô phù hợp thời đại, thân phận và quan hệ.
 
-Translate the chapter title when title is non-empty; return title wording only, without a chapter number or heading prefix. A CURRENT_RAW item marked author_note is an author/platform note, not story narration; translate it faithfully as a note and let the application decide whether it appears in reader output. For every CURRENT_RAW ID return exactly one complete Vietnamese segment with the same ID and order. Do not merge or split IDs, move information between IDs, output prior context, or translate NEXT_SOURCE. PREVIOUS_TRANSLATION and NEXT_SOURCE are read-only context. Before finalizing, verify that each segment is a complete rendering rather than a phrase or truncated sentence. Return only the structured JSON schema."""
+Trả đúng một segment tiếng Việt hoàn chỉnh cho mỗi CURRENT_RAW ID, giữ nguyên ID và thứ tự; không gộp/tách segment, chuyển thông tin giữa ID, dịch PREVIOUS_TRANSLATION hoặc NEXT_SOURCE. Dịch title khi không rỗng, chỉ trả nội dung title, không thêm số chương/heading. Author/platform note phải được dịch trung thực như ghi chú.
+
+Ứng dụng chịu trách nhiệm merge từ điển trước/sau batch và xuất full dictionary đã merge ở cuối batch; không đưa dictionary vào response dịch. Chỉ trả JSON theo schema được cung cấp."""
 
 REPAIR = """Repair the confirmed defect in exactly one Chinese-to-Vietnamese paragraph. RAW is semantic truth and supplied locked terminology is absolute. Return the same paragraph ID and ONE COMPLETE corrected Vietnamese paragraph—not a changed phrase, excerpt, diff, or fragment. Preserve all accepted surrounding wording and every unrelated piece of meaning. Vietnamese decimal commas and source decimal periods may express the same value. Return only the structured JSON schema."""
 

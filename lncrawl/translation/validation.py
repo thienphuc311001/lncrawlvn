@@ -42,6 +42,15 @@ VI_WORD_NUMBERS = {"một": "1", "hai": "2", "ba": "3", "bốn": "4", "năm": "5
 VI_NUMBER_WORD_CONTEXT = re.compile(
     r"\b(?:bậc|thứ|căn|mũ|số)\s+(một|hai|ba|bốn|năm|sáu|bảy|tám|chín|mười)\b", re.I
 )
+SENTENCE_INDEX_MARKER = re.compile(
+    r"([。！？.!?][”’」』\"）】]?)(\s*)[0-9]{1,2}(?=\s+[\u3400-\u9fff“「『])"
+)
+
+
+def _strip_sentence_index_markers(text):
+    return SENTENCE_INDEX_MARKER.sub(r"\1\2", text)
+
+
 
 
 def _normalize_number(value, source=False, scaled=False):
@@ -130,6 +139,8 @@ def chinese_numeric_allowances(text):
 
 def numeric_mismatch(raw, translated):
     """Return missing/extra values while allowing digits rendered from Chinese numerals."""
+    raw = _strip_sentence_index_markers(raw)
+    translated = _strip_sentence_index_markers(translated)
     source = numeric_values(raw, source=True)
     source_literals = {
         match[0] for match in ARABIC_NUMBER.finditer(raw)

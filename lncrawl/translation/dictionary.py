@@ -33,12 +33,14 @@ CANONICAL_TYPES = {
 LEGACY_TYPE_MAP = {
     "organization": "institution",
     "faction": "institution",
+    "place": "location",
     "ability": "term",
     "technique": "term",
     "item": "term",
     "artifact": "term",
     "weapon": "term",
     "concept": "term",
+    "work": "book_title",
 }
 
 def _clean_text(value, field):
@@ -98,6 +100,13 @@ def _entry(record, legacy=False, migrations=None, allow_legacy_types=False):
             "source": alias["source"], "translation": alias["translation"],
         }
     gender = record.get("gender", "unknown" if canonical_kind == "character" else "not_applicable")
+    if gender is None:
+        normalized_gender = "unknown" if canonical_kind == "character" else "not_applicable"
+        if migrations is not None:
+            migrations.append({
+                "source": source, "field": "gender", "from": None, "to": normalized_gender,
+            })
+        gender = normalized_gender
     if canonical_kind != "character" and gender != "not_applicable":
         if migrations is not None:
             migrations.append({
@@ -190,8 +199,6 @@ def validate_dictionary(dictionary):
         if entry.source in canonical_sources:
             raise DictionaryConflict(f"Duplicate canonical source: {entry.source}")
         canonical_sources.add(entry.source)
-        if entry.type == "character" and TITLE_END.search(entry.source):
-            raise DictionaryConflict(f"Title/reference cannot be a canonical character: {entry.source}")
         local_sources = [entry.source] + [alias.source for alias in entry.aliases]
         if len(local_sources) != len(set(local_sources)):
             raise DictionaryConflict(f"Duplicate alias or self-alias for {entry.source}")
@@ -232,8 +239,6 @@ def merge_patch(dictionary, patch, raw, allow_unattested=False):
             source = entry["source"]
             if source_problem(source):
                 raise DictionaryConflict(f"Invalid canonical source {source!r}: {source_problem(source)}")
-            if entry["type"] == "character" and TITLE_END.search(source):
-                raise DictionaryConflict(f"Title/reference cannot be a canonical character: {source}")
             if not allow_unattested and source not in raw:
                 raise DictionaryConflict(f"Unattested canonical source {source}")
             if source in entries:
