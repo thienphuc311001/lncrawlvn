@@ -75,6 +75,17 @@ downloaded before this fix may contain truncated chapters: on a book's detail
 page, choose **Re-crawl & overwrite** next to **Fetch missing** to replace all
 saved chapters. The equivalent API call is `/api/extract` with `"overwrite": true`.
 
+DocLN (`docln.net`, `ln.hako.vn`) chapter pages may contain a shuffled, XOR-encoded
+body instead of visible paragraphs. The Hako crawler decodes it before saving
+the chapter, including illustrations. If an older download contains only a
+hidden chapter heading, use **Re-crawl & overwrite** to replace the saved body.
+
+For these two hosts, the Hako scraper uses Cloudflare DNS-over-HTTPS because some
+local DNS providers resolve them to loopback (`127.0.0.1`/`::1`), causing
+`transport failure (ConnectionError)` before a page can load. Requests still go
+through the normal scraper with the original host and TLS verification; no
+system DNS change or pinned site IP is needed.
+
 ## How it stays simple
 
 - **No `ctx` service graph** — just a logger, one shared scraper state, one source registry.
