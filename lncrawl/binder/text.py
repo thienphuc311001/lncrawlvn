@@ -37,6 +37,7 @@ def make_text(
     target: Optional[int] = None,
     maximum: Optional[int] = None,
     include_header: bool = True,
+    include_chapter_number: bool = False,
 ) -> Path:
     """Write one TXT file.
 
@@ -54,6 +55,7 @@ def make_text(
         target=target,
         maximum=maximum,
         include_header=include_header,
+        include_chapter_number=include_chapter_number,
     )
     validate_export(built)
     out_file.parent.mkdir(parents=True, exist_ok=True)

@@ -75,6 +75,31 @@ class EpubIntroTests(unittest.TestCase):
             self.assertTrue(has(names, "chapter_00001.xhtml"))
 
 
+    def test_numbered_title_is_not_numbered_twice_and_missing_title_is_optional(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            numbered = chapter(1)
+            unnumbered = Chapter(
+                id=2, title="Tiếp tục", body="<h3>Tiếp tục</h3><p>Nội dung.</p>", success=True,
+            )
+            out = make_epub(
+                novel(), [numbered, unnumbered], root / "numbered.epub",
+                include_chapter_number=True,
+            )
+            with zipfile.ZipFile(out) as archive:
+                first = archive.read("EPUB/chapter_00001.xhtml").decode("utf-8")
+                second = archive.read("EPUB/chapter_00002.xhtml").decode("utf-8")
+                nav = archive.read("EPUB/nav.xhtml").decode("utf-8")
+            self.assertIn('<h1 class="chapter-title">第1章</h1>', first)
+            self.assertNotIn("<h4>#1</h4>", first)
+            self.assertIn('<h1 class="chapter-title">Chương 2: Tiếp tục</h1>', second)
+            self.assertIn("Chương 2: Tiếp tục", nav)
+            out = make_epub(novel(), [unnumbered], root / "plain.epub")
+            with zipfile.ZipFile(out) as archive:
+                plain = archive.read("EPUB/chapter_00002.xhtml").decode("utf-8")
+            self.assertIn('<h1 class="chapter-title">Tiếp tục</h1>', plain)
+            self.assertNotIn("Chương 2", plain)
+
 class LibraryEpubExportTests(unittest.TestCase):
     def test_split_export_keeps_intro_in_first_file(self):
         with TemporaryDirectory() as tmp:

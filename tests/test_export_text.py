@@ -214,6 +214,37 @@ class LibraryTextExportTests(unittest.TestCase):
         self.assertEqual(blocks[1][1], "高启愚搞了个大新闻...")
 
 
+    def test_only_missing_body_numbers_are_optional_even_when_toc_is_numbered(self):
+        with TemporaryDirectory() as tmp:
+            library = Library(root=Path(tmp) / "library")
+            book_id = library.save_book_meta({
+                "title": "测试小说", "url": "https://example.test/book",
+                "toc": [{"id": cid, "title": f"第{cid}章", "url": f"https://example.test/{cid}"}
+                        for cid in (1, 2)],
+            })
+            library.save_chapter(book_id, {
+                "id": 1, "title": "第1章", "body": "<h3>第1章 开始</h3><p>正文一。</p>",
+            })
+            library.save_chapter(book_id, {
+                "id": 2, "title": "第2章", "body": "<h3>继续</h3><p>正文二。</p>",
+            })
+            self.assertTrue(library.needs_chapter_numbers(book_id, "txt"))
+            self.assertFalse(library.needs_chapter_numbers(book_id, "epub"))
+            without = library.export_zip(book_id, "txt")
+            with zipfile.ZipFile(without) as archive:
+                plain = archive.read("0001-0100.txt").decode("utf-8")
+            self.assertEqual([block[0] for block in chapter_blocks(plain)], ["第1章 开始", "继续"])
+            numbered = library.export_zip(book_id, "txt", include_chapter_number=True)
+            with zipfile.ZipFile(numbered) as archive:
+                text = archive.read("0001-0100.txt").decode("utf-8")
+            self.assertEqual(chapter_blocks(text), [
+                ["第1章 开始", "正文一。"], ["Chương 2", "继续", "正文二。"],
+            ])
+            library.save_chapter(book_id, {
+                "id": 2, "title": "第2章", "body": "<h3>Chương 2: Tiếp tục</h3><p>正文二。</p>",
+            }, overwrite=True)
+            self.assertFalse(library.needs_chapter_numbers(book_id, "txt"))
+
 class SplitExportTests(unittest.TestCase):
     """Exports split into N chapters per file, with the header in file 1 only."""
 

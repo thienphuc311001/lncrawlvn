@@ -461,6 +461,18 @@ def fetch_missing(book_id: str) -> Job:
     return started
 
 
+@app.get("/api/books/{book_id}/export-options")
+def export_options(
+    book_id: str,
+    format: str = Query("epub", pattern="^(epub|txt)$"),
+):
+    """Inspect saved chapter headings for the selected export format."""
+    try:
+        return {"needs_chapter_numbers": LIBRARY.needs_chapter_numbers(book_id, format)}
+    except LNException as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
 @app.get("/api/books/{book_id}/export")
 def export_book(
     book_id: str,
@@ -471,6 +483,7 @@ def export_book(
         le=MAX_EXPORT_CHUNK,
         description="Chapters per EPUB/TXT file inside the ZIP",
     ),
+    include_chapter_number: bool = Query(False, description="Number chapters lacking a visible chapter number"),
 ):
     """Export saved chapters as EPUB/TXT files in a ZIP, ``per_file`` chapters each.
 
@@ -481,7 +494,7 @@ def export_book(
     (metadata header, intro page, cover); later files are pure chapters.
     """
     try:
-        zip_path = LIBRARY.export_zip(book_id, format, per_file)
+        zip_path = LIBRARY.export_zip(book_id, format, per_file, include_chapter_number)
     except LNException as e:
         raise HTTPException(status_code=400, detail=str(e))
     return FileResponse(zip_path, media_type="application/zip", filename=zip_path.name)

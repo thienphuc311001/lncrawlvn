@@ -4,6 +4,7 @@ No database, no artifacts, no translations: just a book and chapter bodies.
 """
 
 import logging
+from html import escape
 from pathlib import Path
 from typing import Any, List, Optional
 
@@ -12,6 +13,7 @@ from ebooklib import epub  # type: ignore
 from ..assets.epub import epub_cover_xhtml
 from ..core import Chapter, Novel
 from ..utils.text_tools import generate_md5
+from .numbering import has_chapter_number
 
 logger = logging.getLogger(__name__)
 
@@ -24,17 +26,19 @@ p { line-height: 1.6; }
 PROJECT_URL = "https://github.com/lncrawl/lightnovel-crawler"
 
 
-def _chapter_item(chapter: Chapter) -> "epub.EpubHtml":
+def _chapter_item(chapter: Chapter, include_chapter_number: bool = False) -> "epub.EpubHtml":
     body = chapter.body or "<p><em>No content.</em></p>"
+    title = chapter.title
+    if include_chapter_number and not has_chapter_number(chapter, "epub"):
+        title = f"Chương {chapter.id}: {title}" if title else f"Chương {chapter.id}"
     content = f"""\
 <div>
-  <h4>#{chapter.id}</h4>
-  <h1 class="chapter-title">{chapter.title}</h1>
+  <h1 class="chapter-title">{escape(title)}</h1>
   {body}
 </div>
 """
     item = epub.EpubHtml(
-        title=chapter.title,
+        title=title,
         file_name=f"chapter_{chapter.id:05}.xhtml",
         content=content,
     )
@@ -64,6 +68,7 @@ def make_epub(
     cover_file: Optional[Path] = None,
     *,
     include_intro: bool = True,
+    include_chapter_number: bool = False,
 ) -> Path:
     """Bind chapters into one EPUB.
 
@@ -97,7 +102,7 @@ def make_epub(
     for chapter in chapters:
         if not chapter.success:
             continue
-        item = _chapter_item(chapter)
+        item = _chapter_item(chapter, include_chapter_number)
         book.add_item(item)
         spine.append(item)
         toc.append(item)

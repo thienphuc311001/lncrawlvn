@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from .binder import make_epub, make_text
+from .binder.numbering import has_chapter_number
 from .context import APP_DIR
 from .core import Chapter, Novel
 from .exceptions import LNException
@@ -393,11 +394,19 @@ class Library:
                 path.unlink(missing_ok=True)
         (exports_dir / f"{stem}.{fmt}.zip").unlink(missing_ok=True)
 
+    def needs_chapter_numbers(self, book_id: str, fmt: str) -> bool:
+        """Whether any saved chapter lacks a number in this format's visible heading."""
+        if fmt not in ("epub", "txt"):
+            raise LNException(f"Unsupported export format: {fmt}")
+        _, chapters = self._load_novel_and_chapters(book_id)
+        return any(not has_chapter_number(chapter, fmt) for chapter in chapters)
+
     def export_zip(
         self,
         book_id: str,
         fmt: str = "epub",
         per_file: int = DEFAULT_EXPORT_CHUNK,
+        include_chapter_number: bool = False,
     ) -> Path:
         """Build one EPUB/TXT per chapter chunk and bundle them into a ZIP.
 
@@ -444,9 +453,13 @@ class Library:
                     out,
                     cover if first else None,
                     include_intro=first,
+                    include_chapter_number=include_chapter_number,
                 )
             else:
-                make_text(novel, chunk_chapters, out, include_header=first)
+                make_text(
+                    novel, chunk_chapters, out,
+                    include_header=first, include_chapter_number=include_chapter_number,
+                )
             targets.append(out)
 
         zip_path = exports_dir / f"{stem}.{fmt}.zip"

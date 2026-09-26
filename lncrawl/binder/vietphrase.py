@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from ..exceptions import LNException
+from .numbering import heading_has_number
 
 logger = logging.getLogger(__name__)
 
@@ -792,6 +793,7 @@ def build_export_text(
     target: Optional[int] = None,
     maximum: Optional[int] = None,
     include_header: bool = True,
+    include_chapter_number: bool = False,
 ) -> ExportText:
     """Chunk every successful chapter and assemble the whole TXT.
 
@@ -822,7 +824,11 @@ def build_export_text(
             raise LNException(
                 f"Chapter {chapter.id}: VietPhrase block layout changed the crawled content"
             )
-        records.append((chapter, list(built.content)))
+        add_number = include_chapter_number and not (source and heading_has_number(source[0]))
+        emitted = list(built.content)
+        if add_number:
+            emitted.insert(0, f"Chương {chapter.id}")
+        records.append((chapter, emitted))
         block_sizes.extend(built.block_sizes)
         audit["chapters_exported"] += 1
         audit["safe_blocks_created"] += len(built.blocks)
@@ -839,6 +845,8 @@ def build_export_text(
 
         lines.append("")  # exactly one blank line before the chapter separator
         lines.append(CHAPTER_SEPARATOR)
+        if add_number:
+            lines.append(f"Chương {chapter.id}")
         for position, block in enumerate(built.blocks):
             if position:
                 lines.append("")

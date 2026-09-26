@@ -80,6 +80,9 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
   const [crawlMode, setCrawlMode] = useState<'missing' | 'overwrite' | null>(null);
   const [exportError, setExportError] = useState('');
   const [exporting, setExporting] = useState<'epub' | 'txt' | null>(null);
+  const [checkingExport, setCheckingExport] = useState(false);
+  const [needsChapterNumbers, setNeedsChapterNumbers] = useState(false);
+  const [includeChapterNumber, setIncludeChapterNumber] = useState<boolean | null>(null);
   /** Format whose "chapters per file" dialog is open, if any. */
   const [exportDialog, setExportDialog] = useState<'epub' | 'txt' | null>(null);
   const [perFileInput, setPerFileInput] = useState(String(DEFAULT_EXPORT_PER_FILE));
@@ -381,13 +384,13 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
   }, [bookId]);
 
   const exportBook = useCallback(
-    async (format: 'epub' | 'txt', chaptersPerFile: number) => {
+    async (format: 'epub' | 'txt', chaptersPerFile: number, numberChapters: boolean) => {
       setExporting(format);
       setExportError('');
       try {
         const res = await fetch(
           `${API_BASE}/api/books/${encodeURIComponent(bookId)}/export` +
-            `?format=${format}&per_file=${chaptersPerFile}`,
+            `?format=${format}&per_file=${chaptersPerFile}&include_chapter_number=${numberChapters}`,
         );
         if (!res.ok) {
           const detail = await res.json().catch(() => null);
@@ -411,10 +414,24 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
     [book, bookId],
   );
 
-  const openExportDialog = useCallback((format: 'epub' | 'txt') => {
-    setDialogError('');
-    setExportDialog(format);
-  }, []);
+  const openExportDialog = useCallback(async (format: 'epub' | 'txt') => {
+    if (checkingExport || exporting !== null) return;
+    setCheckingExport(true);
+    setExportError('');
+    try {
+      const { needs_chapter_numbers } = await readerRequest<{ needs_chapter_numbers: boolean }>(
+        `${bookPath}/export-options?format=${format}`,
+      );
+      setNeedsChapterNumbers(needs_chapter_numbers);
+      setIncludeChapterNumber(needs_chapter_numbers ? null : false);
+      setDialogError('');
+      setExportDialog(format);
+    } catch (e) {
+      setExportError(readerError(e));
+    } finally {
+      setCheckingExport(false);
+    }
+  }, [bookPath, checkingExport, exporting]);
 
   const closeExportDialog = useCallback(() => {
     setExportDialog(null);
@@ -448,12 +465,16 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
         );
         return;
       }
+      if (needsChapterNumbers && includeChapterNumber === null) {
+        setDialogError('Chọn Có hoặc Không cho số chương trong file xuất.');
+        return;
+      }
       const format = exportDialog;
       setExportDialog(null);
       setDialogError('');
-      void exportBook(format, perFile);
+      void exportBook(format, perFile, includeChapterNumber === true);
     },
-    [exportBook, exportDialog, perFileInput],
+    [exportBook, exportDialog, perFileInput, needsChapterNumbers, includeChapterNumber],
   );
 
 
@@ -603,18 +624,18 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
               <button
                 type="button"
                 className="btn btn-ghost"
-                disabled={exporting !== null || book.saved_count === 0}
-                onClick={() => openExportDialog('epub')}
+                disabled={checkingExport || exporting !== null || book.saved_count === 0}
+                onClick={() => void openExportDialog('epub')}
               >
-                {exporting === 'epub' ? 'Packing…' : 'Export EPUB'}
+                {checkingExport ? 'Checking…' : exporting === 'epub' ? 'Packing…' : 'Export EPUB'}
               </button>
               <button
                 type="button"
                 className="btn btn-ghost"
-                disabled={exporting !== null || book.saved_count === 0}
-                onClick={() => openExportDialog('txt')}
+                disabled={checkingExport || exporting !== null || book.saved_count === 0}
+                onClick={() => void openExportDialog('txt')}
               >
-                {exporting === 'txt' ? 'Packing…' : 'Export TXT'}
+                {checkingExport ? 'Checking…' : exporting === 'txt' ? 'Packing…' : 'Export TXT'}
               </button>
               <button
                 type="button"
@@ -742,6 +763,21 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
                   </small>
                 </label>
               </section>
+              {needsChapterNumbers && (
+                <fieldset className="settings-group export-number-choice">
+                  <legend>Bạn có muốn lưu số chương vào file xuất không?</legend>
+                  <label className="settings-check">
+                    <input type="radio" name="include-chapter-number" checked={includeChapterNumber === true}
+                      onChange={() => { setIncludeChapterNumber(true); setDialogError(''); }} />
+                    Có — chỉ thêm cho chương chưa có số
+                  </label>
+                  <label className="settings-check">
+                    <input type="radio" name="include-chapter-number" checked={includeChapterNumber === false}
+                      onChange={() => { setIncludeChapterNumber(false); setDialogError(''); }} />
+                    Không — giữ nguyên nội dung chương
+                  </label>
+                </fieldset>
+              )}
               {dialogError && (
                 <p className="muted error-text" role="alert">
                   ✗ {dialogError}

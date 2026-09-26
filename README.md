@@ -42,7 +42,8 @@ installer lives at `scripts/lnmini.sh`; copy it anywhere on your `PATH` as
 | `/api/books/{book_id}/chapters/{n}` | DELETE | Remove one saved chapter file (TOC entry kept) → `204`; re-download later via fetch-missing (`409` while a crawl job is running for the book) |
 | `/api/books/{book_id}/fetch-missing` | POST | Start a job that downloads only chapters missing on disk → `202` + job |
 | `/api/books/{book_id}` | DELETE | Remove a book with all saved chapters, cover, and exports → `204` (`409` while a crawl job is running for it) |
-| `/api/books/{book_id}/export?format=epub\|txt&per_file=100` | GET | Build an EPUB/TXT and download it as a ZIP — one `0001-0010.epub`-style file (chapter range only; the ZIP name keeps the title) per `per_file` chapters (default 100, max 10000). Only the first file carries the novel metadata header, intro page, and cover |
+| `/api/books/{book_id}/export-options?format=epub\|txt` | GET | Check saved chapter headings before export; `needs_chapter_numbers` is true if any exported chapter lacks a visible number (TXT checks body heading; EPUB checks title or body heading) |
+| `/api/books/{book_id}/export?format=epub\|txt&per_file=100&include_chapter_number=false` | GET | Build an EPUB/TXT ZIP with one chapter-range file per `per_file` chapters (default 100, max 10000). Only the first file carries front matter and cover. If `include_chapter_number=true`, add `Chương N` only to chapters whose exported heading lacks a number; otherwise leave them unchanged. The UI asks about this option only when needed. |
 
 
 ## Usage
