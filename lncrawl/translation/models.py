@@ -11,7 +11,7 @@ PRIMARY_MODEL, FALLBACK_MODEL = MODELS
 
 # These versions are part of job/cache identity.  Bump them whenever a persisted
 # semantic contract changes; old accepted chapters are migrated explicitly.
-PIPELINE_VERSION = 22
+PIPELINE_VERSION = 23
 PARSER_VERSION = 8
 DICTIONARY_VERSION = 10
 
@@ -58,18 +58,24 @@ class AddAlias(StrictModel):
 
 class Unresolved(StrictModel):
     source: str = Field(min_length=1)
-    possible_type: str = "unknown"
+    possible_type: Literal["character", "location", "institution", "book_title", "term", "unknown"] = "unknown"
     reason: str = "insufficient evidence"
     evidence: List[str] = Field(default_factory=list)
 
+class Rejected(StrictModel):
+    source: str = Field(min_length=1)
+    reason: str = Field(min_length=1)
+
 class DictionaryPatch(StrictModel):
     confirmed: List[Union[AddEntry, AddAlias]] = Field(default_factory=list)
+    rejected: List[Rejected] = Field(default_factory=list)
     unresolved: List[Unresolved] = Field(default_factory=list)
 
 class ProposedPatch(StrictModel):
     """Provider envelope; each proposed operation is validated locally."""
-    confirmed: List[dict] = Field(default_factory=list)
-    unresolved: List[dict] = Field(default_factory=list)
+    confirmed: List[Union[AddEntry, AddAlias]] = Field(default_factory=list)
+    rejected: List[Rejected] = Field(default_factory=list)
+    unresolved: List[Unresolved] = Field(default_factory=list)
 
 class TranslatedSegment(StrictModel):
     id: str = Field(pattern=r"^P\d{4,}_\d{4}(?:\.F\d{4})*$")

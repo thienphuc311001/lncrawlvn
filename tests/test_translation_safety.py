@@ -9,7 +9,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from lncrawl.translation.dictionary import DictionaryConflict, load_dictionary, locked_matches, merge_patch, relevant_entries, scan
+from lncrawl.translation.dictionary import (
+    DictionaryConflict, candidate_filter_reason, load_dictionary, load_unresolved,
+    locked_matches, merge_patch, possible_type, relevant_entries, scan,
+)
 from lncrawl.translation.models import Entry, PIPELINE_VERSION, Translation, TranslatedSegment
 from lncrawl.translation import prompts
 from lncrawl.translation.notes import author_note_policy, is_author_note
@@ -62,6 +65,7 @@ class ParsingAndDictionarySafetyTests(unittest.TestCase):
         self.assertIn({
             "source": "李昱", "field": "gender", "from": None, "to": "unknown",
         }, migrations)
+
 
     def test_legacy_types_migrate_to_one_versioned_schema(self):
         old = {"version": 9, "entries": [
@@ -340,6 +344,226 @@ class PipelineSafetyTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(sum("candidates" in payload for payload in calls), 1)
             self.assertTrue(store.read("unresolved.json")[0]["evidence"])
             self.assertIsNotNone(store.read("post-dictionary.json"))
+
+
+class TerminologyLifecycleTests(unittest.IsolatedAsyncioTestCase):
+    def scheduler(self, transport):
+        return Scheduler(concurrency=1, spacing=0, transport=transport, keys=[None])
+
+    def translated(self, payload):
+        return {"title": "Kiểm tra", "segments": [
+            {"id": item["id"], "text": "Hà Tâm Ẩn đang giảng dạy ở thư viện."}
+            for item in payload["raw"]
+        ]}
+
+    def reply(self, body, payload):
+        policy = body["systemInstruction"]["parts"][0]["text"]
+        if policy == prompts.QA:
+            return {"findings": []}
+        if policy == prompts.REPAIR:
+            return {"id": payload["id"], "text": "Hà Tâm Ẩn đang giảng dạy ở thư viện."}
+        return self.translated(payload)
+
+    async def test_a_garbage_candidates_are_filtered_before_ai(self):
+        calls = []
+
+        async def transport(model, body):
+            calls.append(payload_from(body))
+            return {"confirmed": [], "rejected": [], "unresolved": []}
+
+        with tempfile.TemporaryDirectory() as directory:
+            raw = "第1章 初见\n别人别死，不是看能力，冯保要走。"
+            store = Store(Path(directory), inputs={"raw": raw, "dictionary": None})
+            pipeline = Pipeline(store, self.scheduler(transport))
+            pipeline.chapters = parse_chapters(raw)
+            pipeline.dictionary = load_dictionary(None)
+            pipeline.input_hash = "garbage-filter"
+            candidates = [
+                {"source": source, "possible_type": "unknown", "evidence": []}
+                for source in ("别人", "别死", "不是看能力", "冯保要")
+            ]
+            await pipeline.resolve(candidates, "pre")
+            self.assertEqual(calls, [])
+            self.assertEqual(pipeline.unresolved, [])
+            self.assertTrue(all(candidate_filter_reason(item) for item in candidates))
+
+    async def test_b_c_candidate_persists_across_batches_then_promotes(self):
+        calls_by_batch = [[], [], []]
+
+        async def run_batch(directory, raw, dictionary, confirm, calls):
+            async def transport(model, body):
+                payload = payload_from(body)
+                calls.append(payload)
+                if "candidates" in payload:
+                    if confirm:
+                        return {"confirmed": [{"operation": "add_entry", "entry": entry(
+                            "何心隐", "Hà Tâm Ẩn", "character", "male")}],
+                            "rejected": [], "unresolved": []}
+                    return {"confirmed": [], "rejected": [], "unresolved": [{
+                        "source": "何心隐", "possible_type": "character",
+                        "reason": "need another chapter of identity evidence",
+                    }]}
+                return self.reply(body, payload)
+
+            store = Store(Path(directory), inputs={"raw": raw, "dictionary": dictionary})
+            await Pipeline(store, self.scheduler(transport)).run()
+            return store
+
+        with tempfile.TemporaryDirectory() as directory:
+            first = await run_batch(
+                Path(directory) / "batch1", "第147章 初见\n何心隐在书院讲学。", None,
+                False, calls_by_batch[0],
+            )
+            first_dictionary = first.read("dictionary.json")
+            first_unresolved = first.read("unresolved.json")
+            self.assertEqual([item["source"] for item in first_unresolved], ["何心隐"])
+            self.assertEqual(first_unresolved[0]["possible_type"], "character")
+            self.assertEqual(first_unresolved[0]["first_seen_chapter"], 147)
+            self.assertEqual(first_unresolved[0]["last_seen_chapter"], 147)
+            self.assertEqual(first_unresolved[0]["occurrences"], 1)
+            self.assertEqual(first_unresolved[0]["resolve_attempts"], 1)
+            self.assertEqual(first_unresolved[0]["evidence"][0]["chapter"], 147)
+
+            replay = await run_batch(
+                Path(directory) / "replay", "第147章 初见\n何心隐在书院讲学。",
+                first_dictionary, False, calls_by_batch[1],
+            )
+            self.assertEqual(sum("candidates" in payload for payload in calls_by_batch[1]), 0)
+
+            second = await run_batch(
+                Path(directory) / "batch2", "第148章 再见\n何心隐在南京书院讲学。",
+                replay.read("dictionary.json"), True, calls_by_batch[2],
+            )
+            resolver_calls = [payload for group in calls_by_batch for payload in group
+                              if "candidates" in payload]
+            self.assertEqual(len(resolver_calls), 2)
+            second_dictionary = second.read("dictionary.json")
+            self.assertEqual(second_dictionary["entries"][0]["source"], "何心隐")
+            self.assertEqual(second_dictionary["entries"][0]["translation"], "Hà Tâm Ẩn")
+            self.assertEqual(second_dictionary["entries"][0]["status"], "locked")
+            self.assertEqual(second.read("unresolved.json"), [])
+
+    async def test_d_rejected_candidate_is_removed_and_cached_across_batches(self):
+        calls = [[], []]
+
+        async def run_batch(directory, raw, dictionary, reject, call_log):
+            async def transport(model, body):
+                payload = payload_from(body)
+                call_log.append(payload)
+                if "candidates" in payload:
+                    if reject:
+                        return {"confirmed": [], "rejected": [{
+                            "source": "何心隐", "reason": "not a glossary identity",
+                        }], "unresolved": []}
+                    return {"confirmed": [], "rejected": [], "unresolved": []}
+                return self.reply(body, payload)
+
+            store = Store(Path(directory), inputs={"raw": raw, "dictionary": dictionary})
+            await Pipeline(store, self.scheduler(transport)).run()
+            return store
+
+        with tempfile.TemporaryDirectory() as directory:
+            first = await run_batch(Path(directory) / "first", "第147章\n何心隐在书院讲学。",
+                                    None, True, calls[0])
+            exported = first.read("dictionary.json")
+            self.assertEqual(first.read("unresolved.json"), [])
+            self.assertEqual(exported["entries"], [])
+            self.assertEqual(exported["rejected"][0]["source"], "何心隐")
+            second = await run_batch(Path(directory) / "second", "第148章\n何心隐在书院讲学。",
+                                     exported, False, calls[1])
+            self.assertEqual(sum("candidates" in item for item in calls[0]), 1)
+            self.assertEqual(sum("candidates" in item for item in calls[1]), 0)
+            self.assertEqual(second.read("unresolved.json"), [])
+            self.assertEqual(second.read("dictionary.json")["entries"], [])
+
+    async def test_e_provider_schema_failure_stays_pending_then_retries_next_batch(self):
+        call_groups = [[], []]
+
+        async def run_batch(directory, raw, dictionary, succeed, call_log):
+            async def transport(model, body):
+                payload = payload_from(body)
+                call_log.append(payload)
+                if "candidates" in payload:
+                    if not succeed:
+                        return {"confirmed": "malformed", "rejected": [], "unresolved": []}
+                    return {"confirmed": [{"operation": "add_entry", "entry": entry(
+                        "何心隐", "Hà Tâm Ẩn", "character", "male")}],
+                        "rejected": [], "unresolved": []}
+                return self.reply(body, payload)
+
+            store = Store(Path(directory), inputs={"raw": raw, "dictionary": dictionary})
+            await Pipeline(store, self.scheduler(transport)).run()
+            return store
+
+        with tempfile.TemporaryDirectory() as directory, patch.dict(
+            "os.environ", {"TRANSLATION_RETRIES_PER_PAIR": "0"}
+        ):
+            first = await run_batch(Path(directory) / "first", "第147章\n何心隐在书院讲学。",
+                                    None, False, call_groups[0])
+            pending = first.read("unresolved.json")
+            self.assertEqual(pending[0]["source"], "何心隐")
+            self.assertIn("last_error", pending[0])
+            self.assertEqual(pending[0]["resolve_attempts"], 1)
+            self.assertEqual(sum("candidates" in item for item in call_groups[0]), 2)
+
+            second = await run_batch(Path(directory) / "second", "第148章\n何心隐在南京书院讲学。",
+                                     first.read("dictionary.json"), True, call_groups[1])
+            self.assertEqual(second.read("unresolved.json"), [])
+            self.assertEqual(second.read("dictionary.json")["entries"][0]["source"], "何心隐")
+            self.assertEqual(sum("candidates" in item for item in call_groups[1]), 1)
+
+    async def test_f_repeated_occurrences_keep_compact_evidence(self):
+        raw = "第147章 初见\n" + "何心隐在书院讲学。" * 10
+        candidates = scan(parse_chapters(raw), load_dictionary(None))
+        candidate = next(item for item in candidates if item["source"] == "何心隐")
+        self.assertEqual(candidate["occurrences"], 10)
+        self.assertEqual(len(candidate["evidence"]), 1)
+
+    async def test_g_dictionary_sources_and_aliases_skip_resolution(self):
+        dictionary = load_dictionary({"version": 10, "entries": [
+            {**entry("何心隐", "Hà Tâm Ẩn", "character", "male"), "aliases": [
+                {"source": "何先生", "translation": "Tiên sinh họ Hà"}]},
+        ]})
+        raw = "第147章 初见\n何心隐在书院讲学。\n何先生也来了。"
+        calls = []
+
+        async def transport(model, body):
+            calls.append(payload_from(body))
+            return {"confirmed": [], "rejected": [], "unresolved": []}
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = Store(Path(directory), inputs={"raw": raw, "dictionary": dictionary})
+            pipeline = Pipeline(store, self.scheduler(transport))
+            pipeline.chapters = parse_chapters(raw)
+            pipeline.dictionary = dictionary
+            pipeline.input_hash = "locked-source-skip"
+            self.assertEqual(scan(pipeline.chapters, dictionary), [])
+            await pipeline.pre_dictionary({"raw": raw, "dictionary": dictionary})
+            self.assertEqual(calls, [])
+
+    def test_legacy_unresolved_noise_is_migrated_out(self):
+        migrated = load_unresolved({"unresolved": [
+            {"source": "不是看能力", "evidence": ["这不是看能力。"], "chapters": [1]},
+            {"source": "别人", "evidence": ["别人都来了。"], "chapters": [1]},
+            {"source": "何心隐", "evidence": ["何心隐在书院讲学。"], "chapters": [147]},
+            {"source": "何心隐", "possible_type": "character",
+             "evidence": [{"chapter": 148, "text": "何心隐受邀到南京讲学。"}],
+             "first_seen_chapter": 148, "last_seen_chapter": 148},
+        ]})
+        self.assertEqual([item["source"] for item in migrated], ["何心隐"])
+        self.assertEqual(migrated[0]["possible_type"], "character")
+        self.assertEqual(migrated[0]["first_seen_chapter"], 147)
+        self.assertEqual(migrated[0]["last_seen_chapter"], 148)
+        self.assertEqual(migrated[0]["occurrences"], 2)
+        self.assertEqual(len(migrated[0]["evidence"]), 2)
+
+    def test_possible_type_hints_cover_names_institutions_and_stable_terms(self):
+        expected = {
+            "何心隐": "character", "刘徽": "character", "宋仁宗": "character",
+            "梅斯塔协会": "institution", "斐波那契数列": "term",
+            "先天太极图": "term", "五行曲线": "term", "牟合方盖": "term",
+        }
+        self.assertEqual({source: possible_type(source) for source in expected}, expected)
 
     async def test_request_budget_warning_and_hard_stop_are_visible(self):
         raw = "第1章 开始\n甲。\n第2章 继续\n乙。"

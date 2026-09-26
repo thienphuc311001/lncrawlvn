@@ -12,16 +12,19 @@ from collections import defaultdict
 from . import prompts
 from .dictionary import (
     DictionaryConflict,
+    best_evidence,
+    candidate_filter_reason,
+    TITLE_END,
     load_dictionary,
+    load_rejected,
     load_unresolved,
     merge_patch,
+    possible_type,
     relevant_entries,
     scan,
     validate_dictionary,
 )
 from .models import (
-    AddAlias,
-    AddEntry,
     CoverageAudit,
     DictionaryPatch,
     FALLBACK_MODEL,
@@ -29,10 +32,10 @@ from .models import (
     PIPELINE_VERSION,
     PRIMARY_MODEL,
     ProposedPatch,
+    Rejected,
     Repair,
     Translation,
     TranslatedSegment,
-    Unresolved,
 )
 from .manual_review import accepted_review, accepted_review_ids
 from .notes import author_note_policy, is_author_note
@@ -58,20 +61,70 @@ class QualityError(RuntimeError):
 
 def _unresolved_merge(previous, additions, chapters):
     merged = {item["source"]: dict(item) for item in previous}
-    numbers = sorted(chapter.number for chapter in chapters)
     for item in additions:
         source = item["source"]
         old = merged.get(source, {})
-        evidence = list(dict.fromkeys((old.get("evidence") or []) + item.get("evidence", [])))[:8]
-        chapter_numbers = item.get("chapters") or numbers
+        evidence = []
+        for value in (old.get("evidence") or []) + item.get("evidence", []):
+            if isinstance(value, str):
+                value = {"chapter": None, "text": value}
+            if not isinstance(value, dict) or not value.get("text"):
+                continue
+            if not any(record.get("text") == value["text"]
+                       and record.get("chapter") == value.get("chapter") for record in evidence):
+                evidence.append({"chapter": value.get("chapter"), "text": value["text"]})
+        by_chapter = dict(old.get("occurrences_by_chapter") or {})
+        for chapter, count in (item.get("occurrences_by_chapter") or {}).items():
+            by_chapter[str(chapter)] = max(int(by_chapter.get(str(chapter), 0)), int(count))
+        old_by_chapter = old.get("occurrences_by_chapter") or {}
+        item_by_chapter = item.get("occurrences_by_chapter") or {}
+        unattributed = max(0, int(old.get("occurrences", 0))
+                           - sum(int(value) for value in old_by_chapter.values()))
+        unattributed += max(0, int(item.get("occurrences", item.get("frequency", 0)))
+                            - sum(int(value) for value in item_by_chapter.values()))
+        occurrence_count = sum(by_chapter.values()) + unattributed
+        chapter_numbers = sorted({
+            int(chapter) for chapter in (list(by_chapter) + list(old.get("chapters", []))
+                                          + list(item.get("chapters", [])))
+            if str(chapter).isdigit()
+        })
+        if not chapter_numbers:
+            chapter_numbers = sorted(chapter.number for chapter in chapters
+                                     if source in chapter.raw)
+        evidence = best_evidence(evidence)
+        incoming_kind = item.get("possible_type", "unknown")
+        kind = (incoming_kind if incoming_kind != "unknown"
+                else old.get("possible_type", incoming_kind))
+        inferred = possible_type(source, evidence)
+        if inferred and inferred != "unknown":
+            kind = inferred
+        first_seen = min(
+            [value for value in (old.get("first_seen_chapter"), *chapter_numbers)
+             if isinstance(value, int)], default=None,
+        )
         merged[source] = {
             "source": source,
-            "possible_type": item.get("possible_type", old.get("possible_type", "unknown")),
+            "possible_type": kind,
             "reason": item.get("reason", old.get("reason", "insufficient evidence")),
             "evidence": evidence,
-            "first_seen_chapter": old.get("first_seen_chapter", min(chapter_numbers)),
-            "last_seen_chapter": max(old.get("last_seen_chapter", 0), max(chapter_numbers)),
+            "first_seen_chapter": first_seen,
+            "last_seen_chapter": max(
+                [value for value in (old.get("last_seen_chapter"), *(chapter_numbers))
+                 if isinstance(value, int)], default=None,
+            ),
+            "chapters": chapter_numbers,
+            "occurrences": occurrence_count,
+            "occurrences_by_chapter": by_chapter,
+            "resolve_attempts": max(int(old.get("resolve_attempts", 0)),
+                                     int(item.get("resolve_attempts", 0))),
+            "last_attempt_input_hash": item.get(
+                "last_attempt_input_hash", old.get("last_attempt_input_hash")),
         }
+        last_error = item.get("last_error", old.get("last_error"))
+        if last_error:
+            merged[source]["last_error"] = last_error
+        else:
+            merged[source].pop("last_error", None)
     return sorted(merged.values(), key=lambda item: item["source"])
 
 
@@ -88,6 +141,37 @@ def _candidate_batches(candidates, max_chars=32_000):
         size += item_size
     if batch:
         yield batch
+
+
+def _observe_source(chapters, source):
+    """Build bounded, chapter-labelled sentence evidence for one old candidate."""
+    by_chapter = {}
+    evidence = []
+    for chapter in chapters:
+        count = 0
+        for paragraph in chapter.paragraphs:
+            count += paragraph.count(source)
+            position = paragraph.find(source)
+            if position < 0:
+                continue
+            start = max(paragraph.rfind(mark, 0, position) for mark in "。！？!?；\n") + 1
+            ends = [paragraph.find(mark, position + len(source)) for mark in "。！？!?；\n"]
+            ends = [end for end in ends if end >= 0]
+            end = min(ends) + 1 if ends else len(paragraph)
+            sentence = paragraph[start:end].strip()
+            if sentence and not any(item["text"] == sentence and item["chapter"] == chapter.number
+                                     for item in evidence):
+                evidence.append({"chapter": chapter.number, "text": sentence})
+        if count:
+            by_chapter[str(chapter.number)] = count
+    return {
+        "source": source,
+        "possible_type": possible_type(source, evidence) or "unknown",
+        "evidence": best_evidence(evidence),
+        "chapters": [int(value) for value in by_chapter],
+        "occurrences": sum(by_chapter.values()),
+        "occurrences_by_chapter": by_chapter,
+    }
 
 
 def _split_paragraph(paragraph, limit):
@@ -185,6 +269,7 @@ class Pipeline:
         self.chapters = []
         self.dictionary = None
         self.unresolved = []
+        self.rejected = []
         self.pre_hash = None
         self.input_hash = None
         self.legacy_raw = {}
@@ -380,8 +465,20 @@ class Pipeline:
         raw = "\n".join(chapter.raw for chapter in self.chapters)
         offset = start_offset
         for batch in _candidate_batches(candidates):
+            batch = [item for item in batch if not candidate_filter_reason(item)]
+            if not batch:
+                continue
+            owned = validate_dictionary(self.dictionary)
+            rejected_sources = {item["source"] for item in self.rejected}
+            batch = [item for item in batch
+                     if item["source"] not in owned and item["source"] not in rejected_sources]
+            if not batch:
+                continue
             known = {item["source"] for item in batch}
-            evidence_text = "\n".join("\n".join(item.get("evidence", [])) for item in batch)
+            evidence_text = "\n".join(
+                "\n".join(value.get("text", "") if isinstance(value, dict) else value
+                           for value in item.get("evidence", [])) for item in batch
+            )
             relevant = relevant_entries(self.dictionary, evidence_text)
             relevant_sources = {entry["source"] for entry in relevant}
             for entry in self.dictionary["entries"]:
@@ -392,35 +489,33 @@ class Pipeline:
             payload = {"candidates": batch, "locked_dictionary": relevant,
                        "rule": "Confirm only proven identity and reusable terminology; leave uncertainty unresolved."}
             event = "PRE_DICTIONARY_REQUEST" if phase == "pre" else "POST_DICTIONARY_REQUEST"
-            proposal = await self.request(event, prompts.DICTIONARY, payload,
-                                          ProposedPatch, cache=True)
-            self.event("DICTIONARY_PATCH_RECEIVED", phase=phase, operations=len(proposal.confirmed))
-            valid_operations = []
-            rejected = {}
-            for record in proposal.confirmed:
-                source = ((record.get("entry") or {}).get("source") if isinstance(record.get("entry"), dict)
-                          else None) or ((record.get("alias") or {}).get("source")
-                                         if isinstance(record.get("alias"), dict) else None)
-                try:
-                    if record.get("operation") == "add_entry":
-                        valid_operations.append(AddEntry.model_validate(record))
-                    elif record.get("operation") == "add_alias":
-                        valid_operations.append(AddAlias.model_validate(record))
-                    else:
-                        raise ValueError("Invalid patch operation")
-                except (ValueError, TypeError) as exc:
-                    self.event("DICTIONARY_PATCH_REJECTED", phase=phase, source=source,
-                               reason=str(exc)[:500])
-                    if source in known:
-                        rejected[source] = "Invalid provider patch schema"
-            valid_unresolved = []
-            for record in proposal.unresolved:
-                try:
-                    valid_unresolved.append(Unresolved.model_validate(record))
-                except (ValueError, TypeError):
-                    self.event("DICTIONARY_PATCH_REJECTED", phase=phase,
-                               reason="Invalid unresolved record")
-            patch = DictionaryPatch(confirmed=valid_operations, unresolved=valid_unresolved)
+            provider_error = None
+            try:
+                proposal = await self.request(event, prompts.DICTIONARY, payload,
+                                              ProposedPatch, cache=True)
+            except ProviderError as exc:
+                proposal = None
+                provider_error = str(exc)
+                self.event("DICTIONARY_RESOLUTION_TECHNICAL_FAILURE", phase=phase,
+                           sources=sorted(known), reason=provider_error[:500])
+            self.event("DICTIONARY_PATCH_RECEIVED", phase=phase,
+                       operations=len(proposal.confirmed) if proposal else 0)
+            patch = DictionaryPatch.model_validate(proposal.model_dump()) if proposal else DictionaryPatch()
+            explicit_unresolved = {item.source: item for item in patch.unresolved}
+            explicit_rejected = {item.source: item for item in patch.rejected}
+            confirmed_proposal_sources = {
+                operation.entry.source if operation.operation == "add_entry" else operation.alias.source
+                for operation in patch.confirmed
+            }
+            invalid_sources = {
+                source for source in known
+                if sum(source in outcome for outcome in (
+                    confirmed_proposal_sources, set(explicit_unresolved), set(explicit_rejected),
+                )) > 1
+            }
+            for source in invalid_sources:
+                self.event("DICTIONARY_PATCH_REJECTED", phase=phase, source=source,
+                           reason="Candidate has conflicting resolver outcomes")
             merged = self.dictionary
             confirmed = set()
             operations = sorted(patch.confirmed,
@@ -431,44 +526,73 @@ class Pipeline:
                     self.event("DICTIONARY_PATCH_REJECTED", phase=phase, source=source,
                                reason="Unsolicited source")
                     continue
+                if source in invalid_sources:
+                    continue
                 try:
+                    if operation.operation == "add_entry" and TITLE_END.search(source):
+                        raise DictionaryConflict(
+                            f"Title-form source requires an existing canonical owner: {source}"
+                        )
                     merged = merge_patch(merged, {"confirmed": [operation.model_dump()],
                                                   "unresolved": []}, raw)
                 except DictionaryConflict as exc:
                     reason = str(exc)
                     self.event("DICTIONARY_PATCH_REJECTED", phase=phase, source=source, reason=reason)
+                    # Ownership conflicts are terminal for this candidate. Other
+                    # local validation failures are technical and remain retryable.
                     if any(token in reason.lower() for token in ("locked", "conflict", "owned")):
-                        raise
-                    rejected[source] = reason
+                        patch.rejected.append(Rejected(source=source, reason=reason[:300]))
+                    else:
+                        invalid_sources.add(source)
                     continue
                 confirmed.add(source)
                 if operation.operation == "add_entry":
                     confirmed.update(alias.source for alias in operation.entry.aliases)
             candidate_by_source = {item["source"]: item for item in batch}
-            unresolved = []
-            for item in patch.unresolved:
-                if item.source not in known:
+            outcomes = [set(confirmed), set(explicit_unresolved), set(explicit_rejected)]
+            for source in known:
+                if sum(source in outcome for outcome in outcomes) > 1:
+                    invalid_sources.add(source)
+            explicitly_rejected = []
+            for item in patch.rejected:
+                if item.source in known and item.source not in confirmed and item.source not in invalid_sources:
+                    explicitly_rejected.append({"source": item.source, "reason": item.reason})
+            for source in known:
+                state = candidate_by_source[source]
+                state["resolve_attempts"] = int(state.get("resolve_attempts", 0)) + 1
+                state["last_attempt_input_hash"] = self.input_hash
+                if source in confirmed:
                     continue
-                record = item.model_dump()
-                evidence = candidate_by_source[item.source]["evidence"]
-                record["evidence"] = list(dict.fromkeys(evidence + record["evidence"]))[:8]
-                record["chapters"] = candidate_by_source[item.source]["chapters"]
-                unresolved.append(record)
-            unresolved_sources = {item["source"] for item in unresolved}
-            unresolved.extend({
-                "source": item["source"], "possible_type": "unknown",
-                "reason": rejected.get(item["source"], "Resolver left candidate unresolved"),
-                "evidence": item["evidence"], "chapters": item["chapters"],
-            } for item in batch if item["source"] not in confirmed
-                                  and item["source"] not in unresolved_sources)
+                if source in explicit_rejected and source not in invalid_sources:
+                    continue
+                if source in invalid_sources or provider_error:
+                    state["last_error"] = provider_error or "Invalid provider patch schema"
+                else:
+                    state.pop("last_error", None)
+                    unresolved_record = explicit_unresolved.get(source)
+                    state["reason"] = (unresolved_record.reason if unresolved_record
+                                        else "Resolver left candidate unresolved")
+                    if unresolved_record and unresolved_record.possible_type != "unknown":
+                        state["possible_type"] = unresolved_record.possible_type
+                self.unresolved = _unresolved_merge(
+                    [item for item in self.unresolved if item["source"] != source],
+                    [state], self.chapters,
+                )
             self.dictionary = merged
-            self.unresolved = _unresolved_merge(self.unresolved, unresolved, self.chapters)
-            self.unresolved = [item for item in self.unresolved if item["source"] not in confirmed]
+            removed = confirmed | {item["source"] for item in explicitly_rejected}
+            self.unresolved = [item for item in self.unresolved if item["source"] not in removed]
+            rejected = {item["source"]: item for item in self.rejected}
+            for item in explicitly_rejected:
+                rejected[item["source"]] = item
+            for source in confirmed:
+                rejected.pop(source, None)
+            self.rejected = [rejected[source] for source in sorted(rejected)]
             offset += len(batch)
             self.store.write(f"{phase}-dictionary-progress.json", {
                 "input_hash": self.input_hash, "offset": offset,
                 "pre_hash": self.pre_hash if phase == "post" else None,
                 "dictionary": self.dictionary, "unresolved": self.unresolved,
+                "rejected": self.rejected,
             })
             self.event("DICTIONARY_PATCH_VALIDATED", phase=phase, confirmed=len(confirmed))
             self.event("DICTIONARY_MERGED", phase=phase, entries=len(self.dictionary["entries"]))
@@ -479,6 +603,7 @@ class Pipeline:
             self.dictionary = load_dictionary(saved["dictionary"], self.dictionary_migrations)
             self.event("DICTIONARY_LOADED", entries=len(self.dictionary["entries"]), reused=True)
             self.unresolved = load_unresolved({"unresolved": saved.get("unresolved", [])})
+            self.rejected = load_rejected({"rejected": self.store.read("rejected.json", []) or []})
             if self.dictionary_migrations:
                 self.store.write("dictionary-migration.json", {
                     "target_version": self.dictionary["version"],
@@ -491,6 +616,9 @@ class Pipeline:
             self.pre_hash = digest(self.dictionary)
             return
         self.dictionary = load_dictionary(inputs.get("dictionary"), self.dictionary_migrations)
+        self.rejected = load_rejected(inputs.get("dictionary"))
+        local_rejected = load_rejected({"rejected": self.store.read("rejected.json", []) or []})
+        self.rejected = load_rejected({"rejected": self.rejected + local_rejected})
         self.event("DICTIONARY_LOADED", entries=len(self.dictionary["entries"]), reused=False)
         frozen = self.store.read("frozen-dictionary.json")
         if frozen and isinstance(frozen.get("dictionary"), dict):
@@ -517,36 +645,68 @@ class Pipeline:
                 "operations": self.dictionary_migrations,
             })
         self.unresolved = _unresolved_merge(load_unresolved(inputs.get("dictionary")),
-                                            self.store.read("unresolved.json", []) or [], self.chapters)
+                                            load_unresolved({"unresolved":
+                                                self.store.read("unresolved.json", []) or []}),
+                                            self.chapters)
         locked_sources = validate_dictionary(self.dictionary)
         self.unresolved = [item for item in self.unresolved if item["source"] not in locked_sources]
+        rejection_sources = {item["source"] for item in self.rejected}
+        self.unresolved = [item for item in self.unresolved if item["source"] not in rejection_sources]
         self.event("PRE_SCAN_STARTED")
-        candidates = scan(self.chapters, self.dictionary)
-        candidate_sources = {item["source"] for item in candidates}
-        raw = "\n".join(chapter.raw for chapter in self.chapters)
+        scanned = scan(self.chapters, self.dictionary)
+        scanned_sources = {item["source"] for item in scanned}
         for item in self.unresolved:
-            if item["source"] in raw and item["source"] not in candidate_sources:
-                candidates.append({
-                    "source": item["source"], "frequency": raw.count(item["source"]),
-                    "chapters": [chapter.number for chapter in self.chapters
-                                 if item["source"] in chapter.raw],
-                    "evidence": item.get("evidence", [])[:3],
-                })
-        self.event("PRE_SCAN_COMPLETED", candidates=len(candidates))
-        self.progress("Pre-dictionary resolution", candidate_count=len(candidates))
+            if item["source"] not in scanned_sources:
+                observed = _observe_source(self.chapters, item["source"])
+                if observed["occurrences"]:
+                    scanned.append(observed)
+        old_by_source = {item["source"]: item for item in self.unresolved}
+        resolver_candidates = []
+        reused_unresolved = 0
+        for item in scanned:
+            source = item["source"]
+            if source in locked_sources or source in rejection_sources or candidate_filter_reason(item):
+                continue
+            old = old_by_source.get(source)
+            old_evidence = old.get("evidence", []) if old else []
+            old_keys = {(value.get("chapter"), value.get("text")) for value in old_evidence
+                        if isinstance(value, dict)}
+            new_keys = {(value.get("chapter"), value.get("text")) for value in item.get("evidence", [])
+                        if isinstance(value, dict)}
+            changed_evidence = bool(new_keys - old_keys)
+            merged = _unresolved_merge([old] if old else [], [item], self.chapters)[0]
+            changed_occurrences = not old or merged["occurrences"] > old.get("occurrences", 0)
+            improved_type = bool(old and old.get("possible_type") == "unknown"
+                                 and merged["possible_type"] != "unknown")
+            retry_failure = bool(old and old.get("last_error")
+                                 and old.get("last_attempt_input_hash") != self.input_hash)
+            self.unresolved = _unresolved_merge(
+                [record for record in self.unresolved if record["source"] != source],
+                [merged], self.chapters,
+            )
+            if changed_occurrences or changed_evidence or improved_type or retry_failure:
+                resolver_candidates.append(merged)
+            elif old:
+                reused_unresolved += 1
+        self.unresolved = sorted(self.unresolved, key=lambda item: item["source"])
+        self.event("PRE_SCAN_COMPLETED", candidates=len(resolver_candidates),
+                   reused_unresolved=reused_unresolved)
+        self.progress("Pre-dictionary resolution", candidate_count=len(resolver_candidates))
         partial = self.store.read("pre-dictionary-progress.json")
         offset = 0
         if partial and partial.get("input_hash") == self.input_hash:
             self.dictionary = load_dictionary(partial["dictionary"])
             self.unresolved = load_unresolved({"unresolved": partial.get("unresolved", [])})
+            self.rejected = load_rejected({"rejected": partial.get("rejected", [])})
             offset = partial["offset"]
-        await self.resolve(candidates[offset:], "pre", offset)
+        await self.resolve(resolver_candidates[offset:], "pre", offset)
         self.pre_hash = digest(self.dictionary)
         self.store.write("pre-dictionary.json", {
             "input_hash": self.input_hash, "dictionary": self.dictionary,
             "unresolved": self.unresolved,
         })
         self.store.write("unresolved.json", self.unresolved)
+        self.store.write("rejected.json", self.rejected)
         self.event("CHECKPOINT_SAVED", stage="pre_dictionary")
 
     def _convert_legacy_translation(self, chapter, value):
@@ -964,19 +1124,41 @@ class Pipeline:
         if saved and saved.get("input_hash") == self.input_hash and saved.get("pre_hash") == self.pre_hash:
             self.dictionary = load_dictionary(saved["dictionary"])
             self.unresolved = load_unresolved({"unresolved": saved.get("unresolved", [])})
+            self.rejected = load_rejected({"rejected": saved.get("rejected", [])})
             return
         scanned = scan(self.chapters, self.dictionary, (), post=True)
+        scanned_sources = {item["source"] for item in scanned}
+        for item in self.unresolved:
+            if item["source"] not in scanned_sources:
+                observed = _observe_source(self.chapters, item["source"])
+                if observed["occurrences"]:
+                    scanned.append(observed)
         known = validate_dictionary(self.dictionary)
+        rejected_sources = {item["source"] for item in self.rejected}
         unresolved = {item["source"]: item for item in self.unresolved}
         candidates = []
         for item in scanned:
             source = item["source"]
-            if source in known:
+            if source in known or source in rejected_sources or candidate_filter_reason(item):
                 continue
             old = unresolved.get(source)
-            if old and not (set(item["evidence"]) - set(old.get("evidence", []))):
-                continue
-            candidates.append(item)
+            old_keys = {(value.get("chapter"), value.get("text")) for value in old.get("evidence", [])
+                        if isinstance(value, dict)} if old else set()
+            new_keys = {(value.get("chapter"), value.get("text")) for value in item.get("evidence", [])
+                        if isinstance(value, dict)}
+            merged = _unresolved_merge([old] if old else [], [item], self.chapters)[0]
+            changed_occurrences = not old or merged["occurrences"] > old.get("occurrences", 0)
+            changed_evidence = bool(new_keys - old_keys)
+            improved_type = bool(old and old.get("possible_type") == "unknown"
+                                 and merged["possible_type"] != "unknown")
+            retry_failure = bool(old and old.get("last_error")
+                                 and old.get("last_attempt_input_hash") != self.input_hash)
+            self.unresolved = _unresolved_merge(
+                [record for record in self.unresolved if record["source"] != source],
+                [merged], self.chapters,
+            )
+            if changed_occurrences or changed_evidence or improved_type or retry_failure:
+                candidates.append(merged)
         self.event("POST_SCAN_COMPLETED", candidates=len(candidates))
         partial = self.store.read("post-dictionary-progress.json")
         offset = 0
@@ -984,6 +1166,7 @@ class Pipeline:
                 and partial.get("pre_hash") == self.pre_hash):
             self.dictionary = load_dictionary(partial["dictionary"])
             self.unresolved = load_unresolved({"unresolved": partial.get("unresolved", [])})
+            self.rejected = load_rejected({"rejected": partial.get("rejected", [])})
             offset = partial["offset"]
         if candidates:
             self.progress("Post-dictionary review", candidate_count=len(candidates))
@@ -993,8 +1176,10 @@ class Pipeline:
         self.store.write("post-dictionary.json", {
             "input_hash": self.input_hash, "pre_hash": self.pre_hash,
             "dictionary": self.dictionary, "unresolved": self.unresolved,
+            "rejected": self.rejected,
         })
         self.store.write("unresolved.json", self.unresolved)
+        self.store.write("rejected.json", self.rejected)
         self.event("CHECKPOINT_SAVED", stage="post_dictionary")
 
     def _chapter_metrics(self, chapter, translated, saved):
@@ -1150,8 +1335,10 @@ class Pipeline:
             "version": self.dictionary["version"],
             "entries": self.dictionary["entries"],
             "unresolved": self.unresolved,
+            "rejected": self.rejected,
         })
         self.store.write("unresolved.json", self.unresolved)
+        self.store.write("rejected.json", self.rejected)
         self.store.write("pipeline-version.json", {"version": PIPELINE_VERSION})
         self.event("CHECKPOINT_SAVED", stage="batch_complete")
         self.event("BATCH_COMPLETED", chapters=len(self.chapters),

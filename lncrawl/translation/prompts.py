@@ -1,8 +1,8 @@
 """Versioned Gemini policies shared unchanged by primary and fallback models."""
 
 POLICY_VERSIONS = {
-    "pre_dictionary": "dictionary-v4",
-    "post_dictionary": "dictionary-v4",
+    "pre_dictionary": "dictionary-v5",
+    "post_dictionary": "dictionary-v5",
     "translation": "translation-v8",
     "qa": "qa-v2",
     "repair": "repair-v2",
@@ -10,10 +10,10 @@ POLICY_VERSIONS = {
 
 DICTIONARY = """Resolve terminology for a Chinese-to-Vietnamese novel translation. RAW Chinese establishes identity; the supplied locked dictionary establishes existing canonical translations and may never be challenged. Confirm only reusable, clearly evidenced named identities or stable terms. Establish identity before selecting Vietnamese wording and attach proven alternate forms to their canonical owner. Use project-consistent Sino-Vietnamese forms for native Chinese identities. When evidence clearly establishes a foreign identity transliterated into Chinese, restore its recognized international/Vietnamese name (for example 费利佩二世 -> Felipe II); never output Pinyin. Leave uncertain identity or wording unresolved. Never add action fragments, generic words, pronouns, temporary noun phrases, ordinary idioms, or grammatical substrings. Never rewrite a locked mapping.
 
-Return a JSON object with confirmed and unresolved arrays. Every confirmed operation must be exactly one of:
+Return a JSON object with confirmed, rejected, and unresolved arrays. A rejected record is {"source":"...","reason":"generic phrase, fragment, or no reusable identity"}; use it only when the candidate is clearly not a glossary entry. An unresolved record is {"source":"...","possible_type":"character|location|institution|book_title|term|unknown","reason":"..."}; use it only when the candidate plausibly is a glossary entry but the supplied evidence is not enough. Every requested candidate must appear in exactly one outcome array. Every confirmed operation must be exactly one of:
 {"operation":"add_entry","entry":{"source":"邱途","translation":"Khâu Đồ","type":"character","gender":"male","status":"locked","aliases":[]}}
 {"operation":"add_alias","canonical_source":"邱途","alias":{"source":"邱探员","translation":"Thám viên Khâu"}}
-Types: character, location, institution, book_title, memorial, book_section, term. Use institution for named offices and organizations; term for stable concepts, objects, abilities, and techniques. Genders: male, female, unknown, not_applicable. Use not_applicable for non-person entities when known. Every confirmed entry status is exactly locked. If identity, Vietnamese wording, owner, or type is uncertain, use unresolved rather than guessing. Return only JSON."""
+Types: character, location, institution, book_title, term. Use institution for named offices and organizations; term for stable concepts, objects, abilities, and techniques. Genders: male, female, unknown, not_applicable. Use not_applicable for non-person entities when known. Every confirmed entry status is exactly locked. If identity, Vietnamese wording, owner, or type is uncertain, use unresolved rather than guessing. Return only JSON."""
 
 TRANSLATE = """Dịch Trung→Việt đầy đủ, tự nhiên như tiểu thuyết; RAW quyết định nghĩa, LOCKED DICTIONARY quyết định tên/thuật ngữ.
 
