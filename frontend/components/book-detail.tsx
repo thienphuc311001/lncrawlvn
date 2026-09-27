@@ -27,6 +27,13 @@ type Book = {
   chapters: TocChapter[];
 };
 
+type ActiveCrawlJob = {
+  job_id: string;
+  status: 'pending' | 'running' | 'stopping';
+  title?: string;
+  url?: string;
+};
+
 type ChapterContent = { id: number; title: string; url: string; body: string };
 
 type ReaderState = { loading: boolean; chapter: ChapterContent | null; error: string };
@@ -90,6 +97,10 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
   const [translatingGroup, setTranslatingGroup] = useState<number | null>(null);
   const [titleError, setTitleError] = useState('');
   const [deleting, setDeleting] = useState(false);
+  const [activeJobs, setActiveJobs] = useState<ActiveCrawlJob[] | null>(null);
+  const [jobsError, setJobsError] = useState('');
+  const [stopError, setStopError] = useState('');
+  const [stoppingJobId, setStoppingJobId] = useState<string | null>(null);
   const [deletingChapter, setDeletingChapter] = useState(false);
   const [translation, setTranslation] = useState<ChapterTranslation | null>(null);
   const [dictionaryInfo, setDictionaryInfo] = useState<BookDictionaryInfo | null>(null);
@@ -189,6 +200,65 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
   useEffect(() => {
     void load();
   }, [load]);
+  useEffect(() => {
+    let cancelled = false;
+    let timer: number | undefined;
+    let hadActive = false;
+    setActiveJobs(null);
+    setJobsError('');
+    const refresh = async () => {
+      try {
+        const res = await fetch(`${bookPath}/jobs`);
+        if (!res.ok) throw new Error(`API returned ${res.status}`);
+        const jobs: ActiveCrawlJob[] = await res.json();
+        if (cancelled) return;
+        setActiveJobs((previous) => jobs.map((item) => {
+          const older = previous?.find((entry) => entry.job_id === item.job_id);
+          return older?.status === 'stopping' && item.status !== 'stopping'
+            ? { ...item, status: 'stopping' }
+            : item;
+        }));
+        setJobsError('');
+        if (hadActive && jobs.length === 0) void load();
+        hadActive = jobs.length > 0;
+      } catch (e) {
+        if (cancelled) return;
+        setActiveJobs(null);
+        setJobsError(e instanceof Error ? e.message : String(e));
+      } finally {
+        if (!cancelled) timer = window.setTimeout(() => void refresh(), POLL_INTERVAL_MS);
+      }
+    };
+    void refresh();
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [bookPath, load]);
+
+  const stopCrawl = useCallback(async (jobId: string) => {
+    if (stoppingJobId) return;
+    setStopError('');
+    setStoppingJobId(jobId);
+    try {
+      const res = await fetch(`${API_BASE}/api/jobs/${encodeURIComponent(jobId)}/stop`, { method: 'POST' });
+      if (!res.ok) {
+        const detail = await res.json().catch(() => null);
+        throw new Error(detail?.detail || `API returned ${res.status}`);
+      }
+      const stopped: { status: string } = await res.json();
+      if (stopped.status === 'stopping') {
+        setActiveJobs((jobs) => jobs?.map((item) =>
+          item.job_id === jobId ? { ...item, status: 'stopping' } : item,
+        ) ?? null);
+      }
+    } catch (e) {
+      setStopError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setStoppingJobId(null);
+    }
+  }, [stoppingJobId]);
+
 
   /** TOC grouped into consecutive folders of FOLDER_SIZE chapters. */
   const groups = useMemo(() => {
@@ -310,7 +380,7 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
   }, [reader.chapter?.id, readerBusy, refreshTranslation, translation?.job]);
 
   const startCrawl = useCallback(async (mode: 'missing' | 'overwrite') => {
-    if (crawlMode || !book) return;
+    if (crawlMode || !book || activeJobs === null || activeJobs.length > 0) return;
     if (mode === 'overwrite' && !window.confirm(
       `Tải lại toàn bộ ${book.total_chapters} chương của "${book.title}" và ghi đè các chương đã lưu?`,
     )) return;
@@ -330,10 +400,11 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
       if (!res.ok) throw new Error(data?.detail || `API returned ${res.status}`);
       // Console dock polls and streams this job's logs from anywhere in the UI.
       trackJob(data.job_id, `${mode === 'overwrite' ? 'Re-crawl & overwrite' : 'Fetch missing'} — ${book.title}`);
+      setActiveJobs((jobs) => [...(jobs ?? []), { job_id: data.job_id, status: data.status, title: book.title }]);
 
       let status: string = data.status;
       if (status === 'failed' && data.error) setExportError(data.error);
-      while (status === 'running' || status === 'pending') {
+      while (status === 'running' || status === 'pending' || status === 'stopping') {
         const { promise, resolve } = Promise.withResolvers<void>();
         setTimeout(resolve, POLL_INTERVAL_MS);
         await promise;
@@ -349,7 +420,7 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
     } finally {
       setCrawlMode(null);
     }
-  }, [book, bookId, crawlMode, load, trackJob]);
+  }, [activeJobs, book, bookId, crawlMode, load, trackJob]);
 
   const translateTitles = useCallback(async (group: { start: number; chapters: TocChapter[] }) => {
     setTranslatingGroup(group.start);
@@ -479,7 +550,7 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
 
 
   const deleteBook = useCallback(async () => {
-    if (!book) return;
+    if (!book || activeJobs === null || activeJobs.length > 0 || crawlMode) return;
     const confirmed = window.confirm(
       `Xóa "${book.title}" khỏi library?\n\n` +
         `Mất ${book.saved_count}/${book.total_chapters} chương đã lưu, cover và exports. ` +
@@ -501,7 +572,7 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
       setExportError(e instanceof Error ? e.message : String(e));
       setDeleting(false);
     }
-  }, [book, bookId, onBack]);
+  }, [activeJobs, book, bookId, crawlMode, onBack]);
 
   /** Drop the saved chapter file so "Fetch missing" can re-download it. */
   const deleteChapter = useCallback(
@@ -603,11 +674,39 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
             <div className="progress-track wide">
               <div className="progress-fill" style={{ width: `${pct}%` }} />
             </div>
+            <div className="active-crawl-jobs" role="status">
+              {activeJobs === null && !jobsError && <p className="muted">Đang kiểm tra crawl của sách…</p>}
+              {activeJobs?.map((active) => (
+                <div className="active-crawl-job" key={active.job_id}>
+                  <span>
+                    Crawl {active.title || active.url || active.job_id} · {active.job_id} —{' '}
+                    {active.status === 'stopping' ? 'Đang dừng (chờ ghi xong)' :
+                      active.status === 'pending' ? 'Đang chờ' : 'Đang chạy'}
+                  </span>
+                  <button type="button" className="btn btn-ghost"
+                    onClick={() => trackJob(active.job_id, active.title || active.url || active.job_id)}>
+                    Mở console
+                  </button>
+                  <button type="button" className="btn btn-danger"
+                    disabled={active.status === 'stopping' || stoppingJobId !== null}
+                    onClick={() => void stopCrawl(active.job_id)}>
+                    {active.status === 'stopping' ? 'Đang dừng…' :
+                      stoppingJobId === active.job_id ? 'Đang gửi…' : 'Dừng crawl'}
+                  </button>
+                </div>
+              ))}
+              {activeJobs && activeJobs.length > 0 &&
+                <p className="muted">Đóng console không dừng crawl. Chờ crawl dừng hẳn trước khi xóa sách.</p>}
+            </div>
+            {jobsError && <p className="error-text" role="alert">
+              Không thể kiểm tra crawl đang chạy: {jobsError}. Chưa thể xóa sách.
+            </p>}
+            {stopError && <p className="error-text" role="alert">Không thể dừng crawl: {stopError}</p>}
             <div className="detail-actions">
               <button
                 type="button"
                 className="btn btn-primary"
-                disabled={missingCount === 0 || crawlMode !== null}
+                disabled={missingCount === 0 || crawlMode !== null || activeJobs === null || activeJobs.length > 0}
                 onClick={() => void startCrawl('missing')}
               >
                 {crawlMode === 'missing' ? 'Fetching…' : `Fetch missing (${missingCount})`}
@@ -615,7 +714,7 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
               <button
                 type="button"
                 className="btn btn-ghost"
-                disabled={!book.url || book.total_chapters === 0 || crawlMode !== null}
+                disabled={!book.url || book.total_chapters === 0 || crawlMode !== null || activeJobs === null || activeJobs.length > 0}
                 title="Tải lại toàn bộ chương và ghi đè nội dung đã lưu"
                 onClick={() => void startCrawl('overwrite')}
               >
@@ -640,10 +739,10 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
               <button
                 type="button"
                 className="btn btn-danger"
-                disabled={deleting || crawlMode !== null || exporting !== null}
+                disabled={deleting || crawlMode !== null || exporting !== null || activeJobs === null || activeJobs.length > 0}
                 onClick={() => void deleteBook()}
               >
-                {deleting ? 'Deleting…' : '🗑 Delete book'}
+                {deleting ? 'Đang xóa…' : '🗑 Xóa sách'}
               </button>
             </div>
             {exportError && <p className="muted error-text">✗ {exportError}</p>}

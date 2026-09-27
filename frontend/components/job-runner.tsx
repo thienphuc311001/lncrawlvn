@@ -19,7 +19,7 @@ type TrackedJob = {
   label: string;
 };
 
-export type JobStatus = 'idle' | 'running' | 'done' | 'failed';
+export type JobStatus = 'idle' | 'pending' | 'running' | 'stopping' | 'done' | 'failed' | 'cancelled';
 
 export type ExtractOptions = {
   first?: number;
@@ -66,7 +66,10 @@ export default function JobRunnerProvider({ children }: { children: ReactNode })
     setJobKey((key) => key + 1);
   }, []);
 
-  const clearJob = useCallback(() => setJob(null), []);
+  const clearJob = useCallback(() => {
+    setJob(null);
+    setJobStatus('idle');
+  }, []);
 
   const startJob = useCallback(
     async (url: string, opts: ExtractOptions = {}) => {

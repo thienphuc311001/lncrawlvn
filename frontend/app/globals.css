@@ -297,9 +297,10 @@ h1, h2, h3, h4 { text-wrap: balance; }
   text-align: left;
 }
 .jc-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--muted); flex: none; }
-.jc-dot.running { background: oklch(65% 0.15 75); animation: jc-pulse 1.2s ease-in-out infinite; }
+.jc-dot.running, .jc-dot.pending, .jc-dot.stopping { background: oklch(65% 0.15 75); animation: jc-pulse 1.2s ease-in-out infinite; }
 .jc-dot.done    { background: var(--accent); }
 .jc-dot.failed  { background: oklch(55% 0.2 25); }
+.jc-dot.cancelled { background: var(--muted); }
 @keyframes jc-pulse {
   0%, 100% { opacity: 1; }
   50%      { opacity: 0.35; }
@@ -307,9 +308,16 @@ h1, h2, h3, h4 { text-wrap: balance; }
 .jc-status { font-size: 11px; letter-spacing: 0.08em; color: var(--muted); flex: none; }
 .jc-status.done   { color: var(--accent); }
 .jc-status.failed { color: oklch(55% 0.2 25); }
+.jc-status.stopping { color: oklch(65% 0.15 75); }
 .jc-name { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .jc-meta { color: var(--muted); white-space: nowrap; flex: none; }
 .job-console-actions { display: inline-flex; gap: 4px; flex: none; }
+.job-console > .error-text { padding: 0 var(--gutter) 10px; max-width: var(--container); margin: auto; }
+@media (max-width: 600px) {
+  .job-console-head { flex-wrap: wrap; }
+  .job-console-title { flex-basis: 100%; }
+  .job-console-actions { margin-left: auto; }
+}
 .job-console-body {
   max-height: 40vh;
   overflow-y: auto;
@@ -545,6 +553,16 @@ html { scroll-behavior: smooth; }
   color: var(--muted);
 }
 .detail-actions { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 16px; }
+.active-crawl-jobs { margin-top: 16px; }
+.active-crawl-job {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 8px 0;
+  border-bottom: 1px solid var(--border);
+}
+.active-crawl-job > span { flex: 1 1 240px; overflow-wrap: anywhere; }
 .synopsis {
   max-width: 70ch;
   color: var(--muted);

@@ -18,6 +18,7 @@ import threading
 import time
 import uuid
 from collections import deque
+from concurrent.futures import FIRST_COMPLETED, wait
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional
@@ -36,6 +37,7 @@ from .translation.api import router as translation_router
 from .translation.api import scheduler as translation_scheduler
 from .translation.api import shutdown as shutdown_translation
 from .translation.scheduler import ProviderError, api_keys
+from .utils.file_tools import safe_filename
 
 logger = logging.getLogger(__name__)
 
@@ -111,7 +113,7 @@ class TitleTranslationResponse(BaseModel):
 class Job(BaseModel):
     job_id: str
     url: str
-    status: str = "pending"  # pending | running | done | failed
+    status: str = "pending"  # pending | running | stopping | cancelled | done | failed
     source: str = ""  # crawler class that handled the URL
     title: str = ""
     author: str = ""
@@ -142,15 +144,23 @@ class JobStore:
         self.lock = threading.RLock()
         self._jobs: Dict[str, Job] = {}
         self._order: Deque[str] = deque()
+        self._stop_events: Dict[str, threading.Event] = {}
         self._max_jobs = max_jobs
 
     def create(self, url: str) -> Job:
         job = Job(job_id=uuid.uuid4().hex[:12], url=url, started_at=time.time())
         with self.lock:
             self._jobs[job.job_id] = job
+            self._stop_events[job.job_id] = threading.Event()
             self._order.append(job.job_id)
-            while len(self._order) > self._max_jobs:
-                self._jobs.pop(self._order.popleft(), None)
+            for old_id in list(self._order):
+                if len(self._order) <= self._max_jobs:
+                    break
+                if self._jobs[old_id].status in ("pending", "running", "stopping"):
+                    continue
+                self._order.remove(old_id)
+                self._jobs.pop(old_id)
+                self._stop_events.pop(old_id, None)
         return job
 
     def snapshot(self, job_id: str) -> Optional[Job]:
@@ -163,11 +173,33 @@ class JobStore:
         with self.lock:
             return self._jobs.get(job_id)
 
+    def stop_event(self, job_id: str) -> threading.Event:
+        with self.lock:
+            return self._stop_events[job_id]
+
+    def stop(self, job_id: str) -> Optional[Job]:
+        with self.lock:
+            job = self._jobs.get(job_id)
+            if job is None:
+                return None
+            if job.status in ("pending", "running"):
+                self._stop_events[job_id].set()
+                job.status = "stopping"
+            return job.model_copy(deep=True)
+
+    def active_for_book(self, book_id: str) -> List[Job]:
+        with self.lock:
+            return [
+                job.model_copy(deep=True) for job in self._jobs.values()
+                if job.book_id == book_id and job.status in ("pending", "running", "stopping")
+            ]
+
+
     def has_active_for_book(self, book_id: str) -> bool:
-        """True while any pending/running job is writing to this book."""
+        """True while a crawl can still write to this book."""
         with self.lock:
             return any(
-                job.book_id == book_id and job.status in ("pending", "running")
+                job.book_id == book_id and job.status in ("pending", "running", "stopping")
                 for job in self._jobs.values()
             )
 
@@ -190,6 +222,15 @@ def _set(job: Job, **fields) -> None:
     with JOBS.lock:
         for key, value in fields.items():
             setattr(job, key, value)
+
+
+class _CrawlStopped(Exception):
+    """Cooperative stop requested; the crawl thread still owns cleanup."""
+
+
+def _check_stop(event: threading.Event) -> None:
+    if event.is_set():
+        raise _CrawlStopped
 
 
 # --------------------------------------------------------------------------- #
@@ -343,10 +384,25 @@ def get_job(job_id: str) -> Job:
     return job
 
 
+@app.post("/api/jobs/{job_id}/stop", response_model=Job)
+def stop_job(job_id: str) -> Job:
+    job = JOBS.stop(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job
+
+
 @app.get("/api/books", response_model=List[BookSummary])
 def list_books() -> List[BookSummary]:
     """All novels persisted in the library, newest first."""
     return [BookSummary(**b) for b in LIBRARY.list_books()]
+
+
+@app.get("/api/books/{book_id}/jobs", response_model=List[Job])
+def active_book_jobs(book_id: str) -> List[Job]:
+    if LIBRARY.load_book(book_id) is None:
+        raise HTTPException(status_code=404, detail="Book not found in library")
+    return JOBS.active_for_book(book_id)
 
 
 @app.get("/api/books/{book_id}", response_model=BookDetail)
@@ -439,16 +495,18 @@ def delete_chapter(book_id: str, chapter_id: int):
 @app.post("/api/books/{book_id}/fetch-missing", response_model=Job, status_code=202)
 def fetch_missing(book_id: str) -> Job:
     """Start a job that downloads only chapters missing from the library."""
-    book = LIBRARY.load_book(book_id)
-    if book is None:
-        raise HTTPException(status_code=404, detail="Book not found in library")
-    if not book["url"]:
-        raise HTTPException(status_code=400, detail="Book has no source URL")
-    missing = LIBRARY.missing_chapter_ids(book_id)
-    if not missing:
-        raise HTTPException(status_code=400, detail="No missing chapters — the book is complete")
-    req = ExtractRequest(url=book["url"], only_ids=missing)
-    job = JOBS.create(book["url"])
+    with JOBS.lock:
+        book = LIBRARY.load_book(book_id)
+        if book is None:
+            raise HTTPException(status_code=404, detail="Book not found in library")
+        if not book["url"]:
+            raise HTTPException(status_code=400, detail="Book has no source URL")
+        missing = LIBRARY.missing_chapter_ids(book_id)
+        if not missing:
+            raise HTTPException(status_code=400, detail="No missing chapters — the book is complete")
+        req = ExtractRequest(url=book["url"], only_ids=missing)
+        job = JOBS.create(book["url"])
+        job.book_id = book_id
     thread = threading.Thread(
         target=_run_job,
         args=(job.job_id, req),
@@ -503,17 +561,18 @@ def export_book(
 @app.delete("/api/books/{book_id}", status_code=204)
 def delete_book(book_id: str):
     """Delete a book with all its saved chapters, cover, and exports."""
-    if JOBS.has_active_for_book(book_id):
-        raise HTTPException(
-            status_code=409,
-            detail="A crawl job is still running for this book — stop it first",
-        )
-    try:
-        deleted = LIBRARY.delete_book(book_id)
-    except LNException as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    if not deleted:
-        raise HTTPException(status_code=404, detail="Book not found in library")
+    with JOBS.lock:
+        if JOBS.has_active_for_book(book_id):
+            raise HTTPException(
+                status_code=409,
+                detail="A crawl job is still running for this book — stop it first",
+            )
+        try:
+            deleted = LIBRARY.delete_book(book_id)
+        except LNException as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        if not deleted:
+            raise HTTPException(status_code=404, detail="Book not found in library")
 
 
 class ConfigField(BaseModel):
@@ -714,9 +773,12 @@ def _run_job(job_id: str, req: ExtractRequest) -> None:
         return
     _install_log_forwarding(job)
 
+    stop_event = JOBS.stop_event(job_id)
     crawler = None
     try:
-        _set(job, status="running")
+        with JOBS.lock:
+            _check_stop(stop_event)
+            job.status = "running"
         _log(job, f"Looking up a crawler for {req.url}")
 
         from .services.sources import Sources
@@ -743,6 +805,7 @@ def _run_job(job_id: str, req: ExtractRequest) -> None:
         novel = Novel(url=req.url)
         crawler.read_novel(novel)
         crawler.format_novel(novel)
+        _check_stop(stop_event)
         if not novel.title:
             raise LNException("No novel title found")
 
@@ -765,19 +828,22 @@ def _run_job(job_id: str, req: ExtractRequest) -> None:
 
         book_id = ""
         if req.save:
-            book_id = LIBRARY.save_book_meta(
-                {
-                    "url": novel.url,
-                    "title": novel.title,
-                    "author": novel.author,
-                    "cover_url": novel.cover_url,
-                    "language": novel.language,
-                    "synopsis": novel.synopsis,
-                    "tags": list(novel.tags),
-                    "toc": [{"id": c.id, "title": c.title, "url": c.url} for c in novel.chapters],
-                }
-            )
-            _set(job, book_id=book_id)
+            with JOBS.lock:
+                _check_stop(stop_event)
+                book_id = safe_filename(novel.title) or "novel"
+                job.book_id = book_id
+                LIBRARY.save_book_meta(
+                    {
+                        "url": novel.url,
+                        "title": novel.title,
+                        "author": novel.author,
+                        "cover_url": novel.cover_url,
+                        "language": novel.language,
+                        "synopsis": novel.synopsis,
+                        "tags": list(novel.tags),
+                        "toc": [{"id": c.id, "title": c.title, "url": c.url} for c in novel.chapters],
+                    }
+                )
             _log(job, f"Saved to library as '{book_id}'")
             if req.overwrite:
                 _log(job, "Overwrite mode: re-crawled chapters replace saved copies")
@@ -788,6 +854,7 @@ def _run_job(job_id: str, req: ExtractRequest) -> None:
                     _log(job, "Cover saved to library")
                 except Exception as e:
                     _log(job, f"Cover download failed: {e}", level="warning")
+            _check_stop(stop_event)
 
         chapters = list(novel.chapters)
         requested = "all"
@@ -815,57 +882,80 @@ def _run_job(job_id: str, req: ExtractRequest) -> None:
                 JobChapter(id=c.id, title=c.title, url=c.url, success=False) for c in chapters
             ]
         _log(job, f"Downloading {len(chapters)} chapters...")
+        _check_stop(stop_event)
 
         futures = {
-            crawler.taskman.submit_task(lambda ch: _fetch_chapter(crawler, ch), chapter): chapter
+            crawler.taskman.submit_task(
+                lambda ch: None if stop_event.is_set() else _fetch_chapter(crawler, ch), chapter
+            ): chapter
             for chapter in chapters
+            if not stop_event.is_set()
         }
-        done_count = 0
-        for chapter in crawler.taskman.resolve(
-            futures=futures, disable_bar=True, desc="Chapters", unit="chap"
-        ):
-            if chapter is None:
-                continue
-            done_count += 1
-            idx = index_by_id.get(chapter.id)
-            if idx is None:
-                continue
-            error = chapter.get("error")
-            with JOBS.lock:
-                job.chapters[idx].success = bool(chapter.success)
-                job.chapters[idx].error = error
-            if req.save and book_id and chapter.success:
-                if LIBRARY.save_chapter(book_id, chapter.to_dict(), overwrite=req.overwrite):
-                    with JOBS.lock:
-                        job.saved_count += 1
-            title = (chapter.title or "").strip()[:60]
-            elapsed = chapter.get("elapsed") or 0.0
-            if chapter.success:
-                _log(job, f"✓ Ch {chapter.id} · {title} ({elapsed:.1f}s)")
-            else:
-                _log(job, f"✗ Ch {chapter.id} · {title}: {error}", level="error")
+        pending = set(futures)
+        while pending:
+            _check_stop(stop_event)
+            completed, pending = wait(pending, timeout=0.2, return_when=FIRST_COMPLETED)
+            for future in completed:
+                _check_stop(stop_event)
+                try:
+                    chapter = future.result()
+                except Exception as exc:
+                    _log(job, f"Chapter task failed: {exc}", level="error")
+                    continue
+                if chapter is None:
+                    continue
+                idx = index_by_id.get(chapter.id)
+                if idx is None:
+                    continue
+                error = chapter.get("error")
+                with JOBS.lock:
+                    _check_stop(stop_event)
+                    job.chapters[idx].success = bool(chapter.success)
+                    job.chapters[idx].error = error
+                    if chapter.success:
+                        job.success_count += 1
+                    else:
+                        job.failed_count += 1
+                    if req.save and book_id and chapter.success:
+                        if LIBRARY.save_chapter(book_id, chapter.to_dict(), overwrite=req.overwrite):
+                            job.saved_count += 1
+                title = (chapter.title or "").strip()[:60]
+                elapsed = chapter.get("elapsed") or 0.0
+                if chapter.success:
+                    _log(job, f"✓ Ch {chapter.id} · {title} ({elapsed:.1f}s)")
+                else:
+                    _log(job, f"✗ Ch {chapter.id} · {title}: {error}", level="error")
 
         success_count = sum(1 for c in chapters if c.success)
         failed_count = len(chapters) - success_count
-        _set(
-            job,
-            status="done",
-            success_count=success_count,
-            failed_count=failed_count,
-            finished_at=time.time(),
-        )
+        with JOBS.lock:
+            _check_stop(stop_event)
+            job.status = "done"
+            job.success_count = success_count
+            job.failed_count = failed_count
+            job.finished_at = time.time()
         level = "warning" if failed_count else "info"
         summary = f"Completed: {success_count} ok, {failed_count} failed"
         if req.save and book_id:
             summary += f", {job.saved_count} saved to library"
         _log(job, summary, level=level)
-    except LNException as e:
-        _set(job, status="failed", error=str(e), finished_at=time.time())
-        _log(job, f"Failed: {e}", level="error")
+    except _CrawlStopped:
+        if crawler is not None:
+            crawler.taskman.executor.shutdown(wait=True, cancel_futures=True)
+        with JOBS.lock:
+            job.status = "cancelled"
+            job.finished_at = time.time()
+        _log(job, "Stopped; saved chapters were kept", level="warning")
     except Exception as e:
-        logger.exception("Extract failed for %s", req.url)
-        _set(job, status="failed", error=f"Extract failed: {e}", finished_at=time.time())
-        _log(job, f"Failed: {e}", level="error")
+        if crawler is not None:
+            crawler.taskman.executor.shutdown(wait=True, cancel_futures=True)
+        if not isinstance(e, LNException):
+            logger.exception("Extract failed for %s", req.url)
+        with JOBS.lock:
+            job.status = "cancelled" if stop_event.is_set() else "failed"
+            job.error = None if stop_event.is_set() else str(e)
+            job.finished_at = time.time()
+        _log(job, f"Stopped: {e}" if stop_event.is_set() else f"Failed: {e}", level="warning" if stop_event.is_set() else "error")
     finally:
         if crawler is not None:
             crawler.close()

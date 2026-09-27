@@ -5,6 +5,11 @@ Next.js frontend for **lncrawl-mini**. Clicking **Extract novel** (or pressing
 job console docked at the bottom of the screen streams its live log from
 anywhere in the UI (Extract, Books, book detail — tab switches never lose it).
 
+Đang crawl có nút **Dừng crawl** trong console và ở trang chi tiết sách (kể cả khi
+đã đóng console hoặc tải lại trang). Đóng console chỉ ẩn tiến trình, không dừng
+crawl. Sau khi yêu cầu dừng, chờ trạng thái **Đã hủy** rồi mới xóa sách; các
+chương đã lưu được giữ nguyên.
+
 ## Requirements
 
 - [Bun](https://bun.sh) 1.4+
@@ -37,5 +42,5 @@ frontend/
     └── page-foot.tsx    # footer
 ```
 
-Note: this frontend is presentational only. The actual crawler is the Python CLI
-in the repository root: `uv run python -m lncrawl <url>`.
+The frontend uses the FastAPI crawl service. The CLI also remains available:
+`uv run python -m lncrawl <url>`.

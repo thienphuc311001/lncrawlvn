@@ -106,16 +106,19 @@ def _raw(book_id: str, chapter_id: int) -> str:
         raise HTTPException(404, "Chapter not saved yet")
     title = chapter.get("title") or ""
     wrapper = _SAVED_TITLE_WRAPPER.match(title)
-    if wrapper and int(wrapper[1]) == chapter_id:
+    printed_number = int(wrapper[1]) if wrapper else None
+    if printed_number == chapter_id:
         title = wrapper[2].strip()
     lines = []
     has_prose = False
     for line in extract_text(chapter.get("body") or "").splitlines():
         heading = HEADING.fullmatch(line.strip())
-        if (heading and chapter_number(heading[1]) == chapter_id
-                and not REFERENCE.match(heading[2])):
-            # A saved HTML heading is the source title even if TOC translation
-            # already replaced the chapter JSON title with Vietnamese.
+        if (heading and not REFERENCE.match(heading[2])
+                and (chapter_number(heading[1]) == chapter_id
+                     or (not has_prose and printed_number is not None
+                         and chapter_number(heading[1]) == printed_number))):
+            # The TOC ID can be an ordinal while the printed chapter number
+            # differs. Match the saved title's number only at the body start.
             source_title, inline_body = split_inline_body(heading[2].strip())
             if source_title and not has_prose:
                 title = source_title

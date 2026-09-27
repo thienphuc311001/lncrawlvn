@@ -13,7 +13,8 @@ export default function Hero() {
   const [showSettings, setShowSettings] = useState(false);
   const [crawlOptions, setCrawlOptions] = useState<ExtractOptions>({});
   const { job, jobStatus, startJob } = useJobRunner();
-  const isRunning = job !== null && jobStatus === 'running';
+  const isRunning = job !== null &&
+    (jobStatus === 'pending' || jobStatus === 'running' || jobStatus === 'stopping');
 
   const start = () => {
     if (isRunning) return;
@@ -61,7 +62,7 @@ export default function Hero() {
           </div>
           <div className="hero-cta" style={{ marginTop: '20px' }}>
             <button type="button" className="btn btn-primary" onClick={start} disabled={isRunning}>
-              {isRunning ? 'Crawling…' : 'Extract novel'}
+              {jobStatus === 'stopping' && isRunning ? 'Đang dừng crawl…' : isRunning ? 'Crawling…' : 'Extract novel'}
             </button>
             <button
               type="button"

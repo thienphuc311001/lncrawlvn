@@ -2,7 +2,7 @@
 
 import { useEffect, useRef, useState } from 'react';
 
-import { useJobRunner } from './job-runner';
+import { useJobRunner, type JobStatus } from './job-runner';
 
 const API_BASE = '';
 const POLL_INTERVAL_MS = 800;
@@ -29,7 +29,7 @@ type JobChapter = {
 type Job = {
   job_id: string;
   url: string;
-  status: 'pending' | 'running' | 'done' | 'failed';
+  status: Exclude<JobStatus, 'idle'>;
   source: string;
   title: string;
   author: string;
@@ -55,7 +55,7 @@ function toLine(log: { t: number; level: string; message: string }, startedAt: n
 function summaryLines(job: Job): LogLine[] {
   const lines: LogLine[] = [
     {
-      text: `→ ${job.status} · source=${job.source || '?'} · requested=${job.requested} · found=${job.total_chapters} · ok=${job.success_count} · failed=${job.failed_count}`,
+      text: `→ ${job.status === 'cancelled' ? 'Đã hủy' : job.status} · source=${job.source || '?'} · requested=${job.requested} · found=${job.total_chapters} · ok=${job.success_count} · failed=${job.failed_count}`,
       level: job.status === 'failed' || job.failed_count > 0 ? 'warning' : 'info',
       style: { marginTop: '12px' },
     },
@@ -67,7 +67,7 @@ function summaryLines(job: Job): LogLine[] {
 /** Recaps failed chapters from the structured per-chapter results, so
  * failures stay visible even when their log lines were evicted. */
 function failedChapterLines(job: Job): LogLine[] {
-  const failed = job.chapters.filter((chapter) => !chapter.success);
+  const failed = job.chapters.filter((chapter) => !chapter.success && (job.status !== 'cancelled' || chapter.error));
   if (failed.length === 0) return [];
   const lines: LogLine[] = [
     {
@@ -91,11 +91,14 @@ export default function JobConsole() {
   const { job, jobKey, clearJob, setJobStatus } = useJobRunner();
   const [open, setOpen] = useState(true);
   const [lines, setLines] = useState<LogLine[]>([]);
-  const [status, setStatus] = useState<'idle' | 'running' | 'done' | 'failed'>('idle');
+  const [status, setStatus] = useState<JobStatus>('idle');
   const [lineCount, setLineCount] = useState(0);
   const [elapsed, setElapsed] = useState(0);
   const [copied, setCopied] = useState(false);
+  const [stopError, setStopError] = useState('');
+  const [stoppingRequest, setStoppingRequest] = useState(false);
   const boxRef = useRef<HTMLDivElement | null>(null);
+  const stopAcknowledged = useRef(false);
 
   // Reset everything when a different job is tracked.
   useEffect(() => {
@@ -103,6 +106,9 @@ export default function JobConsole() {
     setStatus(job ? 'running' : 'idle');
     setJobStatus(job ? 'running' : 'idle');
     setLineCount(0);
+    setStopError('');
+    setStoppingRequest(false);
+    stopAcknowledged.current = false;
     setElapsed(0);
     setOpen(true);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -110,7 +116,7 @@ export default function JobConsole() {
 
   // Live run clock while the job is active.
   useEffect(() => {
-    if (status !== 'running') return;
+    if (status !== 'running' && status !== 'pending' && status !== 'stopping') return;
     const timer = setInterval(() => setElapsed((value) => value + 1), 1000);
     return () => clearInterval(timer);
   }, [status]);
@@ -159,14 +165,17 @@ export default function JobConsole() {
           renderedAbsolute = lastAbs;
           setLineCount(lastAbs);
 
-          if (jobData.status === 'done' || jobData.status === 'failed') {
+          if (jobData.status === 'stopping') stopAcknowledged.current = true;
+          if (jobData.status === 'done' || jobData.status === 'failed' || jobData.status === 'cancelled') {
+            stopAcknowledged.current = false;
             setStatus(jobData.status);
             setJobStatus(jobData.status);
             setLines((prev) => [...prev, ...summaryLines(jobData), ...failedChapterLines(jobData)]);
             break;
           }
-          setStatus('running');
-          setJobStatus('running');
+          const liveStatus = stopAcknowledged.current ? 'stopping' : jobData.status;
+          setStatus(liveStatus);
+          setJobStatus(liveStatus);
           await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
           if (cancelled) break;
           jobData = await load();
@@ -190,13 +199,37 @@ export default function JobConsole() {
     };
   }, [job?.jobId, jobKey]);
 
+  const stopJob = async () => {
+    if (!job || stoppingRequest || status === 'stopping') return;
+    setStoppingRequest(true);
+    setStopError('');
+    try {
+      const res = await fetch(`${API_BASE}/api/jobs/${encodeURIComponent(job.jobId)}/stop`, { method: 'POST' });
+      if (!res.ok) {
+        const detail = await res.json().catch(() => null);
+        throw new Error(detail?.detail || `API returned ${res.status}`);
+      }
+      const stopped: Job = await res.json();
+      if (stopped.status === 'stopping') stopAcknowledged.current = true;
+      setStatus(stopped.status);
+      setJobStatus(stopped.status);
+    } catch (error) {
+      setStopError(error instanceof Error ? error.message : String(error));
+    } finally {
+      setStoppingRequest(false);
+    }
+  };
+
   if (!job) return null;
 
-  const statusLabel: Record<string, string> = {
-    idle: 'IDLE',
-    running: 'RUNNING',
-    done: 'DONE',
-    failed: 'FAILED',
+  const statusLabel: Record<JobStatus, string> = {
+    idle: 'CHƯA CHẠY',
+    pending: 'ĐANG CHỜ',
+    running: 'ĐANG CHẠY',
+    stopping: 'ĐANG DỪNG',
+    done: 'HOÀN TẤT',
+    failed: 'THẤT BẠI',
+    cancelled: 'ĐÃ HỦY',
   };
   const visible = lines.slice(-MAX_RENDERED_LINES);
 
@@ -212,13 +245,13 @@ export default function JobConsole() {
 
   return (
     <>
-      {status === 'running' && !open && (
+      {(status === 'pending' || status === 'running' || status === 'stopping') && !open && (
         <button
           type="button"
           className="job-console-fab"
           onClick={() => setOpen(true)}
-          aria-label="Mở job console"
-          title="Job đang chạy — bấm để mở console"
+          aria-label="Mở console (không dừng crawl)"
+          title="Mở console; đóng console không dừng crawl"
         >
           <span className={`jc-dot ${status}`} aria-hidden="true" />
           ▤
@@ -240,6 +273,12 @@ export default function JobConsole() {
             </span>
           </button>
           <div className="job-console-actions">
+            {(status === 'pending' || status === 'running' || status === 'stopping') && (
+              <button type="button" className="btn btn-danger" onClick={() => void stopJob()}
+                disabled={stoppingRequest || status === 'stopping'}>
+                {status === 'stopping' ? 'Đang dừng…' : stoppingRequest ? 'Đang gửi…' : 'Dừng crawl'}
+              </button>
+            )}
             <button type="button" className="btn btn-ghost" onClick={() => void copyLog()}>
               {copied ? '✓ Đã copy' : '⧉ Copy'}
             </button>
@@ -251,11 +290,13 @@ export default function JobConsole() {
             >
               {open ? '▾' : '▴'}
             </button>
-            <button type="button" className="btn btn-ghost" onClick={clearJob} aria-label="Đóng console">
+            <button type="button" className="btn btn-ghost" onClick={clearJob}
+              aria-label="Đóng console (crawl vẫn tiếp tục)" title="Đóng console; crawl vẫn tiếp tục">
               ✕
             </button>
           </div>
         </header>
+        {stopError && <p className="error-text" role="alert">Không thể dừng crawl: {stopError}</p>}
         {open && (
           <div className="job-console-body" role="log" ref={boxRef}>
             {visible.map((line, index) => (
@@ -269,7 +310,7 @@ export default function JobConsole() {
                 {line.text}
               </span>
             ))}
-            {status === 'running' && (
+            {(status === 'pending' || status === 'running' || status === 'stopping') && (
               <span className="line">
                 <span className="job-cursor" aria-hidden="true" />
               </span>

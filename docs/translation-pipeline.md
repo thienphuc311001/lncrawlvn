@@ -12,6 +12,8 @@ The active pipeline accepts UTF-8 RAW Chinese and an optional cumulative locked 
 6. Atomically commit a chapter after validation. A post-scan finds newly evidenced candidates; it skips Gemini if none exist. New dictionary entries cause a final local recheck and targeted repair of affected paragraphs.
 7. Publish `translated.json`, reader `translated.txt`, full merged `dictionary.json`, and `unresolved.json`. `dictionary.json` carries the locked `entries`, the unresolved evidence queue, and a small `rejected` cache, so it can be supplied unchanged to the next batch. `unresolved.json` contains only candidates still waiting for evidence or a technical retry. The `done` status is written only after all artifacts and the pipeline-version marker are durable.
 
+The `translation-v9` instruction asks for fluent but faithful Vietnamese, keeping Chinese cultural context and character relationships rather than adding conversational particles (such as `ạ`, `dạ`, `nhé`) for naturalness. Honorifics primarily use pronouns, titles, and wording. The register is neutral with a Southern lean, without imposing colloquial Southern speech on the source. RAW controls meaning and the locked dictionary controls names/terms; the application, not the translation response, merges and publishes the full dictionary after the batch.
+
 Download links and HTTP attachment names use the uploaded RAW file's basename (for example, `0141-0150.txt` produces `0141-0150-translated.txt`, `0141-0150-dictionary.json`, and `0141-0150-unresolved.json`). Internal artifact names remain stable for checkpointing and resume. Preserved outputs retain the same download names after a batch is removed.
 
 ## Dictionary schema and migration

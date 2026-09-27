@@ -173,6 +173,22 @@ class BookReaderTranslationTests(unittest.IsolatedAsyncioTestCase):
         rejected = await self.client.post(path + "/translate", json={"refresh": True})
         self.assertEqual(rejected.status_code, 422)
 
+    async def test_printed_chapter_number_can_differ_from_saved_toc_id(self):
+        book_id = self.library.save_book_meta({
+            "title": "Lệch số", "toc": [{"id": 59, "title": "Chương 58: Giới thiệu"}],
+        })
+        body = "<p>第58章 介绍杨靡演郭襄</p><p>陈诺怔了一下。</p>"
+        self.library.save_chapter(book_id, {
+            "id": 59, "title": "Chương 58: Giới thiệu", "body": body,
+        })
+        path = f"/api/books/{book_id}/chapters/59"
+        response = await self.client.post(path + "/translate", json={})
+        self.assertEqual(response.status_code, 202, response.text)
+        raw = self.created[-1]["raw"]
+        self.assertEqual(raw, "第59章 介绍杨靡演郭襄\n陈诺怔了一下。")
+        self.assertEqual(parse_chapters(raw)[0].number, 59)
+        self.assertEqual((await self.client.get(path)).json()["body"], body)
+
     async def test_translated_toc_title_uses_original_heading_from_saved_body(self):
         book_id = self.library.save_book_meta({
             "title": "Truyện có mục lục dịch", "toc": [{"id": 56, "title": "Chương 56: Gặp gỡ"}],

@@ -3,7 +3,7 @@
 POLICY_VERSIONS = {
     "pre_dictionary": "dictionary-v5",
     "post_dictionary": "dictionary-v5",
-    "translation": "translation-v8",
+    "translation": "translation-v9",
     "qa": "qa-v2",
     "repair": "repair-v2",
 }
@@ -15,11 +15,13 @@ Return a JSON object with confirmed, rejected, and unresolved arrays. A rejected
 {"operation":"add_alias","canonical_source":"邱途","alias":{"source":"邱探员","translation":"Thám viên Khâu"}}
 Types: character, location, institution, book_title, term. Use institution for named offices and organizations; term for stable concepts, objects, abilities, and techniques. Genders: male, female, unknown, not_applicable. Use not_applicable for non-person entities when known. Every confirmed entry status is exactly locked. If identity, Vietnamese wording, owner, or type is uncertain, use unresolved rather than guessing. Return only JSON."""
 
-TRANSLATE = """Dịch Trung→Việt đầy đủ, tự nhiên như tiểu thuyết; RAW quyết định nghĩa, LOCKED DICTIONARY quyết định tên/thuật ngữ.
+TRANSLATE = """Dịch Trung→Việt đầy đủ, mượt và dễ đọc nhưng giữ sắc thái hội thoại, văn hóa và quan hệ nhân vật của nguyên tác; không Việt hóa quá mức. RAW quyết định nghĩa, LOCKED DICTIONARY quyết định tên/thuật ngữ. Không thêm/bớt/tóm tắt/đoán, không bám cứng cú pháp Trung; giữ đúng chủ thể, quan hệ, sắc thái, phủ định, số liệu và thứ tự.
 
-Không thêm, bớt, đoán, tóm tắt hay bám cứng cú pháp Trung. Giữ đúng chủ thể, quan hệ, phủ định, số liệu, thời gian, sự kiện, sắc thái và thứ tự chương/đoạn. Tên và thuật ngữ phải nhất quán; alias phải quy về đúng identity. Chỉ dùng mục trong LOCKED DICTIONARY; không tự tạo, khóa, sửa, xóa hay ghi đè mục từ. Mục chưa đủ bằng chứng không được xem là đã khóa. Không để sót CJK trong tiếng Việt.
+Không tự chèn thói quen nói tiếng Việt như ạ, dạ, vâng, nhé, nha, đấy, cơ, mà chỉ để câu nghe tự nhiên. Chỉ dùng khi RAW thực sự thể hiện sắc thái tương đương. Đặc biệt không biến mọi câu kính ngữ thành câu kết thúc bằng ạ; thể hiện tôn ti chủ yếu qua đại từ, danh xưng, chức vị và cách hành văn.
 
-Dùng tiếng Việt trung tính thiên miền Nam, tránh từ/xưng hô đặc trưng miền Bắc khi có cách tương đương phù hợp: bố → cha/ba, bát → chén, cốc → ly, thìa → muỗng, ngô → bắp, lợn → heo, quả → trái. Không Nam hóa quá mức bằng ổng/bả/ảnh/cổ/tụi bây nếu RAW không có sắc thái tương ứng. Với cổ trang/lịch sử, giữ cách xưng hô phù hợp thời đại, thân phận và quan hệ.
+Dùng tiếng Việt trung tính thiên miền Nam, tránh Bắc hóa (bố→cha/ba, bát→chén, cốc→ly, thìa→muỗng, ngô→bắp, lợn→heo) nhưng cũng không Nam hóa bằng ổng/bả/ảnh/cổ/tụi bây nếu nguyên tác không có sắc thái đó. Với cổ trang/lịch sử, giữ cách nói phù hợp bối cảnh Trung Quốc và thân phận nhân vật.
+
+Tên/thuật ngữ phải nhất quán; alias quy đúng identity; không overwrite dictionary; cuối batch trả full dictionary đã merge. Chỉ dùng mục trong LOCKED DICTIONARY; không tự tạo, khóa, sửa, xóa hay ghi đè mục từ. Mục chưa đủ bằng chứng không được xem là đã khóa. Không để sót CJK trong tiếng Việt.
 
 Trả đúng một segment tiếng Việt hoàn chỉnh cho mỗi CURRENT_RAW ID, giữ nguyên ID và thứ tự; không gộp/tách segment, chuyển thông tin giữa ID, dịch PREVIOUS_TRANSLATION hoặc NEXT_SOURCE. Dịch title khi không rỗng, chỉ trả nội dung title, không thêm số chương/heading. Author/platform note phải được dịch trung thực như ghi chú.
 
