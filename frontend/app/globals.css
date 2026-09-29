@@ -594,24 +594,36 @@ html { scroll-behavior: smooth; }
   display: flex;
   align-items: center;
   gap: 8px;
-  width: 100%;
   padding: 9px 16px;
   background: none;
-  border: none;
   border-bottom: 1px solid var(--border);
   color: var(--text);
-  font: inherit;
   font-size: 13px;
+}
+.toc-item:last-child { border-bottom: none; }
+.toc-item-open {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 1;
+  min-width: 0;
+  padding: 0;
+  background: none;
+  border: none;
+  color: inherit;
+  font: inherit;
   text-align: left;
   cursor: pointer;
 }
-.toc-item:last-child { border-bottom: none; }
+.toc-item-open:disabled { cursor: not-allowed; }
 .toc-item.saved:hover { background: var(--surface-2, rgba(128, 128, 128, 0.1)); }
-.toc-item.missing { color: var(--muted); cursor: not-allowed; opacity: 0.65; }
+.toc-item.missing { color: var(--muted); opacity: 0.65; }
 .toc-dot { color: var(--accent); width: 14px; }
 .toc-item.missing .toc-dot { color: var(--muted); }
 .toc-num { min-width: 44px; color: var(--muted); font-variant-numeric: tabular-nums; }
 .toc-title { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.toc-copy { flex: none; padding: 4px 6px; font-size: 12px; white-space: nowrap; }
+.toc-copy-error { flex: none; font-size: 11px; }
 
 /* ------------------------------------------------------------------ */
 /* Chapter reader overlay                                              */

@@ -78,6 +78,28 @@ function folderRange(chapterId: number): { start: number; end: number } {
   return { start, end: start + FOLDER_SIZE - 1 };
 }
 
+function chapterHtmlToText(html: string): string {
+  const parsed = new DOMParser().parseFromString(html, 'text/html');
+  parsed.querySelectorAll('script, style, noscript').forEach((node) => node.remove());
+  const blockTags = new Set([
+    'ADDRESS', 'ARTICLE', 'BLOCKQUOTE', 'DD', 'DIV', 'DL', 'DT', 'FIELDSET', 'FIGCAPTION',
+    'FIGURE', 'FOOTER', 'H1', 'H2', 'H3', 'H4', 'H5', 'H6', 'HEADER', 'LI', 'MAIN', 'OL',
+    'P', 'PRE', 'SECTION', 'TABLE', 'TR', 'UL',
+  ]);
+  const read = (node: Node): string => {
+    if (node.nodeType === Node.TEXT_NODE) return node.textContent ?? '';
+    if (!(node instanceof Element)) return '';
+    if (node.tagName === 'BR') return '\n';
+    const content = Array.from(node.childNodes, read).join('');
+    return blockTags.has(node.tagName) ? `\n${content}\n` : content;
+  };
+  return read(parsed.body)
+    .replace(/\u00a0/g, ' ')
+    .replace(/[ \t]*\n[ \t]*/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
 export default function BookDetail({ bookId, onBack }: { bookId: string; onBack: () => void }) {
   const { trackJob } = useJobRunner();
   const [book, setBook] = useState<Book | null>(null);
@@ -107,6 +129,10 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
   const [readerView, setReaderView] = useState<'raw' | 'translated'>('raw');
   const [readerInfoError, setReaderInfoError] = useState('');
   const [readerBusy, setReaderBusy] = useState(false);
+  const [copyingChapterId, setCopyingChapterId] = useState<number | null>(null);
+  const [copiedChapterId, setCopiedChapterId] = useState<number | null>(null);
+  const [copyError, setCopyError] = useState<{ chapterId: number; message: string } | null>(null);
+  const copyTimer = useRef<number | undefined>(undefined);
   const readerEpoch = useRef(0);
   const readerRequestId = useRef(0);
   const lastTranslationStatus = useRef<string | null>(null);
@@ -128,7 +154,20 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
   useEffect(() => () => {
     readerEpoch.current++;
     readerRequestId.current++;
+    window.clearTimeout(copyTimer.current);
   }, [bookId]);
+
+  useEffect(() => {
+    if (!reader.chapter) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        closeReader();
+      }
+    };
+    window.addEventListener('keydown', closeOnEscape);
+    return () => window.removeEventListener('keydown', closeOnEscape);
+  }, [closeReader, reader.chapter]);
 
   const applyTranslation = useCallback((result: ChapterTranslation) => {
     if (result.status === 'done' && !result.stale && lastTranslationStatus.current !== 'done') {
@@ -301,6 +340,53 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
     },
     [bookPath, loadReaderInfo],
   );
+
+  const copyChapter = useCallback(async (chapter: TocChapter) => {
+    if (copyingChapterId !== null) return;
+    setCopyingChapterId(chapter.id);
+    setCopiedChapterId(null);
+    setCopyError(null);
+    window.clearTimeout(copyTimer.current);
+    try {
+      const content = await readerRequest<ChapterContent>(`${bookPath}/chapters/${chapter.id}`);
+      const body = chapterHtmlToText(content.body);
+      const text = [`${chapter.id}. ${chapter.title || content.title}`.trim(), body]
+        .filter(Boolean)
+        .join('\n\n');
+      await navigator.clipboard.writeText(text);
+      setCopiedChapterId(chapter.id);
+      copyTimer.current = window.setTimeout(() => setCopiedChapterId(null), 1800);
+    } catch (e) {
+      setCopyError({ chapterId: chapter.id, message: readerError(e) });
+    } finally {
+      setCopyingChapterId(null);
+    }
+  }, [bookPath, copyingChapterId]);
+
+  const copyReaderChapter = useCallback(async () => {
+    const chapter = reader.chapter;
+    if (!chapter || copyingChapterId !== null) return;
+    const activeId = translation?.active_chapter_id ?? dictionaryInfo?.active_chapter_id ?? null;
+    const translatedContent = readerView === 'translated' ? translation?.translated : null;
+    const translationToCopy = translatedContent && !translation?.stale && activeId !== chapter.id
+      ? translatedContent
+      : null;
+    const title = translationToCopy?.title ?? chapter.title;
+    const body = translationToCopy?.paragraphs.join('\n\n') ?? chapterHtmlToText(chapter.body);
+    setCopyingChapterId(chapter.id);
+    setCopiedChapterId(null);
+    setCopyError(null);
+    window.clearTimeout(copyTimer.current);
+    try {
+      await navigator.clipboard.writeText([`${chapter.id}. ${title}`.trim(), body].filter(Boolean).join('\n\n'));
+      setCopiedChapterId(chapter.id);
+      copyTimer.current = window.setTimeout(() => setCopiedChapterId(null), 1800);
+    } catch (e) {
+      setCopyError({ chapterId: chapter.id, message: readerError(e) });
+    } finally {
+      setCopyingChapterId(null);
+    }
+  }, [copyingChapterId, dictionaryInfo?.active_chapter_id, reader.chapter, readerView, translation]);
 
   const importDictionary = useCallback(async (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.currentTarget.files?.[0];
@@ -792,18 +878,32 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
                     </div>
                     <div className="toc-list">
                       {group.chapters.map((ch) => (
-                        <button
-                          type="button"
-                          key={ch.id}
-                          className={`toc-item${ch.saved ? ' saved' : ' missing'}`}
-                          disabled={!ch.saved}
-                          title={ch.saved ? 'Open chapter' : 'Not downloaded yet — use Fetch missing'}
-                          onClick={() => void openChapter(ch.id)}
-                        >
-                          <span className="toc-dot">{ch.saved ? '✓' : '·'}</span>
-                          <span className="toc-num">{ch.id}.</span>
-                          <span className="toc-title">{ch.title}</span>
-                        </button>
+                        <div key={ch.id} className={`toc-item${ch.saved ? ' saved' : ' missing'}`}>
+                          <button
+                            type="button"
+                            className="toc-item-open"
+                            disabled={!ch.saved}
+                            title={ch.saved ? 'Open chapter' : 'Not downloaded yet — use Fetch missing'}
+                            onClick={() => void openChapter(ch.id)}
+                          >
+                            <span className="toc-dot">{ch.saved ? '✓' : '·'}</span>
+                            <span className="toc-num">{ch.id}.</span>
+                            <span className="toc-title">{ch.title}</span>
+                          </button>
+                          <button
+                            type="button"
+                            className="btn btn-ghost toc-copy"
+                            disabled={!ch.saved || copyingChapterId !== null}
+                            aria-label={`Copy chapter ${ch.id}`}
+                            title={copyError?.chapterId === ch.id ? copyError.message : 'Copy chapter text'}
+                            onClick={() => void copyChapter(ch)}
+                          >
+                            {copyingChapterId === ch.id ? 'Copying…' : copiedChapterId === ch.id ? '✓ Copied' : '⧉ Copy'}
+                          </button>
+                          {copyError?.chapterId === ch.id && (
+                            <span className="error-text toc-copy-error" role="alert">Copy failed</span>
+                          )}
+                        </div>
                       ))}
                     </div>
                   </>
@@ -904,6 +1004,15 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
                 <div className="reader-head-actions">
                   <button
                     type="button"
+                    className="btn btn-ghost"
+                    disabled={copyingChapterId !== null}
+                    title={copyError?.chapterId === reading.id ? copyError.message : 'Copy visible chapter text'}
+                    onClick={() => void copyReaderChapter()}
+                  >
+                    {copyingChapterId === reading.id ? 'Copying…' : copiedChapterId === reading.id ? '✓ Copied' : '⧉ Copy'}
+                  </button>
+                  <button
+                    type="button"
                     className="btn btn-danger"
                     disabled={deletingChapter || crawlMode !== null}
                     onClick={() => void deleteChapter(reading)}
@@ -913,12 +1022,17 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
                   <button
                     type="button"
                     className="btn btn-ghost"
+                    title="Close reader (Esc)"
+                    aria-keyshortcuts="Escape"
                     onClick={closeReader}
                   >
-                    ✕ Close
+                    ✕ Close (Esc)
                   </button>
                 </div>
               </div>
+              {copyError?.chapterId === reading.id && (
+                <p className="error-text reader-copy-error" role="alert">Copy failed: {copyError.message}</p>
+              )}
               <div className="reader-controls">
                 <div className="reader-controls-row">
                   <label className="reader-import">
@@ -1031,4 +1145,3 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
     </section>
   );
 }
-
