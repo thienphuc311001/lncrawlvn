@@ -290,8 +290,9 @@ export default function TranslationWorkspace() {
   }
 
   return <section className="container translation-workspace">
+    <p className="eyebrow">THE SAME STORY. A NEW LANGUAGE.</p>
     <h1>Novel translation</h1>
-    <p className="muted">Chinese → Vietnamese. RAW supplies meaning; your cumulative book dictionary locks terminology.</p>
+    <p className="lead">Chinese → Vietnamese. Keep the story’s meaning and your book’s terminology consistent.</p>
     <div className="translation-inputs">
       {(['raw', 'dictionary'] as const).map(key => <label key={key} className="settings-field">
         <span>{key.toUpperCase()}{key === 'dictionary' ? ' (optional)' : ''}</span>
@@ -299,18 +300,19 @@ export default function TranslationWorkspace() {
           onChange={e => setFiles(previous => ({ ...previous, [key]: e.target.files?.[0] }))} />
       </label>)}
     </div>
-    <p className="muted">UTF-8 RAW text with numbered 第N章 chapter headings. Gaps are allowed; duplicate or backwards headings are errors. The optional dictionary is cumulative JSON.</p>
+    <p className="muted translation-input-hint">Use UTF-8 Chinese text with numbered 第N章 headings. Gaps are allowed; duplicate or backwards headings are errors. Add a cumulative JSON dictionary to keep names and terms consistent.</p>
     <button className="btn btn-primary" disabled={busy || active || !config?.api_key_configured || !files.raw} onClick={() => void start()}>
       {busy ? 'Working…' : 'Translate batch'}
     </button>
-    {config && <details className="translation-config"><summary>System Configuration</summary>
+    {config && !config.api_key_configured && <p className="error-text" role="status">Translation needs an API key. Set GOOGLE_AI_API_KEY on the server to get started.</p>}
+    {config && <details className="translation-config"><summary>Translation settings</summary>
       <p>Requests prefer the primary model across configured keys, then the fallback model. Daily quota disables only that key/model pair for this run. RPM/TPM limits suspend that pair for about 60 seconds. Temporary errors get two retries per pair by default.</p>
       {Object.entries(config.models).map(([role, model]) => <label className="settings-field" key={role}>
         <span>{role[0].toUpperCase() + role.slice(1)} Model</span><input readOnly value={model} />
       </label>)}
+      <p className="muted">{config.concurrency} workers · {config.stagger_ms} ms staggering · Author notes: {config.author_note_policy ?? 'preserve'} · Server API key {config.api_key_configured ? 'configured' : 'missing — set GOOGLE_AI_API_KEY on the server'}</p>
+      {config.api_key_configured && <p className="muted">{config.api_key_count ?? 1} API key(s) configured · Automatic rotation on quota errors · Key values stay on the server</p>}
     </details>}
-    {config && <p className="muted">{config.concurrency} workers · {config.stagger_ms} ms staggering · Author notes: {config.author_note_policy ?? 'preserve'} · Server API key {config.api_key_configured ? 'configured' : 'missing — set GOOGLE_AI_API_KEY on the server'}</p>}
-    {config?.api_key_configured && <p className="muted">{config.api_key_count ?? 1} API key(s) configured · Automatic rotation on quota errors · Key values stay on the server</p>}
     {jobs.length > 0 && <label className="settings-field"><span>Saved batches</span><select value={job?.job_id ?? ''} disabled={busy}
       onChange={e => { request(`/jobs/${e.target.value}`).then(data => setJob(data as Job)).catch(e => setError(errorDetail(e))); }}>
       {jobs.map(j => <option key={j.job_id} value={j.job_id}>{j.display_title ?? `Translation batch ${j.job_id.slice(0, 8)}`}</option>)}

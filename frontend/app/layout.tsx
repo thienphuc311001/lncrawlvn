@@ -3,9 +3,9 @@ import type { Metadata } from 'next';
 import './globals.css';
 
 export const metadata: Metadata = {
-  title: 'Novel Crawler · Extract, convert, and download web novels',
+  title: 'NovelCrawler · Your reading workspace',
   description:
-    'Extract chapters from web novel sites, convert to EPUB/PDF/MOBI, and read offline on any device.',
+    'Build your personal web novel library, translate Chinese chapters into Vietnamese, and export EPUB or TXT for offline reading.',
 };
 
 export default function RootLayout({

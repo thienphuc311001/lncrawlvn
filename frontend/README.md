@@ -28,12 +28,12 @@ bun run start    # serve the production build
 ```
 frontend/
 ├── app/
-│   ├── globals.css    # design system ported verbatim from index.html (+ demo additions)
+│   ├── globals.css    # shared workspace tokens, components, and responsive styles
 │   ├── layout.tsx     # root layout & metadata
 │   └── page.tsx       # landing page composition
 └── components/
     ├── top-nav.tsx      # sticky navigation
-    ├── hero.tsx         # client: URL input + extract controls + ⚙ settings
+    ├── hero.tsx         # client: extraction form, recent books, and settings
     ├── job-runner.tsx   # client: global job context (start/track jobs app-wide)
     ├── job-console.tsx  # client: global dock streaming live job logs
     ├── settings-modal.tsx # client: crawl tweaks + engine settings (GET/POST /api/config)
@@ -44,3 +44,16 @@ frontend/
 
 The frontend uses the FastAPI crawl service. The CLI also remains available:
 `uv run python -m lncrawl <url>`.
+
+## Interface checks
+
+```bash
+bun run build
+bun x tsc --noEmit
+bun test tests/translation-workspace.test.tsx
+```
+
+The workspace uses the existing React/Next.js stack and system fonts. Books can
+be searched by title or author and sorted by date or title. Recent books open
+directly from Extract. Settings, export options, and the chapter reader support
+keyboard focus trapping, Escape dismissal, and focus restoration.

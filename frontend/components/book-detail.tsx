@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ChangeEvent, type FormEvent } from 'react';
 
 import { useJobRunner } from './job-runner';
+import useDialog from './use-dialog';
 
 const API_BASE = '';
 const POLL_INTERVAL_MS = 800;
@@ -157,17 +158,8 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
     window.clearTimeout(copyTimer.current);
   }, [bookId]);
 
-  useEffect(() => {
-    if (!reader.chapter) return;
-    const closeOnEscape = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') {
-        event.preventDefault();
-        closeReader();
-      }
-    };
-    window.addEventListener('keydown', closeOnEscape);
-    return () => window.removeEventListener('keydown', closeOnEscape);
-  }, [closeReader, reader.chapter]);
+  const readerDialogRef = useDialog(Boolean(reader.chapter), closeReader);
+  const exportDialogRef = useDialog(Boolean(exportDialog), () => closeExportDialog());
 
   const applyTranslation = useCallback((result: ChapterTranslation) => {
     if (result.status === 'done' && !result.stale && lastTranslationStatus.current !== 'done') {
@@ -835,7 +827,7 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
           </div>
         </div>
 
-        {book.synopsis && <p className="synopsis">{book.synopsis}</p>}
+        {book.synopsis && <p className="synopsis">{chapterHtmlToText(book.synopsis)}</p>}
 
         <h2 className="toc-heading">Mục lục</h2>
         <div className="toc-folders">
@@ -916,6 +908,8 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
         {exportDialog && (
           <div
             className="settings-overlay"
+            ref={exportDialogRef}
+            tabIndex={-1}
             role="dialog"
             aria-modal="true"
             aria-label="Export options"
@@ -944,8 +938,7 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
                     max={MAX_EXPORT_PER_FILE}
                     step={1}
                     value={perFileInput}
-                    // eslint-disable-next-line jsx-a11y/no-autofocus
-                    autoFocus
+                    data-dialog-initial-focus
                     onChange={(e) => {
                       setPerFileInput(e.target.value);
                       setDialogError('');
@@ -995,7 +988,7 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
         )}
 
         {reading && (
-          <div className="reader-overlay" role="dialog" aria-modal="true" aria-label="Chapter reader">
+          <div ref={readerDialogRef} className="reader-overlay" role="dialog" aria-modal="true" aria-label="Chapter reader" tabIndex={-1}>
             <div className="reader-panel">
               <div className="reader-head">
                 <h3>

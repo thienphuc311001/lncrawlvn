@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react';
 
 import type { ExtractOptions } from './job-runner';
+import useDialog from './use-dialog';
 
 const API_BASE = '';
 
@@ -31,6 +32,7 @@ export default function SettingsModal({ open, onClose, onCrawlOptionsChange }: S
   const [error, setError] = useState('');
   const [saved, setSaved] = useState(false);
   const [initialized, setInitialized] = useState(false);
+  const dialogRef = useDialog(open, () => { onClose(); setError(''); setSaved(false); });
 
   useEffect(() => {
     if (!open || initialized) return;
@@ -92,10 +94,10 @@ export default function SettingsModal({ open, onClose, onCrawlOptionsChange }: S
   if (!open) return null;
 
   return (
-    <div className="settings-overlay" role="dialog" aria-modal="true" aria-label="Settings">
+    <div ref={dialogRef} className="settings-overlay" role="dialog" aria-modal="true" aria-label="Settings" tabIndex={-1}>
       <div className="settings-modal">
         <div className="settings-head">
-          <h3>⚙ Settings</h3>
+          <h3>Crawl settings</h3>
           <button type="button" className="btn btn-ghost" onClick={close} aria-label="Đóng">
             ✕
           </button>
