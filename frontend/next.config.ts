@@ -2,6 +2,10 @@ import type { NextConfig } from 'next';
 
 const nextConfig = {
   allowedDevOrigins: ['192.168.1.6'],
+  experimental: {
+    // Allow 50 MiB of files plus multipart overhead; FastAPI enforces the file limit.
+    proxyClientMaxBodySize: '52mb',
+  },
   // Proxy API calls to the FastAPI backend so the frontend works from any
   // host (localhost, LAN IP, ...) without hardcoded origins and without CORS.
   async rewrites() {

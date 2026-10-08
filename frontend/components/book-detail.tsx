@@ -458,7 +458,7 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
   }, [reader.chapter?.id, readerBusy, refreshTranslation, translation?.job]);
 
   const startCrawl = useCallback(async (mode: 'missing' | 'overwrite') => {
-    if (crawlMode || !book || activeJobs === null || activeJobs.length > 0) return;
+    if (crawlMode || !book?.url || activeJobs === null || activeJobs.length > 0) return;
     if (mode === 'overwrite' && !window.confirm(
       `Tải lại toàn bộ ${book.total_chapters} chương của "${book.title}" và ghi đè các chương đã lưu?`,
     )) return;
@@ -538,8 +538,9 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
       setExportError('');
       try {
         const res = await fetch(
-          `${API_BASE}/api/books/${encodeURIComponent(bookId)}/export` +
-            `?format=${format}&per_file=${chaptersPerFile}&include_chapter_number=${numberChapters}`,
+          book && !book.url
+            ? `${bookPath}/download?format=${format}`
+            : `${bookPath}/export?format=${format}&per_file=${chaptersPerFile}&include_chapter_number=${numberChapters}`,
         );
         if (!res.ok) {
           const detail = await res.json().catch(() => null);
@@ -549,7 +550,7 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
         const url = URL.createObjectURL(blob);
         const link = document.createElement('a');
         link.href = url;
-        link.download = `${book?.title || bookId}.${format}.zip`;
+        link.download = `${book?.title || bookId}.${format}${book && !book.url ? '' : '.zip'}`;
         document.body.appendChild(link);
         link.click();
         link.remove();
@@ -560,11 +561,15 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
         setExporting(null);
       }
     },
-    [book, bookId],
+    [book, bookId, bookPath],
   );
 
   const openExportDialog = useCallback(async (format: 'epub' | 'txt') => {
-    if (checkingExport || exporting !== null) return;
+    if (!book || checkingExport || exporting !== null) return;
+    if (!book.url) {
+      void exportBook(format, DEFAULT_EXPORT_PER_FILE, false);
+      return;
+    }
     setCheckingExport(true);
     setExportError('');
     try {
@@ -580,7 +585,7 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
     } finally {
       setCheckingExport(false);
     }
-  }, [bookPath, checkingExport, exporting]);
+  }, [book, bookPath, checkingExport, exporting, exportBook]);
 
   const closeExportDialog = useCallback(() => {
     setExportDialog(null);
@@ -659,7 +664,8 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
       const confirmed = window.confirm(
         `Xóa chương ${chapter.id} khỏi library?\n\n` +
           `File nội dung của chương này sẽ bị xóa khỏi đĩa, mục lục vẫn giữ nguyên. ` +
-          `Dùng "Fetch missing" để tải lại chương này từ nguồn khi cần.`,
+          (book?.url ? `Dùng "Fetch missing" để tải lại chương này từ nguồn khi cần.` :
+            `Sách tải lên không có nguồn để tải lại chương này. Hãy giữ bản EPUB/TXT gốc trước khi xóa.`),
       );
       if (!confirmed) return;
       setDeletingChapter(true);
@@ -682,7 +688,7 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
         setDeletingChapter(false);
       }
     },
-    [bookId, closeReader, deletingChapter, load],
+    [book?.url, bookId, closeReader, deletingChapter, load],
   );
 
   if (error && !book) {
@@ -739,6 +745,7 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
           <div>
             <h1>{book.title}</h1>
             {book.author && <p className="muted">by {book.author}</p>}
+            {!book.url && <p className="book-local-source">Source: local upload. This book is saved in your library; download a complete EPUB or TXT below. There is no website source to fetch or re-crawl.</p>}
             <div className="tag-row">
               {book.tags.slice(0, 6).map((tag) => (
                 <span key={tag} className="tag">
@@ -752,7 +759,7 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
             <div className="progress-track wide">
               <div className="progress-fill" style={{ width: `${pct}%` }} />
             </div>
-            <div className="active-crawl-jobs" role="status">
+            {book.url && <div className="active-crawl-jobs" role="status">
               {activeJobs === null && !jobsError && <p className="muted">Đang kiểm tra crawl của sách…</p>}
               {activeJobs?.map((active) => (
                 <div className="active-crawl-job" key={active.job_id}>
@@ -775,21 +782,21 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
               ))}
               {activeJobs && activeJobs.length > 0 &&
                 <p className="muted">Đóng console không dừng crawl. Chờ crawl dừng hẳn trước khi xóa sách.</p>}
-            </div>
+            </div>}
             {jobsError && <p className="error-text" role="alert">
               Không thể kiểm tra crawl đang chạy: {jobsError}. Chưa thể xóa sách.
             </p>}
             {stopError && <p className="error-text" role="alert">Không thể dừng crawl: {stopError}</p>}
             <div className="detail-actions">
-              <button
+              {book.url && <button
                 type="button"
                 className="btn btn-primary"
                 disabled={missingCount === 0 || crawlMode !== null || activeJobs === null || activeJobs.length > 0}
                 onClick={() => void startCrawl('missing')}
               >
                 {crawlMode === 'missing' ? 'Fetching…' : `Fetch missing (${missingCount})`}
-              </button>
-              <button
+              </button>}
+              {book.url && <button
                 type="button"
                 className="btn btn-ghost"
                 disabled={!book.url || book.total_chapters === 0 || crawlMode !== null || activeJobs === null || activeJobs.length > 0}
@@ -797,14 +804,14 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
                 onClick={() => void startCrawl('overwrite')}
               >
                 {crawlMode === 'overwrite' ? 'Re-crawling…' : 'Re-crawl & overwrite'}
-              </button>
+              </button>}
               <button
                 type="button"
                 className="btn btn-ghost"
                 disabled={checkingExport || exporting !== null || book.saved_count === 0}
                 onClick={() => void openExportDialog('epub')}
               >
-                {checkingExport ? 'Checking…' : exporting === 'epub' ? 'Packing…' : 'Export EPUB'}
+                {checkingExport ? 'Checking…' : exporting === 'epub' ? 'Packing…' : book.url ? 'Export EPUB' : 'Download EPUB'}
               </button>
               <button
                 type="button"
@@ -812,7 +819,7 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
                 disabled={checkingExport || exporting !== null || book.saved_count === 0}
                 onClick={() => void openExportDialog('txt')}
               >
-                {checkingExport ? 'Checking…' : exporting === 'txt' ? 'Packing…' : 'Export TXT'}
+                {checkingExport ? 'Checking…' : exporting === 'txt' ? 'Packing…' : book.url ? 'Export TXT' : 'Download TXT'}
               </button>
               <button
                 type="button"
@@ -823,7 +830,7 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
                 {deleting ? 'Đang xóa…' : '🗑 Xóa sách'}
               </button>
             </div>
-            {exportError && <p className="muted error-text">✗ {exportError}</p>}
+            {exportError && <p className="muted error-text" role="alert">✗ {exportError}</p>}
           </div>
         </div>
 
@@ -875,7 +882,7 @@ export default function BookDetail({ bookId, onBack }: { bookId: string; onBack:
                             type="button"
                             className="toc-item-open"
                             disabled={!ch.saved}
-                            title={ch.saved ? 'Open chapter' : 'Not downloaded yet — use Fetch missing'}
+                            title={ch.saved ? 'Open chapter' : book.url ? 'Not downloaded yet — use Fetch missing' : 'Chapter content is missing — this upload has no website source'}
                             onClick={() => void openChapter(ch.id)}
                           >
                             <span className="toc-dot">{ch.saved ? '✓' : '·'}</span>

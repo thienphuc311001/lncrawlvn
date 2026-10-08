@@ -23,11 +23,13 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Deque, Dict, List, Optional
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
+from starlette.background import BackgroundTask
 
+from .book_import import MAX_UPLOAD_BYTES, import_books
 from .book_translation import router as book_translation_router
 from .context import APP_DIR, ctx
 from .core import Novel
@@ -83,6 +85,17 @@ class BookDetail(BookSummary):
     synopsis: str = ""
     tags: List[str] = []
     chapters: List[BookChapter] = []
+
+
+class ImportErrorDetail(BaseModel):
+    filename: str
+    error: str
+
+
+class BookImportResult(BaseModel):
+    books: List[BookSummary]
+    errors: List[ImportErrorDetail]
+    skipped: List[str]
 
 
 class ChapterContent(BaseModel):
@@ -398,6 +411,27 @@ def list_books() -> List[BookSummary]:
     return [BookSummary(**b) for b in LIBRARY.list_books()]
 
 
+@app.post("/api/books/upload", response_model=BookImportResult)
+def upload_books(files: List[UploadFile] = File(...)) -> BookImportResult:
+    """Import EPUB/TXT files, or each supported book inside an uploaded ZIP."""
+    try:
+        total = 0
+        for upload in files:
+            upload.file.seek(0, 2)
+            total += upload.file.tell()
+            upload.file.seek(0)
+            if total > MAX_UPLOAD_BYTES:
+                raise HTTPException(
+                    status_code=413, detail="Uploads must total 50 MiB or less."
+                )
+        return BookImportResult(**import_books(
+            LIBRARY, [(upload.filename or "", upload.file) for upload in files]
+        ))
+    finally:
+        for upload in files:
+            upload.file.close()
+
+
 @app.get("/api/books/{book_id}/jobs", response_model=List[Job])
 def active_book_jobs(book_id: str) -> List[Job]:
     if LIBRARY.load_book(book_id) is None:
@@ -556,6 +590,28 @@ def export_book(
     except LNException as e:
         raise HTTPException(status_code=400, detail=str(e))
     return FileResponse(zip_path, media_type="application/zip", filename=zip_path.name)
+
+
+@app.get("/api/books/{book_id}/download")
+def download_book(
+    book_id: str,
+    format: str = Query("epub", pattern="^(epub|txt)$"),
+):
+    """Download all saved chapters as one EPUB or UTF-8 TXT file."""
+    book = LIBRARY.load_book(book_id)
+    if book is None:
+        raise HTTPException(status_code=404, detail="Book not found in library")
+    try:
+        path = LIBRARY.export_file(book_id, format)
+    except LNException as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    title = safe_filename(book["title"]) or book_id
+    return FileResponse(
+        path,
+        media_type="application/epub+zip" if format == "epub" else "text/plain; charset=utf-8",
+        filename=f"{title}.{format}",
+        background=BackgroundTask(path.unlink, missing_ok=True),
+    )
 
 
 @app.delete("/api/books/{book_id}", status_code=204)

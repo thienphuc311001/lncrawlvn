@@ -59,9 +59,6 @@ MAX_ENV = "VIETPHRASE_SAFE_BLOCK_MAX"
 CHAPTER_SEPARATOR = "-" * 60
 FRONT_MATTER_MARKER = "+" * 60
 
-# The synthetic wrapper this binder must never emit again.
-WRAPPER_PATTERN = re.compile(r"^\s*chapter\s+\d+\s*[:：]", re.I)
-
 # Boundary classes, strongest first. Class rank outranks any position bonus so
 # a weaker boundary is never chosen while a stronger one is in reach.
 _BOUNDARY_RANK = {
@@ -934,65 +931,26 @@ def validate_export(built: ExportText) -> None:
     """Enforce the fatal export invariants; report-only diagnostics never fail."""
     audit = built.audit
     maximum = int(audit.get("safe_block_max") or SAFE_BLOCK_MAX)
-    front = "\n".join(built.front_matter)
-    if WRAPPER_PATTERN.search(front):
-        raise LNException("Export validation failed: synthetic wrapper in front matter")
-    marker = FRONT_MATTER_MARKER
-    pos = built.text.find(marker)
-    if pos < 0 and built.front_matter:
-        raise LNException("Export validation failed: front-matter marker missing")
     if "\r" in built.text:
         raise LNException("Export validation failed: non-LF line ending")
     try:
         built.text.encode("utf-8")
     except UnicodeEncodeError as exc:
         raise LNException(f"Export validation failed: not UTF-8: {exc}") from exc
-    # Headerless exports (the files after the first in a split export) start
-    # directly at the first chapter separator.
-    after = normalize_newlines(built.text[pos + len(marker):] if pos >= 0 else built.text)
-    tail = after.strip("\n")
-    if not tail and audit.get("chapters_exported"):
-        raise LNException("Export validation failed: chapter region is empty")
-    raw_parts = tail.split(CHAPTER_SEPARATOR) if tail else []
-    # Each chapter is "\n" + separator + "\n" + body; the text before the
-    # first separator is only leftover front-matter spacing.
-    parts = []
-    for position, raw in enumerate(raw_parts):
-        if position == 0:
-            if raw.strip("\n"):
-                raise LNException(
-                    "Export validation failed: text before first chapter separator"
-                )
-            continue
-        if not raw.startswith("\n"):
-            raise LNException(
-                "Export validation failed: chapter separator without newline"
-            )
-        parts.append(raw[1:])
-    if len(parts) != audit.get("chapters_exported", 0):
-        raise LNException(
-            "Export validation failed: chapter separator count "
-            f"({len(parts)}) != chapters exported "
-            f"({audit.get('chapters_exported', 0)})"
-        )
-    written = []
-    for part in parts:
-        # block blanks are single empty lines; dropping them must recover source
-        written.extend(line for line in part.split("\n") if line != "")
-    expected = []
+    if len(built.chapters) != audit.get("chapters_exported", 0):
+        raise LNException("Export validation failed: chapter count mismatch")
+    # Source text can legitimately contain our separators or English headings.
+    # Validate the serialized records instead of parsing user content as delimiters.
+    expected = [line for line in "\n".join(built.front_matter).split("\n") if line != ""]
     for _, source in built.chapters:
+        expected.append(CHAPTER_SEPARATOR)
         expected.extend(source)
+    written = [line for line in built.text.split("\n") if line != ""]
     if written != expected:
         raise LNException(
             "Export validation failed: content mismatch "
             "(order/deletion/duplication/merge)"
         )
-    for _, source in built.chapters:
-        for line in source:
-            if WRAPPER_PATTERN.match(line):
-                raise LNException(
-                    f"Export validation failed: synthetic wrapper remains: {line!r}"
-                )
     over_maximum = [size for size in built.block_sizes if size > maximum]
     reported = sorted(built.oversized_heading_sizes)
     if sorted(over_maximum) != reported:

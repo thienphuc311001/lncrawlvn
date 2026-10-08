@@ -19,6 +19,7 @@ an export can pick its own number of chapters per file (``per_file``).
 import json
 import logging
 import shutil
+import tempfile
 import time
 import zipfile
 from pathlib import Path
@@ -400,6 +401,33 @@ class Library:
             raise LNException(f"Unsupported export format: {fmt}")
         _, chapters = self._load_novel_and_chapters(book_id)
         return any(not has_chapter_number(chapter, fmt) for chapter in chapters)
+
+    def export_file(self, book_id: str, fmt: str = "epub") -> Path:
+        """Bind every saved chapter into one file, without adding chapter numbers.
+
+        Each download gets its own path, isolated from chunk-export cleanup.
+        The response owner must unlink the returned file after sending it.
+        """
+        if fmt not in ("epub", "txt"):
+            raise LNException(f"Unsupported export format: {fmt}")
+        book_dir = self._guarded_book_dir(book_id)
+        novel, chapters = self._load_novel_and_chapters(book_id)
+        directory = book_dir / "exports" / "direct"
+        directory.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            dir=directory, prefix="download-", suffix=f".{fmt}", delete=False
+        ) as temporary:
+            output = Path(temporary.name)
+        try:
+            if fmt == "epub":
+                cover = book_dir / "cover.jpg"
+                make_epub(novel, chapters, output, cover if cover.is_file() else None)
+            else:
+                make_text(novel, chapters, output)
+        except Exception:
+            output.unlink(missing_ok=True)
+            raise
+        return output
 
     def export_zip(
         self,

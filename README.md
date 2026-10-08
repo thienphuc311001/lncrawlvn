@@ -2,8 +2,8 @@
 
 Minimal web-novel downloader built from the zh + vn sources of
 [Lightnovel Crawler](https://github.com/lncrawl/lightnovel-crawler). No server,
-no database, no account system. One URL in → a persistent on-disk library you
-can read, complete, and export to EPUB/TXT.
+no database, no account system. One URL or local EPUB/TXT upload in → a persistent
+on-disk library you can read, complete, and export to EPUB/TXT.
 
 ## Development
 
@@ -33,6 +33,7 @@ installer lives at `scripts/lnmini.sh`; copy it anywhere on your `PATH` as
 | `/api/jobs/{job_id}` | GET | Job progress: status, timestamped stage logs, per-chapter success/failure + reasons |
 | `/api/jobs/{job_id}/stop` | POST | Request a cooperative stop; returns `stopping` until in-flight downloads finish, then `cancelled`. Saved chapters remain on disk. |
 | `/api/books` | GET | All books in the library with saved/total chapter counts |
+| `/api/books/upload` | POST | Multipart `files` containing one or more EPUB/TXT/ZIP uploads (50 MiB combined). Returns `{ books, errors: [{ filename, error }], skipped }`; each EPUB/TXT in a ZIP becomes a separate saved book. Successful siblings remain available when another book fails. |
 | `/api/books/{book_id}` | GET | Book metadata + full TOC annotated with per-chapter saved/missing flags |
 | `/api/books/{book_id}/jobs` | GET | Active crawl jobs for a book, including jobs still `stopping`; empty once it is safe to delete. |
 | `/api/books/{book_id}/translate-titles` | POST | Translate every TOC title in one 100-chapter section with one structured Gemini request; persist translated titles in the TOC and saved chapter metadata |
@@ -46,6 +47,37 @@ installer lives at `scripts/lnmini.sh`; copy it anywhere on your `PATH` as
 | `/api/books/{book_id}` | DELETE | Remove a book with all saved chapters, cover, and exports → `204` (`409` while a crawl job is running or stopping; stop it from the book page or job console first) |
 | `/api/books/{book_id}/export-options?format=epub\|txt` | GET | Check saved chapter headings before export; `needs_chapter_numbers` is true if any exported chapter lacks a visible number (TXT checks body heading; EPUB checks title or body heading) |
 | `/api/books/{book_id}/export?format=epub\|txt&per_file=100&include_chapter_number=false` | GET | Build an EPUB/TXT ZIP with one chapter-range file per `per_file` chapters (default 100, max 10000). Only the first file carries front matter and cover. If `include_chapter_number=true`, add `Chương N` only to chapters whose exported heading lacks a number; otherwise leave them unchanged. The UI asks about this option only when needed. |
+| `/api/books/{book_id}/download?format=epub\|txt` | GET | Download all saved chapters as one complete EPUB or UTF-8 TXT attachment. Unlike `/export`, this returns the file directly, not a chapter-range ZIP. |
+
+## Import local books
+
+Open **Books → Upload your books**, choose one or more `.epub`, `.txt`, or `.zip`
+files, then select **Upload to library**. Open an imported book and choose
+**Download EPUB** or **Download TXT**; either input format can be downloaded in
+either output format.
+
+- A ZIP can contain multiple stories in nested folders. Each EPUB/TXT file is
+  imported independently; nested ZIPs and other formats are skipped.
+- EPUB imports retain title, author, language, synopsis and reading order.
+  Text and basic formatting are imported; images and active/external resources
+  are omitted. TXT accepts UTF-8 (with or without BOM) and BOM-marked UTF-16.
+  Recognized Vietnamese, English or Chinese chapter headings split the book;
+  text without headings is stored as one chapter.
+- Imported books use the same on-disk Library storage as crawled books and remain
+  available after restarting. Duplicate names create separate books, never
+  overwrite existing content. Local books have no website source to re-crawl.
+- The form reports imported books, individual failures and skipped files.
+  Retrying a partially successful ZIP creates additional copies of its valid
+  stories; choose only failed stories to avoid duplicates.
+- Limits: 50 MiB combined uploaded files, 200 MiB expanded content and 10,000
+  archive entries per request, including EPUB internals. Unsafe paths, links,
+  encrypted entries and excessive compression ratios are rejected.
+
+```bash
+curl -F 'files=@novel.epub' -F 'files=@stories.zip' \
+  http://127.0.0.1:8000/api/books/upload
+curl -OJ 'http://127.0.0.1:8000/api/books/BOOK_ID/download?format=txt'
+```
 
 
 ## Usage

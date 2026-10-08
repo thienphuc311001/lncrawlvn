@@ -544,13 +544,6 @@ class LimitConfigTests(unittest.TestCase):
 
 
 class ValidationTests(unittest.TestCase):
-    def test_rejects_wrapper_line(self):
-        bad = chapter(1, "\u7b2c1\u7ae0", ["\u6b63\u6587"])
-        bad.body = "<p>Chapter 1: fake</p><p>\u6b63\u6587</p>"
-        built = build_export_text(novel(), [bad])
-        with self.assertRaises(LNException):
-            validate_export(built)
-
     def test_rejects_content_mismatch(self):
         built = build_export_text(novel(), [chapter(1, "\u7b2c1\u7ae0", ["\u6b63\u6587"])])
         built.chapters[0][1].append("\u4e22\u5931\u7684\u884c")
